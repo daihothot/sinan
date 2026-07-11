@@ -26,7 +26,7 @@ Read the complete document before implementation, especially sections 4-7 and 23
 ## Non-negotiable Architecture Decisions
 
 1. Trading Core is the trading correctness boundary.
-2. Strategy & Decision Control Plane submits `TradeIntent`; it never creates or sends `execution.command` directly.
+2. Strategy & Decision Control Plane submits `TradeIntent` with required `account_id` and stable `idempotency_key`; it never creates or sends `execution.command` directly.
 3. Risk Engine is a hard gate inside Trading Core.
 4. Execution Client Protocol is transport-independent.
 5. Native TCP and Execution WebSocket are Execution Client Protocol bindings.
@@ -34,7 +34,7 @@ Read the complete document before implementation, especially sections 4-7 and 23
 7. SQLite append-only facts and projections are the authoritative local execution state.
 8. `ExecutionEvent` is the execution fact source; command, leg, and plan status are projections.
 9. `execution.command` requires HMAC-SHA256 using the fixed signing string in section 23.1.
-10. `transport.ack`, `command.received`, and `execution.event` have different semantics and must not be conflated.
+10. `transport.ack` uses the canonical payload in section 23.1; `transport.ack`, `command.received`, and `execution.event` have different semantics and must not be conflated.
 11. Trading Core server time is authoritative. Execution Client and Control Plane maintain offsets using monotonic clocks.
 12. Expired, unauthenticated, stale, unreconciled, or risk-blocked work must fail closed.
 13. WebSocket event gaps recover through bounded replay or `GET /state`; they never imply execution failure.
@@ -141,7 +141,10 @@ Required tests:
 - Use server-time Unix milliseconds for business timestamps.
 - Use monotonic clocks only for local elapsed time and RTT.
 - Keep payload DTOs immutable where practical.
+- Use the repository's MIT license for all workspace crates.
 - Do not use JSON canonicalization for command HMAC.
+- Treat section 23.1 and its golden vector as the authoritative HMAC field order.
+- Require `X-Idempotency-Key` to equal `TradeIntent.idempotency_key`.
 - Do not let transport code own retry or command lifecycle decisions.
 - Keep migrations forward-only and checksum verified.
 - Preserve existing architecture vocabulary in public APIs.
