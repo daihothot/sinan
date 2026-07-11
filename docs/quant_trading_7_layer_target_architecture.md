@@ -1,0 +1,6247 @@
+# 量化交易系统 7 层目标架构设计文档
+
+## 1. 系统定位
+
+本系统定位为一个 **event-driven multi-service quant trading architecture**，面向黄金 `XAUUSD` 与比特币 `BTCUSD` 的中低频量化交易研究、模拟盘验证与后续实盘执行。
+
+核心方向：
+
+```text
+交易品种：XAUUSD + BTCUSD
+策略类型：趋势交易为主，中期统计套利为辅
+起始周期：H1 / H4
+执行路径：MT5 模拟盘 → 小资金实盘 → 扩展策略组合
+```
+
+核心原则：
+
+```text
+MQL5 不做策略核心
+Compute Services 不做流程控制
+Strategy & Decision Control Plane 做慢决策、AI 编排和研究工作流
+Trading Core 做低延迟交易内核、强风控、执行状态机和 broker adapter routing
+Trading Core State Store / append-only log 是执行状态与执行事实的本地强一致存储
+Redis Streams 可做跨服务事件分发和异步审计 fanout，但不是执行状态唯一来源
+Risk Engine 是 Trading Core 内的执行前硬边界
+Execution Event 是执行事实来源，执行状态是事实流投影
+Agent / LLM 只能辅助，不直接下单
+外部研究 / 回测服务只做研究、分析、审查、候选生成
+```
+
+---
+
+## 2. 总体架构
+
+```text
+                          ┌──────────────────────────────────┐
+                          │ Debug / Test UI                   │
+                          │ TUI / Desktop / Dashboard         │
+                          └───────────────┬──────────────────┘
+                                          │ WebSocket / HTTP
+                                          │ state / summary / manual action
+                                          ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Strategy & Decision Control Plane                                          │
+│ decision workflow / Agent / rule engine / human review / TradeIntent       │
+└───────────────┬───────────────────────────────────────────────▲────────────┘
+                │ HTTP POST /trade-intents                      │ WS /events
+                │ HTTP GET /state /time                         │ summaries
+                ▼                                               │
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Trading Core                                                               │
+│                                                                            │
+│  ┌─────────────────────────── Trading Gateway ──────────────────────────┐  │
+│  │ TransportAdapter: Native TCP / Execution WS / Event WS / HTTP        │  │
+│  │ GatewayInboundRouter / GatewayOutboundRouter                         │  │
+│  └───────────────┬───────────────────────────────┬──────────────────────┘  │
+│                  │                               │                         │
+│  ┌───────────────▼──────────────┐  ┌─────────────▼─────────────────────┐   │
+│  │ Risk Engine                  │  │ Execution Engine                  │   │
+│  │ hard risk gate               │  │ plan / command / lifecycle        │   │
+│  └───────────────┬──────────────┘  └─────────────┬─────────────────────┘   │
+│                  │                               │                         │
+│  ┌───────────────▼───────────────────────────────▼─────────────────────┐   │
+│  │ Trading Core State Store                                            │   │
+│  │ SQLite / append-only log / idempotency / reconciliation / spool      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└───────────────┬───────────────────────────────┬────────────────────────────┘
+                │                               │
+                │ Native TCP / Execution WS     │ Redis Streams / audit fanout
+                │ Execution Client Protocol     │ optional, not source of truth
+                ▼                               ▼
+┌──────────────────────────────┐   ┌────────────────────────────────────────┐
+│ Execution Client / Adapter    │   │ Long-term Audit / Replay / Research    │
+│ MT5 / Exchange / Paper         │   │ Postgres / ClickHouse / object store   │
+│ command inbox / broker bridge  │   └────────────────────────────────────────┘
+└───────────────┬──────────────┘
+                │
+                │ broker API / terminal API
+                ▼
+┌──────────────────────────────────┐
+│ Broker / Exchange / MT5 Terminal │
+└──────────────────────────────────┘
+
+Strategy & Decision Control Plane
+  └── HTTP calls
+      ▼
+┌────────────────────────────────┐
+│ Compute & Research Services     │
+│ indicators / IC / backtest / ML  │
+└────────────────────────────────┘
+```
+
+关键方向：
+
+```text
+Execution Client 通过 Execution Client Protocol 接入 Trading Gateway；transport binding 可以是 Native TCP 或 Execution WebSocket。
+Strategy & Decision Control Plane 只通过 HTTP / WS 接入 Trading Core。
+Debug / Test UI 默认连接 Strategy & Decision Control Plane；测试 / 故障场景允许只读直连 Trading Core。
+Debug / Test UI 不直接连接 Execution Client。
+Debug / Test UI 直连 Trading Core 必须使用独立 debug/read-only credential，默认只允许 GET /state 和 WS /events。
+Compute & Research Services 由 Strategy & Decision Control Plane 调用，不直接参与 execution.command。
+Redis Streams / audit fanout 是分发和审计辅助，不是执行事实来源。
+Trading Core State Store 是执行状态、idempotency 和 reconciliation 的本地强一致来源。
+```
+
+Debug / Test UI 有两条路径：
+
+```text
+normal path:
+  Debug UI → Strategy & Decision Control Plane
+  → 查看 workflow / agent / research / manual review state
+
+break-glass read-only path:
+  Debug UI → Trading Core GET /state / WS /events
+  → 只读查看 execution summary / system.event / session health
+  → Control Plane 挂掉时仍能诊断 Trading Core 和 Execution Client
+```
+
+---
+
+## 3. 七层职责定义
+
+### 3.1 MT5 Adapter Layer
+
+#### 技术形态
+
+```text
+MQL5 Expert Advisor
+TCP execution client
+MT5 account / symbol / order adapter
+local terminal guard
+```
+
+#### 职责
+
+```text
+连接 MT5 交易终端
+采集 market.tick / market.bar
+采集 symbol metadata / broker trading constraints
+向 Gateway 推送市场事件
+向 Gateway 推送 symbol.metadata
+接收 execution.command
+执行订单或模拟执行
+上报 execution.event
+在关键时机发布 account.snapshot / position.snapshot / order.snapshot
+记录本地兜底日志
+维护本地 command 去重缓存
+维护连接状态
+发送心跳
+执行 time sync，维护 effective_server_now_ms
+断线重连
+处理基础拆包 / 粘包
+维护本地 send queue / command inbox
+```
+
+#### 不负责
+
+```text
+策略判断
+指标计算
+组合风控
+Agent 决策
+多策略调度
+组合仓位管理
+长期审计存储
+```
+
+#### 设计结论
+
+MQL5 层不再是完整 EA Framework，而是：
+
+```text
+MT5 execution adapter
+```
+
+它是交易终端适配器，不是策略大脑。
+
+更一般地说，MQL5 只是 `Execution Client` 的一种实现。后续 Binance、IBKR、Paper Trading、Backtest Executor 等其他执行平台也可以实现同一套 Execution Client Protocol 接入 Gateway。
+
+---
+
+### 3.2 Trading Core Layer
+
+#### 技术形态
+
+```text
+Rust implementation / single binary first
+WS / HTTP API for UI and Strategy & Decision Control Plane
+Execution Client Protocol server
+Native TCP / Execution WebSocket transport binding
+Execution Client session registry
+broker adapter router
+heartbeat monitor
+time sync authority
+transport message framing
+hard Risk Engine
+Execution Engine
+Command Lifecycle State Machine
+SQLite / append-only State Store
+local spool / audit writer
+```
+
+#### 服务边界
+
+Trading Core 是交易正确性边界，不是 Strategy & Decision Control Plane 的内部 helper。
+
+```text
+Strategy & Decision Control Plane
+  ↔ HTTP / WS TradeIntent API
+Trading Core
+  ↔ Execution Client Protocol
+MT5 Adapter / Exchange Adapter
+```
+
+#### 职责
+
+```text
+接收 Strategy & Decision Control Plane 产生的 TradeIntent / StrategyDecision
+读取最新 account / position / order / symbol metadata / market snapshot
+执行强风控 hard risk gate
+从上游有效期和 execution policy 派生 execution.command.expires_at
+生成 execution.plan / execution.command
+维护 command / plan lifecycle state
+维护 SQLite / append-only execution event store
+维护 command idempotency journal
+维护 Execution Client 与后端的双向 TCP 连接
+接收 Execution Client 上报的 market event
+向 Execution Client 下发 execution.command
+维护 session_id / client_id / platform / terminal_id / account_id 映射
+执行心跳检测
+提供 time.sync.request / response，并作为 Execution Client Protocol 的时间权威
+维护连接健康状态
+执行消息 framing encode / decode
+管理 command delivery ack timeout
+处理 DELIVERY_UNCONFIRMED / reconciliation
+执行 broker adapter routing
+维护 execution.event / system.event local append-only spool
+向 Strategy & Decision Control Plane / UI / Redis 发布聚合事件和状态变化
+```
+
+#### 不负责
+
+```text
+策略判断
+指标计算
+LLM / Agent 推理
+宏观分析
+研究 / 回测编排
+策略候选 promotion
+解释性报告生成
+```
+
+#### Strategy & Decision Control Plane 与 Trading Core 的关系
+
+```text
+Strategy & Decision Control Plane 不直接维护 MT5 / Execution Client TCP 连接
+Strategy & Decision Control Plane 不直接生成最终 execution.command
+Strategy & Decision Control Plane 只提交 TradeIntent / StrategyDecision / manual approval
+Trading Core 负责最终 risk gate、command 生成、dispatch、state projection
+Trading Core 负责上报 EXECUTION_CLIENT_CONNECTION_LOST / RESTORED 等 system.event
+Trading Core 可以拒绝任何过期、不匹配、不安全或不可确认的 intent
+```
+
+#### Trading Core 对 Strategy & Decision Control Plane 的 API
+
+Strategy & Decision Control Plane 调用 Trading Core 时提交的是 `TradeIntent`，不是最终订单，也不是同步执行函数。
+
+推荐 API：
+
+```text
+POST /trade-intents
+  → 输入 TradeIntent
+  → 返回 intent_id / status / reason / correlation_id
+  → status = ACCEPTED / RISK_BLOCKED / REJECTED / DUPLICATE
+
+GET /state
+  → 返回 Trading Core 当前 account / position / order / risk / session summary
+  → 只读，用于 Strategy & Decision Control Plane 决策上下文，不作为执行事实来源替代
+
+GET /time
+  → 返回 Trading Core server_now_ms、server_receive_at、server_send_at、clock_health、max_internal_server_skew_ms
+  → 返回 max_decision_time_skew_ms、max_decision_time_sync_age_ms、max_decision_time_sync_rtt_ms、control_plane_time_sync_interval_ms、max_decision_intent_age_ms
+  → Strategy & Decision Control Plane 用于生成 StrategyDecision.timestamp / TradeIntent.requested_at / signal_expires_at
+  → server_now_ms 必须等于 server_send_at，避免响应中出现两个权威时间
+
+WS /events
+  → 推送 market.snapshot / risk.summary / execution.summary / system.event
+  → 不推送每个 raw tick 给 Strategy & Decision Control Plane
+```
+
+规则：
+
+```text
+POST /trade-intents 只表示 Trading Core 已接收并完成初步校验，不表示 broker 已成交。
+Trading Core 必须在本地 state store 中先记录 intent / idempotency key，再进入 hard risk 和 execution flow。
+Strategy & Decision Control Plane 不得通过 HTTP retry 造成重复执行；重复 intent_id / decision_id 必须由 Trading Core 幂等处理。
+Broker 生命周期只通过 WS /events 或 event fanout 返回。
+```
+
+#### Trading Gateway Transport Abstraction
+
+Trading Gateway 需要支持多种 transport，但 transport 不是业务边界。TCP、WebSocket、HTTP 都只是 adapter，后面必须进入同一套 Trading Core command bus / query bus / event bus。
+
+设计原则：
+
+```text
+Transport Adapter 负责连接、鉴权、framing、读写队列、backpressure、基础 ACK 和连接健康。
+Protocol Router 负责把 wire message 映射为 Trading Core 内部 command / query / event。
+Trading Core domain module 负责 risk、execution、state projection、idempotency 和 reconciliation。
+Transport Adapter 不得直接调用 broker，不得直接改 execution state，不得绕过 Risk Layer。
+```
+
+推荐抽象：
+
+```text
+TransportAdapter
+  → start / stop
+  → accept connection or request
+  → authenticate
+  → decode inbound envelope
+  → encode outbound envelope
+  → enforce max frame / payload size
+  → manage send queue and backpressure
+  → report transport health
+
+SessionContext
+  → transport_type = TCP / WEBSOCKET / HTTP
+  → session_id
+  → client_id
+  → account_id
+  → terminal_id
+  → platform
+  → authenticated_at
+  → capabilities
+  → remote_addr
+
+GatewayInboundRouter
+  → compose small pipeline components
+  → no business state mutation
+
+GatewayOutboundRouter
+  → compose small pipeline components
+  → no command lifecycle mutation
+```
+
+Router 实现约束：
+
+```text
+GatewayInboundRouter / GatewayOutboundRouter 只是 pipeline composition root。
+每个 stage 必须可以独立单测。
+新增业务类型时优先新增 handler / stage，不在 Router 主体里堆 if / switch。
+Router 只返回 routing result / delivery result，不返回 risk result 或 execution state transition。
+```
+
+Router 组件拆分：
+
+```text
+InboundDecodeStage
+  → decode envelope / payload
+  → reject invalid frame or JSON
+
+InboundSchemaStage
+  → validate schema_version / message type / required fields
+  → send invalid message to deadletter.event
+
+InboundAuthStage
+  → validate connection auth / API key / token
+  → attach authenticated principal
+
+InboundSessionStage
+  → enforce session_id / client_id / account_id / terminal_id binding
+  → attach SessionContext
+
+InboundTimeStage
+  → attach received_at = server_now_ms
+  → validate sent_at skew where applicable
+
+InboundDispatchStage
+  → route to Trading Core command / query / event handler
+  → no domain decision inside router
+
+OutboundSelectStage
+  → select active session or event subscribers
+
+OutboundAuthzStage
+  → enforce topic / account / client visibility
+
+OutboundDeliveryStage
+  → apply transport delivery policy
+  → report delivery result to Execution Layer or event stream manager
+
+OutboundEncodeStage
+  → encode envelope / payload through selected TransportAdapter
+```
+
+Router anti-patterns:
+
+```text
+GatewayInboundRouter / GatewayOutboundRouter 不得直接访问 broker。
+GatewayInboundRouter / GatewayOutboundRouter 不得执行 risk check。
+GatewayInboundRouter / GatewayOutboundRouter 不得生成 execution.command。
+GatewayInboundRouter / GatewayOutboundRouter 不得直接更新 ExecutionCommandState。
+GatewayInboundRouter / GatewayOutboundRouter 不得持有跨请求业务状态；状态必须在 Session Registry、Event Stream Manager 或 Trading Core State Store。
+```
+
+transport 类型：
+
+```text
+Native TCP Transport
+  → Execution Client Protocol binding
+  → MT5 / low-latency local adapter / paper executor
+  → full-duplex
+  → length-prefixed JSON frame
+  → supports transport ack / command.received / execution.event / heartbeat / time sync
+
+Execution WebSocket Transport
+  → Execution Client Protocol binding
+  → exchange adapter / cloud adapter / environment where WebSocket is easier than raw TCP
+  → full-duplex
+  → one WebSocket message carries one WireMessage JSON
+  → supports transport ack / command.received / execution.event / heartbeat / time sync
+  → may carry execution.command
+
+Event WebSocket Transport
+  → UI / Debug Tool / Strategy & Decision Control Plane event stream
+  → subscription-oriented
+  → pushes market.snapshot / risk.summary / execution.summary / system.event
+  → may accept subscribe / unsubscribe / ping / cursor resume
+  → must not carry execution.command
+
+HTTP Transport
+  → request / response API
+  → POST /trade-intents
+  → GET /state
+  → GET /time
+  → optional internal refresh / admin endpoints
+  → must not carry execution.command
+```
+
+可靠性语义：
+
+| Transport | 主用途 | 可靠性语义 | 可否承载 execution.command |
+|---|---|---|---:|
+| Native TCP | Execution Client Protocol binding | session sequence + transport ack + command.received + idempotency journal | 是 |
+| Execution WebSocket | Execution Client Protocol binding | session sequence + transport ack + command.received + idempotency journal | 是 |
+| Event WebSocket | event stream / dashboard / Control Plane feedback | event_id cursor resume；断线后用 `/state` 校准 | 否 |
+| HTTP | intent submit / query | request idempotency；服务端 state store 为准 | 否 |
+
+Event WebSocket 与 HTTP 不得提供绕过 Trading Core 的执行通道。即使后续允许 WebSocket 写入人工操作，也只能写 manual action / audit request / review decision，不能写 `execution.command` 或 broker order。
+
+Execution WebSocket 与 Event WebSocket 必须是不同 endpoint、不同 auth scope、不同 router。Execution WebSocket 面向 Execution Client，可以承载 `execution.command`；Event WebSocket 面向 UI / Control Plane，只能订阅事件和提交受审计的非执行操作。
+
+推荐 endpoint 命名：
+
+```text
+Native TCP listener
+  → 0.0.0.0:<execution_client_tcp_port>
+  → Execution Client Protocol only
+
+WS /execution-client
+  → Execution WebSocket
+  → Execution Client Protocol only
+
+WS /events
+  → Event WebSocket
+  → UI / Control Plane subscriptions only
+
+HTTP /trade-intents /state /time
+  → Control Plane / Debug query API
+```
+
+#### WS /events 重连恢复策略
+
+`WS /events` 是 Trading Core → Strategy & Decision Control Plane / UI 的事件推送通道。它不是执行事实来源，也不为每个 consumer 无限保留私有队列。
+
+推荐语义：
+
+```text
+Trading Core State Store
+  → 保存执行事实、command state、summary projection
+
+Event Stream Manager
+  → 从 State Store / projection / local fanout log 读取事件
+  → 推送给 WebSocket subscribers
+  → 维护短期 event cursor window
+  → 不拥有执行事实
+
+WebSocket subscriber
+  → 连接时声明 topics / account scope / last_event_id
+  → 收到事件后按 event_id 更新本地 cursor
+  → 断线后用 last_event_id resume
+```
+
+断线期间事件处理：
+
+```text
+结论：不是简单全丢，也不是为每个 consumer 无限 spool。
+durable execution facts 必须写 Trading Core State Store。
+summary events 保留 bounded replay window。
+ephemeral UI events 可以丢弃。
+
+不为单个 WS client 单独 spool 无限事件。
+Trading Core 必须保留 bounded replay window，例如最近 N 条或最近 M 分钟 summary events。
+如果 last_event_id 仍在 replay window 内：
+  → 从 last_event_id 之后补推事件
+  → 然后切回 live stream
+
+如果 last_event_id 已过期或 event gap detected：
+  → 返回 resume_failed / gap_detected
+  → client 必须调用 GET /state 校准当前 summary
+  → client 再用新的 cursor 订阅 live stream
+```
+
+事件类型分级：
+
+```text
+durable execution facts
+  → execution.event / command.received / execution.command.state
+  → 来源是 Trading Core State Store
+  → 可通过 GET /state 或 summary 重建
+
+summary events
+  → execution.summary / risk.summary / market.snapshot / system.event
+  → 可 replay bounded window
+  → gap 后用 GET /state 校准
+
+ephemeral UI events
+  → dashboard ping / transient progress / local UI hint
+  → 可丢弃，不参与恢复
+```
+
+Control Plane 恢复规则：
+
+```text
+1. WS 断线不影响 Trading Core 执行。
+2. Control Plane 重连后先尝试 last_event_id resume。
+3. resume 成功时继续处理补推事件。
+4. resume 失败时调用 GET /state / GET /time 重新校准 workflow context。
+5. Control Plane 不得根据 WS gap 自行推断执行失败或重发 TradeIntent。
+6. 对已提交 intent，只能用原 intent_id 查询 Trading Core state 或幂等重放 POST /trade-intents。
+```
+
+内部路由表：
+
+```text
+Execution Client Protocol inbound
+  via Native TCP / Execution WebSocket
+  hello
+  heartbeat
+  time.sync.request
+  market.tick / market.bar
+  account.snapshot / position.snapshot / order.snapshot / symbol.metadata
+  command.received
+  execution.event
+  reconciliation.result
+
+Execution Client Protocol outbound
+  via Native TCP / Execution WebSocket
+  hello.accepted
+  time.sync.response
+  execution.command
+  reconciliation.request
+
+Event WebSocket outbound
+  market.snapshot
+  risk.summary
+  execution.summary
+  system.event
+  deadletter.event summary
+
+Event WebSocket inbound
+  subscribe
+  unsubscribe
+  ping
+  resume cursor
+  manual action request, optional and audited
+
+HTTP inbound
+  trade.intent submit
+  state query
+  time query
+  optional manual review / admin request
+  debug read-only state query
+```
+
+实现边界：
+
+```text
+Transport layer can fail a delivery attempt.
+Transport layer can mark a session stale.
+Transport layer can emit system.event for connection / frame / auth failures.
+Transport layer cannot decide whether to retry an execution.command.
+Transport layer cannot mutate ExecutionCommandState directly; it reports delivery result to Execution Layer.
+Execution Layer owns command lifecycle transitions.
+```
+
+#### Execution Client Protocol
+
+执行客户端协议是平台无关协议，`WireMessage` 不绑定 TCP。TCP、Execution WebSocket、后续 Unix Domain Socket 或其他 full-duplex transport 都只是 transport binding。
+
+Transport binding：
+
+```text
+Native TCP
+  → 4-byte big-endian length prefix + UTF-8 JSON WireMessage payload
+
+Execution WebSocket
+  → one WebSocket message = one UTF-8 JSON WireMessage payload
+  → 不使用 TCP length prefix
+  → 仍必须执行 max_message_bytes、schema validation、session binding、transport ack
+
+Event WebSocket
+  → UI / Control Plane event subscription protocol
+  → 不属于 Execution Client Protocol binding
+  → 不承载 execution.command
+```
+
+所有 Execution Client transport payload 都必须包含最小 wire envelope，避免 transport ack、重连去重和协议升级依赖业务字段。
+
+```ts
+export interface WireMessage<T> {
+  message_id: string
+  type: ExecutionClientMessageType
+  schema_version: string
+
+  client_id?: string
+  session_id?: string
+  correlation_id?: string
+  causation_id?: string
+
+  sent_at?: number
+  sequence?: number
+
+  payload: T
+}
+```
+
+字段规则：
+
+```text
+message_id    = transport ack / 去重的最小单位
+type          = hello / time.sync.request / time.sync.response / heartbeat / market.tick / execution.command / command.received 等
+schema_version = wire payload schema 版本
+session_id    = Gateway 接受 hello 后分配的 Execution Client session ID
+sent_at       = server-time domain；Gateway 发送时使用真实 server time，Execution Client 在 time sync 后使用估算的 server time
+sequence      = 同一 Execution Client session、同一发送方向内单调递增，可用于诊断乱序和断点恢复
+```
+
+`hello` 与 `time.sync.request` 发生在客户端完成时间同步之前，允许不带 `sent_at`。`hello.accepted` 之后，所有非 time-sync 的业务消息必须带 `sent_at`，且必须是 server-time domain。
+
+#### Server Time Authority 与 Clock Sync
+
+交易系统中任何用于控制、过期、排序、freshness、TTL、审计和风控判断的时间，必须使用服务器时间。客户端本地 wall clock 不得参与交易控制。
+
+权威时间源：
+
+```text
+protocol time authority
+  → Trading Gateway / Trading Core server time
+  → Unix milliseconds UTC
+  → Gateway 是 Execution Client Protocol 对外暴露的时间权威
+
+server process clocks
+  → Trading Gateway / Risk Engine / Execution Engine / Trading Core State Store 必须使用同一 server time source
+  → 单机部署时使用同一主机时钟
+  → 多机部署时必须使用 NTP / chrony / cloud time sync
+  → 内部 server clock skew 超过 max_internal_server_skew_ms 时不得生成或投递新的 execution.command
+
+Execution Client local wall clock
+  → 不可信
+  → 不得用于 expires_at / freshness / event_at / observed_at / sent_at
+
+Execution Client local monotonic clock
+  → 只允许用于测量 RTT 和本地 elapsed time
+  → 不得写入业务 payload
+```
+
+所有跨服务时间字段必须使用 Unix milliseconds UTC，不使用本地时区字符串。
+
+```text
+sent_at
+  → 发送端创建 WireMessage 时的 server-time domain 时间
+  → Gateway 发送时使用 server_now_ms
+  → Execution Client 发送时使用 effective_server_now_ms
+
+received_at
+  → Gateway / server 收到并完成解析的 server_now_ms
+
+created_at
+  → server 创建 EventEnvelope 的 server_now_ms
+
+observed_at
+  → 外部状态被 Execution Client 观测到时的 effective_server_now_ms
+
+event_at
+  → Execution Client 生成 execution.event 时的 effective_server_now_ms
+
+filled_at
+  → Execution Client 观测到 broker 成交时的 effective_server_now_ms
+
+broker_filled_at / broker_time
+  → broker 原始时间戳，可选，仅用于审计和对账
+  → 不参与 freshness、expires_at、TTL 或风控判断
+```
+
+规则：
+
+```text
+1. Gateway 必须为每条 inbound WireMessage 补 received_at，且 received_at 必须使用 server_now_ms。
+2. 所有 freshness 判断使用 server_now_ms - observed_at。
+3. 所有 expires_at / valid_until / TTL 判断使用 server_now_ms 或 effective_server_now_ms。
+4. latency 观测使用 received_at - sent_at；缺少 sent_at 的 hello / time.sync.request 不参与业务 latency 统计。
+5. 如果 abs(received_at - sent_at) > max_clock_offset_ms，写 system.event: CLOCK_SKEW_DETECTED。
+6. 对 execution.command，time sync 不健康时不得继续执行新 command，必须先重新同步或人工处理。
+7. 推荐 max_clock_offset_ms = 2000。
+8. 推荐 max_internal_server_skew_ms = 100。
+9. bar 去重使用 symbol + timeframe + timestamp，不使用 received_at。
+```
+
+Execution Client 必须维护：
+
+```text
+server_time_offset_ms
+  → server_now_ms - client_monotonic_now_ms
+
+effective_server_now_ms
+  → client_monotonic_now_ms + server_time_offset_ms
+
+last_time_sync_at_server_ms
+  → 最近一次有效 sample 的 server_mid_ms
+
+last_time_sync_age_ms
+  → effective_server_now_ms - last_time_sync_at_server_ms
+
+last_time_sync_rtt_ms
+clock_sync_status
+  → SYNCED / DEGRADED / UNSYNCED
+```
+
+time sync 协议：
+
+```ts
+export interface TimeSyncRequest {
+  request_id: string
+}
+
+export interface TimeSyncResponse {
+  request_id: string
+  server_receive_at: number
+  server_send_at: number
+  server_time: number
+}
+```
+
+time sync 计算：
+
+```text
+client records local monotonic t0
+  → send time.sync.request
+
+Gateway receives request at server_receive_at
+Gateway sends response at server_send_at
+  → server_time = server_send_at
+
+client receives response at local monotonic t3
+
+rtt_ms = t3 - t0
+client_mid_ms = (t0 + t3) / 2
+server_mid_ms = (server_receive_at + server_send_at) / 2
+server_time_offset_ms = server_mid_ms - client_mid_ms
+effective_server_now_ms = client_monotonic_now_ms + server_time_offset_ms
+```
+
+采样规则：
+
+```text
+hello.accepted 返回 server_time 后，Execution Client 必须立即完成至少 3 次 time.sync sample。
+只接受 rtt_ms <= max_time_sync_rtt_ms 的 sample。
+初始 offset 使用最低 RTT sample。
+运行中每个 heartbeat_interval_ms 至少做 1 次 time.sync sample。
+连续 3 次 sample 失败或 last_time_sync_age_ms > heartbeat_timeout_ms 时，clock_sync_status = UNSYNCED。
+offset 抖动超过 max_clock_offset_ms 时，clock_sync_status = DEGRADED，并写 CLOCK_SKEW_DETECTED。
+clock_sync_status != SYNCED 时，Execution Client 不得接受新的 execution.command。
+clock_sync_status != SYNCED 时，Execution Client 不得把 market / snapshot 作为 fresh state 发布。
+clock_sync_status != SYNCED 时，Execution Client 可以本地 journal 已在途订单的 broker 回报，但应在恢复 SYNCED 后再上报 execution.event；如果无法重建准确 server-time domain 时间，必须写 TIME_SYNC_UNHEALTHY 并触发 reconciliation。
+```
+
+Strategy & Decision Control Plane 也必须维护 Trading Core server-time offset。它可以通过 `GET /time` 或 WS heartbeat 采样，但生成 `StrategyDecision.timestamp`、`TradeIntent.requested_at`、`signal_expires_at` 时必须使用 Trading Core server-time domain。
+
+Control Plane time sync state：
+
+```ts
+export interface ControlPlaneTimeSyncState {
+  trading_core_time_offset_ms: number
+  effective_trading_core_now_ms: number
+  last_sample_at_monotonic_ms: number
+  last_sample_at_server_ms: number
+  last_rtt_ms: number
+  last_time_sync_age_ms: number
+  clock_health: "HEALTHY" | "DEGRADED" | "UNHEALTHY"
+  consecutive_failures: number
+}
+```
+
+Control Plane time sync 采样：
+
+```text
+Control Plane 使用本地 monotonic t0 发起 GET /time。
+Trading Core 收到请求后记录 server_receive_at。
+Trading Core 发送响应前记录 server_send_at，并返回 time policy。
+Control Plane 收到响应时记录本地 monotonic t3。
+
+rtt_ms = t3 - t0
+client_mid_ms = (t0 + t3) / 2
+server_mid_ms = (server_receive_at + server_send_at) / 2
+trading_core_time_offset_ms = server_mid_ms - client_mid_ms
+effective_trading_core_now_ms = monotonic_now_ms + trading_core_time_offset_ms
+last_sample_at_server_ms = server_mid_ms
+last_sample_at_monotonic_ms = t3
+```
+
+采样规则：
+
+```text
+启动后必须完成至少 3 次 GET /time sample。
+只接受 rtt_ms <= max_decision_time_sync_rtt_ms 的 sample。
+初始 offset 使用最低 RTT sample。
+运行中每个 decision workflow turn 开始前必须确认 sample 未过期。
+后台必须按 control_plane_time_sync_interval_ms 持续刷新。
+连续 3 次 sample 失败，clock_health = UNHEALTHY。
+offset 抖动超过 max_decision_time_skew_ms，clock_health = DEGRADED。
+clock_health != HEALTHY 时不得生成新的 TradeIntent。
+```
+
+Control Plane 时间规则：
+
+```text
+clock_health = HEALTHY / DEGRADED / UNHEALTHY
+1. 使用本地 monotonic clock + trading_core_time_offset_ms 估算 effective_trading_core_now_ms。
+2. 每个 decision workflow turn 开始前必须确认最近一次 /time 或 WS heartbeat 未过期。
+3. 如果 clock_health != HEALTHY 或 last_time_sync_age_ms > max_decision_time_sync_age_ms，不得生成新的 TradeIntent。
+4. Trading Core 收到 TradeIntent 后必须用 server_now_ms 校验 requested_at / signal_expires_at。
+5. requested_at 不得晚于 server_now_ms + max_decision_time_skew_ms。
+6. requested_at 不得早于 server_now_ms - max_decision_intent_age_ms。
+7. signal_expires_at <= server_now_ms 时拒绝，reason = TRADE_INTENT_EXPIRED。
+8. 时间字段异常时拒绝，reason = TRADE_INTENT_TIME_INVALID 或 TIME_SYNC_UNHEALTHY。
+```
+
+TradeIntent 提交前门禁：
+
+```text
+1. 读取 ControlPlaneTimeSyncState。
+2. 如果 clock_health != HEALTHY，停止生成 TradeIntent，写 workflow audit: TIME_SYNC_UNHEALTHY。
+3. 如果 last_time_sync_age_ms > max_decision_time_sync_age_ms，立即同步 /time。
+4. 同步失败或仍过期，停止生成 TradeIntent。
+5. 使用 effective_trading_core_now_ms 写 StrategyDecision.timestamp 和 TradeIntent.requested_at。
+6. signal_expires_at 必须基于 effective_trading_core_now_ms + strategy signal ttl 派生。
+7. 提交 POST /trade-intents 后，Trading Core 仍必须用自身 server_now_ms 二次校验。
+```
+
+#### Schema Version 兼容规则
+
+`schema_version` 使用 Execution Client Protocol 固定格式：
+
+```text
+ecp.v<major>.<minor>
+```
+
+兼容规则：
+
+```text
+major 不同
+  → 不兼容，拒绝消息，写 deadletter.event
+
+minor 更高
+  → 允许读取已知字段，忽略未知字段
+  → 如果缺少必填字段，拒绝消息，写 deadletter.event
+
+未知 type
+  → 写 deadletter.event，不进入业务流程
+
+字段类型错误
+  → 写 deadletter.event，不进入业务流程
+```
+
+所有 schema 变更必须保留 golden sample payload，用于 TS / Python / MQL5 跨语言解析测试。
+
+#### Sequence 与重连恢复语义
+
+`sequence` 只描述同一 Execution Client session、同一发送方向内的 wire message 顺序，不是全局事件序号，也不是交易事实来源。跨 session 恢复和去重必须依赖 `message_id`、`command_id`、`idempotency_key` 与 Redis/Event store 中的事实事件。
+
+推荐 hello / resume payload：
+
+```ts
+export interface HelloPayload {
+  client_id: string
+  platform: "MT5" | "BINANCE" | "OKX" | "IBKR" | "PAPER" | "BACKTEST" | "EXCHANGE"
+  terminal_id?: string
+  account_id: string
+  token: string
+  capabilities: string[]
+
+  resume?: {
+    previous_session_id?: string
+    last_gateway_message_id?: string
+    last_gateway_sequence?: number
+    last_client_message_id?: string
+    last_client_sequence?: number
+    pending_command_ids?: string[]
+  }
+}
+
+export interface HelloAcceptedPayload {
+  session_id: string
+  server_time: number
+  heartbeat_interval_ms: number
+  heartbeat_timeout_ms: number
+  time_sync_interval_ms: number
+  max_time_sync_rtt_ms: number
+  max_clock_offset_ms: number
+  max_inflight_commands: number
+  max_frame_bytes: number
+  max_message_bytes: number
+}
+```
+
+`hello.accepted.server_time` 只用于 bootstrap，不足以长期判断 clock health。Execution Client 必须在 hello 后通过 `time.sync.request / response` 建立并持续刷新 `server_time_offset_ms`。
+
+capabilities 与 symbol metadata 的边界：
+
+```text
+capabilities
+  → 表示 Execution Client 支持的协议能力和动作能力
+  → 示例：MARKET_ORDER / LIMIT_ORDER / MODIFY_ORDER / CANCEL_ORDER / CLOSE_POSITION / RECONCILIATION_REQUEST
+
+symbol.metadata
+  → 表示某个 broker_symbol 在当前账户和终端上的交易约束
+  → 示例：digits / volume_step / stops_level / trade_mode / tick_value
+```
+
+Strategy & Decision Control Plane / Risk Layer 不得用 `capabilities` 推导价格精度、手数步长或止损距离；这些必须来自 `symbol.metadata`。如果 capabilities 允许某动作但 symbol metadata 显示 `trade_mode=DISABLED` 或约束不满足，Risk Layer 必须拒绝。
+
+session 与 sequence 规则：
+
+```text
+1. Gateway 每次接受 hello 后分配新的 session_id。
+2. 同一 client_id / account_id / terminal_id 只允许一个 active session。
+3. 新 session 建立后，Gateway 必须关闭旧 session 或标记旧 session stale。
+4. sequence 在每个 session、每个方向从 1 开始递增。
+5. sequence 只用于诊断丢包、乱序和 resume cursor，不用于业务幂等。
+6. message_id 必须全局唯一，transport ack 必须按 message_id 回执。
+```
+
+sequence 初始化：
+
+```text
+session.hello
+  → 发生在新 session_id 分配前
+  → sequence 可以省略，也可以使用 pre-session sequence = 1
+  → 不参与新 session sequence 计数
+
+session.accepted
+  → Gateway 分配 session_id
+  → Gateway outbound sequence = 1
+
+hello.accepted 后 client 第一条带 session_id 的消息
+  → client inbound-to-core sequence = 1
+
+每次重连成功都是新 session
+  → client sequence 从 1 重新开始
+  → gateway sequence 从 1 重新开始
+  → previous_session_id 仅用于恢复诊断和 reconciliation，不延续 sequence
+```
+
+resume cursor 语义：
+
+```text
+previous_session_id
+  → 客户端认为上一条 session 的 ID
+
+last_gateway_message_id / last_gateway_sequence
+  → 客户端最后成功处理的 Gateway → Client message
+  → 用于 Gateway 判断客户端可能漏掉哪些 outbound delivery attempt
+  → 不自动重放 execution.command
+
+last_client_message_id / last_client_sequence
+  → 客户端最后成功写入本地 journal 的 Client → Gateway message
+  → 用于 Gateway 诊断 wire gap 和重复上报
+
+pending_command_ids
+  → 客户端本地 command journal 中未到 terminal state 的 command_id
+  → Gateway 必须交给 Execution / Reconciliation 模块处理
+```
+
+恢复规则：
+
+```text
+Gateway 不根据 sequence 自动补发 execution.command。
+Gateway 可以根据 resume cursor 写 system.event，标记可能的 delivery gap。
+Execution Layer 根据 ExecutionCommandState、command.received、execution.event、expires_at 决定是否 reconciliation 或重新投递。
+如果 pending_command_ids 与 Trading Core State Store 不一致，进入 reconciliation。
+```
+
+frame 边界与协议违规处理：
+
+```text
+frame header
+  → 4-byte unsigned big-endian payload length
+
+payload length
+  → 必须满足 1 <= length <= max_frame_bytes
+  → max_frame_bytes 由 Gateway 在 hello.accepted 下发
+  → 推荐默认值 max_frame_bytes = 262144
+
+length <= 0
+  → protocol violation
+  → 不发送 transport ack
+  → 关闭当前 transport session
+  → 写 system.event: WIRE_PROTOCOL_VIOLATION
+
+length > max_frame_bytes
+  → 不读取超大 payload
+  → 不发送 transport ack
+  → 关闭当前 transport session
+  → 写 system.event: WIRE_FRAME_TOO_LARGE
+
+payload 不是合法 UTF-8 或 JSON
+  → 不发送 transport ack
+  → 写 deadletter.event(reason=DECODE_FAILED)
+  → 关闭当前 transport session
+
+envelope 可解析但 schema / type 不合法
+  → 写 deadletter.event
+  → 不进入业务流程
+  → transport ack 只允许在 envelope 已通过最小字段校验后发送
+```
+
+heartbeat 与 reconnect backoff：
+
+推荐 heartbeat payload：
+
+```ts
+export interface HeartbeatPayload {
+  effective_server_now: number
+  clock_sync_status: "SYNCED" | "DEGRADED" | "UNSYNCED"
+  last_time_sync_at_server_ms?: number
+  last_time_sync_rtt_ms?: number
+  server_time_offset_ms?: number
+  send_queue_depth?: number
+  command_inbox_depth?: number
+}
+```
+
+heartbeat 规则：
+
+```text
+HeartbeatPayload.effective_server_now 必须使用 server-time domain。
+Gateway 收到 heartbeat 后补 received_at = server_now_ms。
+如果 abs(received_at - effective_server_now) > max_clock_offset_ms，写 CLOCK_SKEW_DETECTED。
+如果 clock_sync_status != SYNCED，写 TIME_SYNC_UNHEALTHY，并停止向该 session 投递新 command。
+clock_sync_status 恢复 SYNCED 后，Gateway 写 TIME_SYNC_RESTORED。
+```
+
+```text
+heartbeat_interval_ms
+  → Gateway 在 hello.accepted 中下发
+
+heartbeat_timeout_ms
+  → 建议为 heartbeat_interval_ms * 3
+
+time_sync_interval_ms
+  → 建议等于 heartbeat_interval_ms
+
+max_time_sync_rtt_ms
+  → 推荐默认值 1000ms
+  → 超过则丢弃该 time sync sample
+
+max_clock_offset_ms
+  → 推荐默认值 2000ms
+  → 超过则写 CLOCK_SKEW_DETECTED
+
+missed_heartbeat_count >= 3
+  → Gateway 标记 session stale，并写 EXECUTION_CLIENT_CONNECTION_LOST
+
+time sync unhealthy
+  → Gateway 写 TIME_SYNC_UNHEALTHY
+  → Execution Client 暂停接收新 execution.command
+  → 已在途订单只允许继续上报 execution.event / reconciliation snapshot
+  → 这些 snapshot 不得作为 fresh state 驱动新交易
+  → 不允许发起新 broker order
+
+time sync restored
+  → 连续 3 次有效 sample 且 offset 抖动 <= max_clock_offset_ms
+  → clock_sync_status = SYNCED
+  → Gateway 写 TIME_SYNC_RESTORED
+  → Execution Client 恢复接收新 execution.command
+
+reconnect backoff
+  → initial = 500ms
+  → multiplier = 2
+  → max = 30000ms
+  → jitter = 20%
+```
+
+重连流程：
+
+```text
+Execution Client 检测断线
+  → 停止接收新 command
+  → 保留本地 command journal / execution journal
+  → backoff 后重新 hello，并携带 resume cursor
+
+Gateway 接受新 hello
+  → 分配新 session_id
+  → 标记旧 session lost / stale
+  → 写 EXECUTION_CLIENT_CONNECTION_RESTORED
+
+Execution Client 重连成功后
+  → 必须先完成 time sync
+  → clock_sync_status = SYNCED 后才允许接收新 command
+  → 立即发送 account.snapshot / position.snapshot / order.snapshot / symbol.metadata
+  → 重发最近已关闭 market.bar，按 symbol + timeframe + timestamp 幂等去重
+  → 对本地已接收但未完成的 command 重发 command.received 或最新 execution.event
+```
+
+消息可靠性分级：
+
+```text
+heartbeat
+  → ephemeral，不 replay
+
+market.tick
+  → latest-only，不逐条 replay
+  → 重连后用最新 tick / snapshot 覆盖
+
+market.bar
+  → idempotent by symbol + timeframe + timestamp
+  → 重连后允许重发最近 N 根已关闭 bar
+
+execution.command
+command.received
+execution.event
+  → durable / idempotent
+  → 必须用 message_id + command_id + idempotency_key 去重
+
+account.snapshot
+position.snapshot
+order.snapshot
+symbol.metadata
+  → latest-state durable / idempotent
+  → 必须用 message_id 去重，并按业务 key + observed_at 保留最新状态
+  → account.snapshot key = account_id
+  → position.snapshot key = account_id + position_id
+  → order.snapshot key = account_id + broker_order_id
+  → symbol.metadata key = account_id + broker_symbol
+```
+
+command 幂等规则：
+
+```text
+Execution Client 收到通过 identity / HMAC 校验且未过期的新 execution.command 后，必须先持久化 command_id / idempotency_key 到本地 journal，再返回 command.received。
+如果断线前 command.received 已发送但 Gateway 未收到，重连后客户端必须重新发送 command.received。
+如果同一 command_id 或 idempotency_key 的已入 inbox command 再次到达，客户端不得重复下单，只能返回 command.received 和当前已知 execution.event。
+如果同一 command_id 或 idempotency_key 命中的是 expired rejection record，只能返回当前已知 execution.event(status=EXPIRED)，不得发送 command.received。
+如果相同 idempotency_key 对应不同 command payload，客户端必须拒绝执行，并上报 execution.event(status=FAILED, message=DUPLICATE_IDEMPOTENCY_CONFLICT)。
+```
+
+command 过期规则：
+
+```text
+Execution Layer 不得创建 expires_at 已过期的 execution.command。
+Trading Gateway 使用 server_now_ms 判断 expires_at，不得投递 expires_at 已过期的 execution.command。
+Execution Client 验签通过后必须先查本地 idempotency journal；已知 command 返回当前状态，不重新执行。
+对本地 journal 未见过的新 command，Execution Client 必须使用 effective_server_now_ms 再次检查 expires_at。
+新 command 已过期时不得进入可执行 command inbox，不得发送 broker order。
+客户端可以持久化 lightweight rejection record，用于 command_id / idempotency_key 幂等。
+客户端必须上报 execution.event(status=EXPIRED, error_code=COMMAND_EXPIRED) 或由 Trading Gateway 写 system.event: COMMAND_EXPIRED。
+```
+
+expiry ownership：
+
+```text
+Strategy & Decision Control Plane / Strategy Runtime owns signal_expires_at
+  → 表示交易想法 / 信号什么时候失效
+  → Trading Core 可以拒绝异常或过期的 signal_expires_at，但不得延长它
+
+Risk Layer owns risk_result.valid_until
+  → 表示本次风控审批什么时候失效
+  → 必须综合 snapshot freshness、order snapshot freshness、symbol metadata freshness 与 risk policy
+
+Execution Layer derives execution.command.expires_at
+  → 从上游有效期和 execution policy 机械派生
+  → 拥有拒绝投递 / 拒绝执行的权利和责任
+  → 可以缩短有效执行窗口
+  → 不得延长 signal 或 risk approval 的有效期
+```
+
+推荐派生公式：
+
+```text
+execution.command.expires_at = min(
+  strategy_decision.signal_expires_at,
+  risk_result.valid_until,
+  server_now_ms + execution_policy.max_command_ttl_ms
+)
+```
+
+Trading Gateway 不应基于 `sequence` 自动重放全部 wire message。Trading Gateway 只负责恢复 session 与 delivery 状态；是否重试 `execution.command` 由 Execution Layer 根据 `ExecutionCommandState`、`expires_at`、reconciliation 结果和 Risk 约束决定。
+
+客户端最小职责：
+
+```text
+connect
+hello / auth
+time sync
+maintain effective_server_now_ms
+send event.tick / event.bar / snapshot / execution.event
+receive execution.command
+send transport ack / command.received
+heartbeat send
+heartbeat timeout detection
+disconnect detection
+reconnect with backoff
+message framing / 拆包 / 粘包处理
+local idempotency cache
+local execution guard
+clock sync guard
+```
+
+客户端不负责：
+
+```text
+策略判断
+风控批准
+订单生成
+command 全局生命周期状态机
+多客户端路由
+跨账户风险聚合
+复杂 replay 策略
+```
+
+---
+
+### 3.3 State / Event Backbone Layer
+
+#### 技术形态
+
+```text
+SQLite / WAL / append-only execution log
+Local spool
+Redis Streams optional fanout
+Consumer Groups
+Event Envelope
+Operational event log
+```
+
+#### 职责
+
+```text
+Trading Core 本地强一致执行状态持久化
+execution event / command state / idempotency journal 持久化
+Redis 事件广播
+多消费者组
+回放
+审计链路
+模块解耦
+策略并行
+异步处理
+backpressure 观测
+```
+
+状态所有权：
+
+```text
+Trading Core State Store
+  → execution.command state
+  → execution.event
+  → idempotency journal
+  → account / position / order latest state
+  → reconciliation checkpoint
+  → local append-only audit/spool
+
+Redis Streams
+  → cross-service operational fanout
+  → Strategy & Decision Control Plane / UI / research consumers
+  → replay aid and audit pipeline
+  → not the authoritative execution state store
+```
+
+#### 推荐 Stream 设计
+
+```text
+market.tick
+market.bar
+symbol.metadata
+
+signal.raw
+signal.scored
+
+strategy.decision
+trade.intent
+
+agent.review
+
+risk.request          # Trading Core internal / audit fanout
+risk.approved         # Trading Core internal / audit fanout
+risk.rejected         # Trading Core internal / audit fanout
+risk.summary          # aggregate fanout, not source of truth
+
+execution.plan
+execution.command
+execution.command.state
+execution.event
+execution.summary     # aggregate fanout, not source of truth
+reconciliation.request
+reconciliation.result
+
+account.snapshot
+position.snapshot
+order.snapshot
+
+audit.event
+system.event
+deadletter.event
+
+external.research.request
+external.research.result
+external.backtest.request
+external.backtest.result
+external.strategy.candidate
+external.strategy.export
+external.strategy.rejected
+external.shadow.report
+```
+
+#### market.tick 与 market.bar 分工
+
+```text
+market.tick
+  → 用于实时 MarketSnapshot 更新
+  → 主要承载 bid / ask / spread / observed_at
+  → 支持风控前的快照新鲜度校验和价差监控
+  → 不作为 H1 / H4 指标计算主输入
+
+market.bar
+  → 用于指标计算和信号生成主流程
+  → 驱动 computeIndicators / scoreSignal / strategy.decision
+  → 是中低频趋势策略的主要事件源
+```
+
+Trading Core 可以消费 raw `market.tick` 并维护实时 MarketSnapshot。Strategy & Decision Control Plane 默认不消费每个 raw tick，只消费 `market.snapshot`、`market.bar`、`signal.candidate` 或 Trading Core 聚合事件。`market.bar` 推动中低频策略流程。
+
+#### Command / Event 语义
+
+必须严格区分：
+
+```text
+Command = 请求某组件做某事
+Event   = 已经发生的事实
+```
+
+示例：
+
+```text
+execution.command = 要求 Execution Client 执行订单
+execution.event   = Execution Client 已接受 / 拒绝 / 提交 / 成交 / 失败
+```
+
+不要把主事实流命名为 `execution.log`。
+日志是副产物，事件是事实。
+
+---
+
+### 3.4 Compute Layer
+
+#### 技术形态
+
+```text
+Python + FastAPI
+stateless compute service
+```
+
+#### 职责
+
+Compute Service 只做计算：
+
+```text
+技术指标计算
+信号强度计算
+仓位数学计算
+组合风险数值计算
+hedge ratio
+basis
+volatility
+correlation
+regression
+regime detection
+模型推理
+```
+
+#### 不负责
+
+```text
+流程控制
+事件调度
+Redis consumer group 状态机
+最终交易批准
+execution.command 生成
+Execution Client 连接管理
+TradingState 持久化
+```
+
+#### 推荐 API
+
+```text
+POST /compute/indicators
+POST /compute/signal-strength
+POST /compute/position-size
+POST /compute/portfolio-risk
+POST /compute/hedge-ratio
+POST /compute/basis
+POST /compute/regime
+```
+
+#### 设计原则
+
+```text
+输入 → 纯计算 → 输出
+无状态
+无流程判断
+无业务副作用
+```
+
+Compute Service 不需要知道自己处于哪个交易流程节点。
+
+---
+
+### 3.5 Strategy & Decision Control Plane
+
+#### 技术形态
+
+```text
+TypeScript
+Bun
+LangGraph optional
+Cursor SDK optional
+Agent SDK optional
+Rule engine optional
+Human review workflow
+Trading Core HTTP / WS client
+Redis Streams consumer / producer for non-critical event fanout
+HTTP client to Compute Services
+Decision workflow checkpoint store
+```
+
+#### 职责
+
+```text
+读取 Trading Core 聚合事件 / market snapshot / execution summary
+维护慢决策 workflow state
+持久化 decision workflow checkpoint
+调用 Compute Services
+执行条件路由
+执行 signal early exit
+调用 Agent 节点
+聚合策略输出
+生成 StrategyDecision / TradeIntent
+提交 TradeIntent 到 Trading Core
+读取 Trading Core 返回的 intent accepted / risk blocked / command state summary
+写 audit.event
+写 system.event
+调用外部研究 / 回测服务
+```
+
+#### 推荐编排拓扑
+
+当前系统不适合使用自由多 Agent swarm 来驱动交易。推荐采用：
+
+```text
+Deterministic Main Trading Graph
+  → 条件路由和状态推进由代码控制
+  → LLM / Agent 只作为受限叶子节点或异步 sidecar
+  → 所有交易相关输出必须提交到 Trading Core
+```
+
+顶层图拆分：
+
+```text
+MarketEventGraph
+  → 处理 market.snapshot / market.bar / symbol metadata summary
+
+StrategyDecisionGraph
+  → 指标计算、信号评分、策略评估、策略决策聚合
+
+AgentReviewSubgraph
+  → 只在条件触发时运行
+  → 输出 AgentReview，不输出 command
+
+RiskApprovalGraph
+  → 可选 pre-risk / soft-risk / explanation
+  → 不作为最终执行批准
+
+ExecutionSagaGraph
+  → submitTradeIntent
+  → record Trading Core response
+  → checkpoint workflow
+
+ExecutionFeedbackGraph
+  → 消费 Trading Core execution summary / execution.event fanout
+  → 更新解释性 workflow state，不覆盖 Trading Core 状态
+
+ReconciliationGraph
+  → 处理 DELIVERY_UNCONFIRMED / SAGA_RECOVERY / REDIS_SPOOL_GAP
+  → 请求 Trading Core refresh / reconciliation summary
+  → 输出 workflow 恢复决策或人工处理请求
+
+ResearchSidecarGraph
+  → 异步研究、回测、策略候选生成
+  → 不直接进入 live execution path
+```
+
+主交易路径：
+
+```text
+receiveMarket
+normalizeMarket
+updateMarketSnapshot
+validateSnapshotFreshness
+computeIndicators
+scoreSignal
+filterSignal
+selectStrategies
+evaluateStrategies
+aggregateStrategyDecision
+agentReviewGate
+agentReviewSubgraph
+buildTradeIntent
+optionalSoftRisk
+submitTradeIntentToTradingCore
+checkpointSaga
+audit
+```
+
+事件恢复路径：
+
+```text
+receiveExecutionFeedback
+  → command.received
+      → updateWorkflowExecutionSummary
+      → checkpointSaga
+
+  → execution.event
+      → readTradingCoreExecutionSummary
+      → updateWorkflowExecutionSummary
+      → checkpointSaga
+
+  → order.snapshot
+      → readTradingCoreStateSummary
+      → resumeWorkflowIfNeeded
+```
+
+条件边：
+
+```text
+filterSignal
+  ├── signal invalid / stale → audit + END
+  └── signal valid → selectStrategies
+
+agentReviewGate
+  ├── high confidence / no anomaly → buildTradeIntent
+  └── ambiguous / volatile / degraded → agentReviewSubgraph
+
+submitTradeIntentToTradingCore
+  ├── accepted → checkpoint + END
+  ├── risk blocked → human_review / audit + END
+  └── rejected → audit + END
+
+delivery timeout / connection lost
+  → wait for Trading Core execution summary / reconciliation result
+  → ReconciliationGraph
+```
+
+设计规则：
+
+```text
+1. Main Trading Graph 不等待 broker 最终成交；Trading Core 接收 intent 后 checkpoint 并结束当前 turn。
+2. Trading Core 的 intent accepted / execution.event summary 作为新事件重新进入 ExecutionFeedbackGraph。
+3. AgentReviewSubgraph 不能改变 Trading Core execution state，也不能写任何 execution plan / command payload。
+4. Trading Core 是最终 risk gate 和 execution gate。
+5. ReconciliationGraph 只能恢复 workflow 或要求人工处理，不能直接生成新交易 command，也不能覆盖 Trading Core execution state。
+6. ResearchSidecarGraph 只写 external.* 事件或 strategy.candidate，不修改 live registry。
+```
+
+#### Strategy & Decision Control Plane 是业务流程 owner
+
+Strategy & Decision Control Plane 负责决定：
+
+```text
+何时调用 Python
+调用哪个 Compute Service API
+如何解释返回值
+走哪个条件分支
+是否进入 Agent Review
+是否调用外部研究 / 回测服务
+是否形成 TradeIntent
+如何解释 Trading Core 返回的 risk blocked / accepted / rejected
+是否进入人工审查或研究流程
+```
+
+Compute Services 不做这些判断。
+Trading Core 做最终风险批准、command 生成、执行状态投影和 broker reconciliation。
+
+---
+
+### 3.6 Risk Layer
+
+#### 技术形态
+
+```text
+Trading Core 内部 domain module
+可调用 Compute Services 做数学计算
+最终批准逻辑在 Trading Core implementation 内执行
+```
+
+#### 部署决策
+
+当前目标架构中，Risk Engine 作为 Trading Core 内部 domain module 部署，而不是 Strategy & Decision Control Plane 节点，也不是独立服务。
+
+理由：
+
+```text
+单机运行，不需要跨进程
+避免额外网络调用
+减少故障点
+更容易访问 Trading Core State Store
+更容易读取 pending commands / snapshots
+风控穿透代价灾难性，必须靠强一致内核兜底
+```
+
+保留清晰模块边界：
+
+```text
+risk-engine/domain
+risk-engine/policy
+risk-engine/evaluator
+risk-engine/result
+```
+
+当需要多实例部署、多账户、多策略高并发或独立风控审计时，再拆分为独立 `risk-engine` service。
+
+#### 职责
+
+```text
+单笔风险检查
+日内亏损检查
+最大回撤检查
+品种风险暴露
+多策略风险聚合
+多腿风险聚合
+禁止无 SL
+过期信号拒绝
+重复 intent / pending command exposure 拒绝
+账户状态校验
+snapshot freshness 校验
+symbol metadata freshness 校验
+broker trading constraints 校验
+风险预算控制
+风控审批有效期控制
+```
+
+#### 输入
+
+```text
+strategy.decision
+trade.intent
+agent.review
+account.snapshot
+position.snapshot
+order.snapshot
+symbol.metadata
+pending execution.command
+pending execution.command state
+risk policy
+market snapshot
+```
+
+#### 输出
+
+```text
+risk.approved
+risk.rejected
+```
+
+#### 风险层边界
+
+策略不能直接生成最终执行命令。
+正确路径：
+
+```text
+strategy.decision
+  → trade.intent
+  → Trading Core
+  → hard risk gate
+  → risk.approved / risk.rejected
+  → execution.plan / execution.command
+```
+
+Risk Layer 是执行前的硬边界。Risk Layer 拥有 `risk.approved` 的有效期语义，但 `execution.command.expires_at` 仍由 Execution Engine 根据上游有效期和 execution policy 派生。
+
+#### Circuit Breaker
+
+Circuit Breaker 是 Trading Core 内部 hard risk gate 的全局保护状态。它不是普通 `risk.rejected`，而是阻断新的交易意图进入执行流程。
+
+状态：
+
+```text
+CLOSED
+  → 正常状态
+
+OPEN
+  → 熔断中，阻断新 TradeIntent 形成 execution.plan / execution.command
+
+HALF_OPEN
+  → 恢复验证中，只允许只读 state、reconciliation、manual review，不允许新开仓
+```
+
+触发条件：
+
+```text
+daily_realized_loss_pct >= max_daily_loss_pct
+equity_drawdown_pct >= max_equity_drawdown_pct
+consecutive_broker_rejections >= max_consecutive_broker_rejections
+consecutive_command_failures >= max_consecutive_command_failures
+manual_reconciliation_required_count > 0 且未处理
+State Store restored 后 reconciliation 未完成
+TIME_SYNC_UNHEALTHY 持续超过 max_time_sync_unhealthy_ms
+snapshot_stale_count 连续超过阈值
+symbol_metadata_stale_count 连续超过阈值
+operator manual trigger
+```
+
+OPEN 后阻断：
+
+```text
+POST /trade-intents
+  → 返回 RISK_BLOCKED
+  → reason = RISK_ENGINE_CIRCUIT_BREAKER_TRIGGERED
+  → 不生成 execution.plan / execution.command
+
+Execution Engine
+  → 不创建新的增加风险暴露的 BUY / SELL command
+  → 允许风险降低型 CLOSE / CANCEL / MODIFY command，例如只收紧 SL，但必须经过 hard risk gate
+
+Execution Client Protocol
+  → 继续允许 command.received / execution.event / snapshots / reconciliation.result
+  → 不影响已在途 broker 订单回报
+
+Event Stream
+  → 发布 system.event: RISK_ENGINE_CIRCUIT_BREAKER_TRIGGERED
+  → 发布 risk.summary(circuit_breaker_status=OPEN)
+```
+
+重置规则：
+
+```text
+自动重置只允许从 OPEN → HALF_OPEN，不允许直接 OPEN → CLOSED。
+进入 HALF_OPEN 前必须完成 account / position / order / symbol metadata refresh。
+进入 HALF_OPEN 前必须完成 pending command reconciliation。
+HALF_OPEN 观察窗口内不得出现新的 hard risk violation。
+HALF_OPEN 只能允许 no-op validation 或风险降低动作。
+恢复 CLOSED 必须满足：
+  → clock health HEALTHY
+  → State Store HEALTHY
+  → no MANUAL_RECONCILIATION_REQUIRED
+  → drawdown / daily loss 未继续恶化
+  → operator approval 或配置允许 auto_reset
+
+manual reset 必须写 audit.event，并记录 operator_id / reason / before_state / after_state。
+```
+
+推荐状态结构：
+
+```ts
+export interface CircuitBreakerState {
+  status: "CLOSED" | "OPEN" | "HALF_OPEN"
+  reason?: ErrorCode | "OK"
+  triggered_at?: number
+  triggered_by?: string
+  reset_at?: number
+  reset_by?: string
+  blocked_intent_count: number
+  metadata?: Record<string, unknown>
+}
+```
+
+`GET /state.risk.circuit_breaker_active` 等价于 `CircuitBreakerState.status != "CLOSED"`。推荐同时返回完整 `circuit_breaker` 对象，避免只有 boolean 无法判断原因。
+
+---
+
+### 3.7 Execution Layer
+
+Execution Layer 是 Trading Core 内部的 execution domain module。它拥有 `execution.plan` / `execution.command` 的状态机，并把客户端返回的 `command.received` 与 `execution.event` 投影为可恢复的执行状态。
+
+#### 技术形态
+
+```text
+Execution Plan Builder
+Execution Command Builder
+Command Lifecycle State Machine
+Execution Event Projector
+Execution Recovery / Rollback Handler
+```
+
+#### 职责
+
+```text
+将 risk.approved / trade.intent 转换为 execution.plan
+将 execution.plan 拆解为 execution.command
+从 strategy.decision / risk.result / execution policy 派生 execution.command.expires_at
+拒绝投递过期、不匹配、不可确认或超过执行约束的 command
+通过 Trading Gateway / adapter router 投递 execution.command
+维护 command lifecycle state
+维护 plan lifecycle state
+接收 command.received
+接收 execution.event
+将 execution.event 投影到 command / plan 状态
+处理 DELIVERY_UNCONFIRMED 的 broker reconciliation
+写 audit.event
+触发 account.snapshot / position.snapshot / order.snapshot / symbol.metadata 刷新
+维护 idempotency journal
+维护 SQLite / append-only execution store
+```
+
+#### 不负责
+
+```text
+维护 TCP socket
+Execution Client session registry
+心跳检测
+连接断线重连
+消息 framing encode / decode
+真实订单执行
+broker order API 适配
+定义 signal expiry
+延长 risk approval validity
+策略判断
+LLM / Agent 判断
+```
+
+#### 单腿策略路径
+
+```text
+risk.approved
+  → execution.plan
+  → execution.command
+  → Gateway delivery request
+  → command.received
+  → execution.event
+  → command / plan status projection
+```
+
+#### 多腿策略路径
+
+```text
+risk.approved
+  → execution.plan
+  → execution.command leg 1
+  → execution.command leg 2
+  → command.received leg 1
+  → command.received leg 2
+  → execution.event leg 1
+  → execution.event leg 2
+  → plan status update
+```
+
+Execution Layer 不负责策略判断、LLM / Agent 判断或真实 broker 执行。`execution.command.expires_at` 由 Execution Layer 写入 command payload，但它是从上游有效期和执行约束派生出来的字段，不是 Execution Layer 自己拥有的业务有效期。Execution Layer 拥有拒绝执行的权利和责任，但不得延长上游有效期。
+
+---
+
+## 4. Execution Command 完整性与 ACK 回路
+
+`execution.command` 从 Trading Core 到 Execution Client 的路径必须有投递确认，避免内部队列满、连接异常或投递失败导致 command 静默丢失。Strategy & Decision Control Plane 提交的是 `TradeIntent`，不直接投递 `execution.command`。
+
+### 4.1 投递路径
+
+```text
+Strategy & Decision Control Plane
+  → trade.intent
+  → Trading Core
+  → hard risk gate
+  → execution.plan
+  → execution.command
+  → Trading Gateway / adapter router
+  → Execution Client
+  → command.received
+  → Trading Core
+  → execution.command.state
+  → event fanout to Strategy & Decision Control Plane / UI
+```
+
+Trading Gateway / adapter router 投递前置校验：
+
+```text
+active session
+  → 必须存在匹配 client_id / account_id / terminal_id 的 active session
+  → 无匹配 session 时不得写 socket，返回 COMMAND_DELIVERY_FAILED
+
+session identity
+  → WireMessage.session_id 必须等于 Gateway 当前 active session_id
+  → execution.command.account_id / client_id / terminal_id 必须匹配 authenticated session context
+  → 不匹配时不得投递，写 system.event: SESSION_IDENTITY_MISMATCH
+
+expires_at
+  → Gateway 使用 server_now_ms 判断；server_now_ms 已经超过 expires_at 时不得投递
+  → 写 system.event: COMMAND_EXPIRED
+  → Execution Layer 将 command state 推进到 EXPIRED
+
+max_inflight_commands
+  → 同一 session 下 DISPATCHED 且未收到 command.received 的 command 数量不得超过 hello.accepted.max_inflight_commands
+  → 超限时 Gateway 不得写 socket
+  → 写 system.event: COMMAND_DISPATCH_BACKPRESSURE，metadata.reason=COMMAND_INFLIGHT_LIMIT_REACHED
+  → Execution Layer 保持 command 未 DISPATCHED，或在 retry budget 耗尽后标记 DELIVERY_FAILED
+```
+
+### 4.2 ACK 规则
+
+Trading Gateway / adapter router 将 command 投递给 Execution Client 后，必须等待客户端返回：
+
+```text
+command.received
+```
+
+ACK 分三层：
+
+```text
+transport ack
+  → 客户端收到完整 WireMessage，成功解析 envelope，并回传 message_id
+
+command.received
+  → execution.command 已进入客户端 command inbox
+  → 必须包含 command_id 和 source message_id
+  → 这是 command 进入执行域的边界
+
+execution.event
+  → 客户端已拒绝 / 接受 / 提交订单 / 成交 / 失败
+```
+
+推荐 ACK payload：
+
+```ts
+export interface TransportAck {
+  message_id: string
+  received_at: number // receiver-side server-time domain
+}
+
+export interface CommandReceived {
+  command_id: string
+  plan_id?: string
+  leg_id?: string
+
+  source_message_id: string
+  idempotency_key: string
+
+  account_id: string
+  client_id?: string
+  terminal_id?: string
+
+  received_at: number // Execution Client effective_server_now_ms when command enters inbox
+}
+```
+
+推荐超时：
+
+```text
+delivery_ack_timeout_ms = 5000
+```
+
+### 4.3 超时处理
+
+如果超时未收到 `command.received`：
+
+```text
+Trading Gateway 写 system.event: COMMAND_DELIVERY_TIMEOUT
+Trading Gateway 标记该 session delivery attempt unconfirmed
+Execution Layer 将 command lifecycle state 更新为 DELIVERY_UNCONFIRMED
+Execution Layer 触发 account / position / order reconciliation
+Execution Layer 根据 reconciliation 结果决定 EXPIRED / FAILED / retry / manual_review
+```
+
+### 4.4 Execution Client 断开时的 pending command 处理
+
+当发生：
+
+```text
+system.event: EXECUTION_CLIENT_CONNECTION_LOST
+```
+
+Trading Gateway 必须：
+
+```text
+标记该 Execution Client session 下所有已 DISPATCHED 但未收到 command.received 的 delivery attempt 为 unconfirmed
+写 system.event: COMMAND_DELIVERY_UNCONFIRMED
+```
+
+Execution Layer 必须：
+
+```text
+将已 DISPATCHED 但未收到 command.received 的 command 标记为 DELIVERY_UNCONFIRMED
+将 command / plan projection 推进到 RECONCILING
+发布 execution.summary / system.event，Strategy & Decision Control Plane 可据此 checkpoint workflow
+刷新 account.snapshot / position.snapshot / broker order state
+写 audit.event 说明投递状态不确定
+不得假设 command 已被 Execution Client 执行
+不得在 reconciliation 完成前使用新 command 盲目重试
+```
+
+### 4.5 设计原则
+
+```text
+command.received 只代表 Execution Client 已收到 command，不代表订单已成交
+ACCEPTED / FILLED / PARTIALLY_FILLED / FAILED 由后续 execution.event 表达
+未收到 command.received 的 command 不能视为已进入执行域
+未收到 command.received 的 command 也不能视为绝对未执行，必须先 reconcile
+DELIVERY_FAILED 只用于 Trading Gateway 明确知道未投递成功的情况，例如无可用 session、认证失败或 socket write 失败且未写入内核发送缓冲区
+DELIVERY_UNCONFIRMED 用于 Gateway 无法确认客户端是否收到 command 的情况
+```
+
+### 4.6 Reconciliation 协议
+
+`RECONCILING` 必须通过 Trading Gateway 请求 Execution Client 刷新 broker 当前状态，不能由 Strategy & Decision Control Plane 直接连接 broker。
+
+推荐路径：
+
+```text
+Execution Layer
+  → reconciliation.request
+  → Trading Gateway
+  → Execution Client
+  → reconciliation.result
+  → Trading Gateway
+  → Execution Layer state projection
+  → WS / Redis fanout to Strategy & Decision Control Plane / UI
+```
+
+推荐 payload：
+
+```ts
+export interface ReconciliationRequest {
+  request_id: string
+  reason:
+    | "DELIVERY_UNCONFIRMED"
+    | "SAGA_RECOVERY"
+    | "REDIS_SPOOL_GAP"
+    | "MANUAL_RECONCILIATION_REQUIRED"
+
+  account_id: string
+  terminal_id?: string
+  client_id?: string
+
+  command_id?: string
+  plan_id?: string
+  leg_id?: string
+
+  symbols: SymbolCode[]
+  broker_order_id?: string
+  position_ticket?: string
+
+  requested_at: number
+}
+
+export interface ReconciliationResult {
+  request_id: string
+  status: "OK" | "PARTIAL" | "FAILED"
+
+  account?: AccountSnapshot
+  positions: PositionSnapshot[]
+  orders: OrderSnapshot[]
+  symbol_metadata: SymbolMetadataSnapshot[]
+
+  completed_at: number
+  message?: string
+}
+```
+
+规则：
+
+```text
+Execution Layer owns reconciliation state
+Gateway only routes reconciliation.request / result
+Execution Client reads broker terminal state and returns snapshots
+reconciliation.result 不是执行事实来源
+如果 result 与 ExecutionEvent 冲突，以 ExecutionEvent 为事实来源，并写 audit.event
+如果 result 缺失或失败，command 进入 manual_review 或 MANUAL_RECONCILIATION_REQUIRED
+```
+
+---
+
+## 5. 服务间认证与最小安全边界
+
+系统内所有服务间调用必须具备最低限度认证，防止任意进程伪造市场数据、执行事件或计算结果。
+
+### 5.1 Execution Client → Gateway
+
+Execution Client 连接 Gateway 的 Native TCP 或 Execution WebSocket endpoint 时必须进行 client auth secret 握手。
+
+```text
+Execution Client 建立 transport 连接
+  → 发送 hello { client_id, platform, terminal_id, account_id, token, capabilities }
+  → Gateway 校验 token
+  → 通过后注册 session
+  → 失败则断开连接并写 system.event: AUTHENTICATION_FAILED
+```
+
+安全规则：
+
+```text
+client auth secret 用于连接准入
+command signing secret 用于 execution.command HMAC
+两类 secret 必须分离
+secret 必须按 client_id / account_id 维度配置，并支持轮换
+```
+
+session identity binding：
+
+```text
+Gateway 认证通过后生成 authenticated session context:
+  { session_id, client_id, account_id, terminal_id, platform }
+
+hello 之后的所有 inbound WireMessage:
+  → session_id 必须等于当前 transport session 的 authenticated session_id
+  → client_id 如果出现，必须等于 authenticated session context.client_id
+
+所有带 account_id / client_id / terminal_id 的 payload:
+  → 必须与 authenticated session context 一致
+  → 不允许客户端在 payload 中声明另一个账户或终端
+
+所有 outbound execution.command:
+  → Gateway 只能投递到匹配 account_id / client_id / terminal_id 的 active session
+  → Execution Client 必须拒绝与本地 account / terminal / client 不匹配的 command
+
+不匹配处理:
+  → 不发送 command.received
+  → 不进入 command inbox
+  → 写 system.event: SESSION_IDENTITY_MISMATCH
+  → 严重或重复出现时关闭 session
+```
+
+### 5.2 Trading Core → Strategy & Decision Control Plane / 内部服务
+
+Trading Core 对 Strategy & Decision Control Plane、UI、内部服务暴露的 HTTP / WS API 必须启用认证。最小可用配置可以使用固定 API Key；生产环境应升级为 mTLS 或短期 token。
+
+```text
+Authorization: Bearer <internal_service_token>
+X-Request-Id: <request_id>
+X-Correlation-Id: <correlation_id>
+```
+
+`X-Internal-Api-Key` 只允许作为本地开发兼容模式，不作为正式协议字段。
+
+### 5.3 Strategy & Decision Control Plane → Compute Service
+
+Python FastAPI 必须启用 bearer token 校验。
+
+```text
+Authorization: Bearer <compute_service_token>
+```
+
+### 5.4 安全边界
+
+```text
+未经认证的 Execution Client 不能发布 market.bar / market.tick
+未经认证的内部服务不能写 execution.event
+未经认证的调用不能访问 compute-service
+所有认证失败写 system.event: AUTHENTICATION_FAILED
+```
+
+Execution Client transport 部署边界：
+
+```text
+同机部署或受控私有网络：
+  → 可使用 Native TCP / Execution WebSocket + client auth secret + command HMAC
+
+跨主机、跨网络或云主机部署：
+  → 必须启用 TLS / mTLS，或使用 WireGuard / Tailscale 等网络隔离
+  → Gateway 不应暴露在公网
+  → client auth secret 和 command signing secret 不得通过明文配置分发
+```
+
+`execution.command` 必须有 HMAC。`command.received`、`execution.event`、`account.snapshot`、`position.snapshot` 依赖连接认证与传输层保护；如果运行在非受控网络，也应增加消息级签名或强制 mTLS。
+
+### 5.5 Secret Rotation
+
+client auth secret 和 command signing secret 必须支持平滑轮换。
+
+推荐 secret 状态：
+
+```text
+ACTIVE
+NEXT
+RETIRED
+REVOKED
+```
+
+轮换流程：
+
+```text
+1. 为 client_id / account_id 生成 NEXT secret。
+2. Trading Gateway / Trading Core 同时接受 ACTIVE 和 NEXT。
+3. Execution Client reload 配置并开始使用 NEXT。
+4. Gateway 观测到 client 使用 NEXT 成功连接和验签。
+5. 将 NEXT 提升为 ACTIVE，旧 ACTIVE 标记为 RETIRED。
+6. grace period 结束后旧 secret 标记为 REVOKED。
+```
+
+规则：
+
+```text
+auth secret 和 command signing secret 分开轮换
+轮换必须写 audit.event
+验签失败不得自动 fallback 到所有历史 secret，只能接受 ACTIVE / NEXT
+REVOKED secret 命中必须写 system.event: AUTHENTICATION_FAILED
+轮换失败必须支持回滚到旧 ACTIVE
+```
+
+---
+
+## 6. 统一事件 Envelope
+
+所有 Redis Streams 消息必须包统一 envelope。
+
+```ts
+export interface EventEnvelope<T> {
+  event_id: string
+  correlation_id: string
+  causation_id?: string
+
+  type: string
+  source: string
+  schema_version: string
+
+  created_at: number
+  received_at?: number
+  observed_at?: number
+
+  payload: T
+}
+```
+
+### 字段语义
+
+| 字段               | 含义                                          |
+| ------------------ | --------------------------------------------- |
+| `event_id`       | 当前事件唯一 ID                               |
+| `correlation_id` | 一条交易链路的统一追踪 ID                     |
+| `causation_id`   | 当前事件由哪个上游事件触发                    |
+| `type`           | 事件类型，例如 `market.bar`                 |
+| `source`         | 事件来源，例如 `mt5-adapter`                |
+| `schema_version` | 消息 schema 版本                              |
+| `created_at`     | server-time domain 的系统创建时间             |
+| `received_at`    | Gateway / consumer 收到消息时的 server_now_ms |
+| `observed_at`    | 外部状态被观测到时的 server-time domain 时间  |
+| `payload`        | 业务载荷                                      |
+
+### Dead Letter Event
+
+无法解析、schema 不兼容、缺少必填字段或类型错误的消息必须写入 `deadletter.event`，不得静默丢弃。
+
+```ts
+export interface DeadLetterEvent {
+  deadletter_id: string
+  original_type?: string
+  original_message_id?: string
+  original_event_id?: string
+  source: string
+  reason:
+    | "UNKNOWN_TYPE"
+    | "SCHEMA_MAJOR_MISMATCH"
+    | "MISSING_REQUIRED_FIELD"
+    | "INVALID_FIELD_TYPE"
+    | "INVALID_HMAC"
+    | "DECODE_FAILED"
+    | "WIRE_FRAME_TOO_LARGE"
+    | "WIRE_PROTOCOL_VIOLATION"
+
+  raw_payload?: string
+  raw_payload_length?: number
+  error_message: string
+  created_at: number
+}
+```
+
+`deadletter.event` 只能用于排查和人工处理，不得被业务流程直接消费为有效事件。
+
+---
+
+## 7. 核心数据模型
+
+### 7.1 Common Types
+
+```ts
+export type SymbolCode = string
+export type TimeframeCode = string
+
+export type ErrorCode =
+  | "ACCOUNT_SNAPSHOT_STALE"
+  | "SYMBOL_METADATA_STALE"
+  | "ORDER_SNAPSHOT_STALE"
+  | "TRADE_INTENT_EXPIRED"
+  | "TRADE_INTENT_TIME_INVALID"
+  | "DUPLICATE_TRADE_INTENT"
+  | "DUPLICATE_COMMAND"
+  | "DUPLICATE_IDEMPOTENCY_CONFLICT"
+  | "INVALID_HMAC"
+  | "AUTHENTICATION_FAILED"
+  | "SESSION_IDENTITY_MISMATCH"
+  | "COMMAND_EXPIRED"
+  | "COMMAND_DELIVERY_TIMEOUT"
+  | "COMMAND_DELIVERY_UNCONFIRMED"
+  | "COMMAND_DELIVERY_FAILED"
+  | "COMMAND_DISPATCH_BACKPRESSURE"
+  | "COMMAND_INFLIGHT_LIMIT_REACHED"
+  | "BROKER_REJECTED"
+  | "BROKER_TIMEOUT"
+  | "INSUFFICIENT_MARGIN"
+  | "INVALID_VOLUME"
+  | "INVALID_PRICE"
+  | "INVALID_STOPS"
+  | "TRADE_MODE_DISABLED"
+  | "RECONCILIATION_FAILED"
+  | "MANUAL_RECONCILIATION_REQUIRED"
+  | "SCHEMA_VALIDATION_FAILED"
+  | "BAD_REQUEST"
+  | "UNAUTHORIZED"
+  | "FORBIDDEN"
+  | "NOT_FOUND"
+  | "METHOD_NOT_ALLOWED"
+  | "CONFLICT"
+  | "IDEMPOTENCY_KEY_CONFLICT"
+  | "RATE_LIMITED"
+  | "INTERNAL_ERROR"
+  | "SERVICE_UNAVAILABLE"
+  | "RISK_ENGINE_CIRCUIT_BREAKER_TRIGGERED"
+  | "REDIS_UNAVAILABLE"
+  | "STATE_STORE_UNAVAILABLE"
+  | "CLOCK_SKEW_DETECTED"
+  | "TIME_SYNC_UNHEALTHY"
+  | "LONG_TERM_AUDIT_WRITE_FAILED"
+  | "SECRET_ROTATION_FAILED"
+  | "DEADLETTER_CREATED"
+  | "UNKNOWN_TYPE"
+  | "SCHEMA_MAJOR_MISMATCH"
+  | "MISSING_REQUIRED_FIELD"
+  | "INVALID_FIELD_TYPE"
+  | "DECODE_FAILED"
+  | "WIRE_FRAME_TOO_LARGE"
+  | "WIRE_PROTOCOL_VIOLATION";
+
+export const SUPPORTED_SYMBOLS = ["XAUUSD", "BTCUSD"] as const
+export const SUPPORTED_TIMEFRAMES = ["H1", "H4"] as const
+```
+
+说明：
+
+```text
+SymbolCode 和 TimeframeCode 使用 string，避免类型层面硬编码扩展瓶颈。
+SUPPORTED_SYMBOLS / SUPPORTED_TIMEFRAMES 用于运行时校验和配置约束。
+新增品种或周期时只改集中配置，不改所有数据结构类型。
+ErrorCode 必须集中维护。跨模块 reason / error_code 字段优先使用 ErrorCode，详细说明放入 message / metadata。
+```
+
+### 7.2 MarketBar
+
+```ts
+export interface MarketBar {
+  symbol: SymbolCode
+  timeframe: TimeframeCode
+  timestamp: number
+
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+}
+```
+
+### 7.3 MarketSnapshot
+
+```ts
+export interface MarketSnapshot {
+  symbol: SymbolCode
+  broker_symbol?: string
+  bid: number
+  ask: number
+  spread: number
+  observed_at: number
+}
+```
+
+### 7.4 SymbolMetadataSnapshot
+
+```ts
+export interface SymbolMetadataSnapshot {
+  account_id: string
+
+  symbol: SymbolCode
+  broker_symbol: string
+
+  digits: number
+  point: number
+  tick_size: number
+  tick_value: number
+  contract_size: number
+
+  volume_min: number
+  volume_max: number
+  volume_step: number
+
+  stops_level_points: number
+  freeze_level_points: number
+  margin_initial?: number
+  margin_maintenance?: number
+
+  trade_mode: "FULL" | "LONG_ONLY" | "SHORT_ONLY" | "CLOSE_ONLY" | "DISABLED"
+
+  observed_at: number
+}
+```
+
+`SymbolMetadataSnapshot` 是风控、下单格式化和 HMAC canonical number formatting 的共同依赖。Risk Layer 和 Execution Layer 不得依赖硬编码 digits / volume step / tick value。
+
+### 7.5 IndicatorSnapshot
+
+```ts
+export interface IndicatorSnapshot {
+  symbol: SymbolCode
+  timeframe: TimeframeCode
+  timestamp: number
+
+  rsi?: number
+  bbw?: number
+  bb_upper?: number
+  bb_lower?: number
+  bb_mid?: number
+
+  par?: number
+  par_direction?: "UP" | "DOWN" | "FLAT"
+
+  ema_21?: number
+  ema_55?: number
+  ema_200?: number
+  ema_alignment?: "BULLISH" | "BEARISH" | "MIXED"
+
+  adx?: number
+  atr?: number
+}
+```
+
+### 7.6 SignalRaw
+
+```ts
+export interface SignalRaw {
+  symbol: SymbolCode
+  timeframe: TimeframeCode
+  timestamp: number
+
+  rsi?: number
+  bbw?: number
+  par_direction?: "UP" | "DOWN" | "FLAT"
+  ema_alignment?: "BULLISH" | "BEARISH" | "MIXED"
+  adx?: number
+
+  metadata?: Record<string, unknown>
+}
+```
+
+### 7.7 SignalScored
+
+```ts
+export interface SignalScored {
+  symbol: SymbolCode
+  timeframe: TimeframeCode
+  timestamp: number
+
+  score: number
+  confidence: number
+  ic_score?: number
+  regime: "TREND" | "RANGE" | "VOLATILE" | "UNKNOWN"
+
+  reason: string
+}
+```
+
+### 7.8 StrategyDecision
+
+```ts
+export interface StrategyDecision {
+  decision_id: string
+  strategy_id: string
+
+  symbol: SymbolCode
+  timeframe: TimeframeCode
+
+  action: "BUY" | "SELL" | "CLOSE" | "HOLD"
+  confidence: number
+  reason: string
+
+  proposed_risk_pct: number
+  proposed_sl?: number
+  proposed_tp?: number
+
+  timestamp: number
+  signal_expires_at: number
+}
+```
+
+说明：
+
+```text
+timestamp         = strategy decision 生成时间，必须使用 Trading Core server-time domain
+signal_expires_at = 策略信号失效时间，由 Strategy & Decision Control Plane / Strategy Runtime 负责，必须使用 Trading Core server-time domain
+```
+
+### 7.8.1 TradeIntent
+
+```ts
+export interface TradeIntent {
+  intent_id: string
+  decision_id: string
+  strategy_id: string
+  correlation_id: string
+
+  symbol: SymbolCode
+  timeframe: TimeframeCode
+
+  action: "BUY" | "SELL" | "CLOSE" | "HOLD"
+  confidence: number
+  reason: string
+
+  proposed_risk_pct: number
+  proposed_sl?: number
+  proposed_tp?: number
+  proposed_legs?: Array<{
+    leg_id: string
+    symbol: SymbolCode
+    action: "BUY" | "SELL" | "CLOSE"
+    ratio: number
+    proposed_sl?: number
+    proposed_tp?: number
+  }>
+
+  signal_expires_at: number
+  requested_at: number
+}
+```
+
+`TradeIntent` 是 Strategy & Decision Control Plane 提交给 Trading Core 的交易意图，不是执行命令。它不能包含 broker_order_id、magic、filling_policy、最终 lots、最终 order_type 或 HMAC。Trading Core 必须基于最新状态、RiskResult 和 execution policy 生成最终 `execution.plan` / `execution.command`。
+
+`TradeIntent.signal_expires_at` 与 `TradeIntent.requested_at` 必须使用 Trading Core server-time domain。Strategy & Decision Control Plane 不能用本地 wall clock 生成控制时间；需要通过 Trading Core `/state`、`/time` 或 WS heartbeat 维护 server time offset。
+
+### 7.9 AgentReview
+
+```ts
+export interface AgentReview {
+  review_id: string
+
+  score_adjustment: number
+  recommendation: "none" | "skip" | "reduce_risk" | "manual_review"
+
+  reason: string
+}
+```
+
+`score_adjustment` 有效范围为 `-1.0 ~ 1.0`。Risk Layer 使用前必须 clamp：
+
+```ts
+const scoreAdjustment = Math.max(-1.0, Math.min(1.0, review.score_adjustment))
+```
+
+### 7.10 AccountSnapshot
+
+```ts
+export interface AccountSnapshot {
+  account_id: string
+
+  balance: number
+  equity: number
+  margin: number
+  free_margin: number
+  currency: string
+
+  observed_at: number
+}
+```
+
+### 7.11 PositionSnapshot
+
+```ts
+export interface PositionSnapshot {
+  account_id: string
+
+  symbol: SymbolCode
+  position_id: string
+  side: "BUY" | "SELL"
+
+  lots: number
+  open_price: number
+  sl?: number
+  tp?: number
+
+  floating_pnl: number
+  observed_at: number
+}
+```
+
+### 7.11.1 OrderSnapshot
+
+```ts
+export interface OrderSnapshot {
+  account_id: string
+  terminal_id?: string
+  client_id?: string
+
+  symbol: SymbolCode
+  broker_symbol?: string
+
+  broker_order_id: string
+  position_ticket?: string
+  command_id?: string
+  plan_id?: string
+  leg_id?: string
+  idempotency_key?: string
+
+  side: "BUY" | "SELL"
+  order_type: "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT"
+  status:
+    | "PLACED"
+    | "PARTIALLY_FILLED"
+    | "FILLED"
+    | "CANCELLED"
+    | "REJECTED"
+    | "EXPIRED"
+    | "UNKNOWN"
+
+  requested_lots: number
+  filled_lots: number
+  remaining_lots: number
+
+  price?: number
+  sl?: number
+  tp?: number
+
+  created_at?: number
+  updated_at?: number
+  observed_at: number
+}
+```
+
+`OrderSnapshot` 用于 `DELIVERY_UNCONFIRMED`、Saga 恢复和人工 reconciliation。它不是执行事实来源；执行事实仍然来自 `ExecutionEvent`。`OrderSnapshot` 是当前 broker 订单状态的观测快照，用于判断是否需要重试、回滚或人工处理。
+
+### 7.12 RiskRequest
+
+```ts
+export interface RiskRequest {
+  request_id: string
+
+  decision: StrategyDecision
+  intent: TradeIntent
+  agent_review?: AgentReview
+
+  account: AccountSnapshot
+  positions: PositionSnapshot[]
+  orders: OrderSnapshot[]
+  symbol_metadata: SymbolMetadataSnapshot[]
+  pending_commands: ExecutionCommand[]
+  pending_command_states: ExecutionCommandState[]
+
+  policy: RiskPolicy
+  market: MarketSnapshot
+}
+```
+
+`RiskRequest` 是 Trading Core 内部风控评估对象，不是 Strategy & Decision Control Plane 的外部提交 payload。外部只提交 `TradeIntent`；Trading Core 基于本地最新状态组装 `RiskRequest`。
+
+`pending_commands` 提供不可变 command 载荷，`pending_command_states` 提供 lifecycle 状态。Risk Layer 做敞口和重复下单检查时应以 state 判断 command 是否仍然有效，以 command payload 读取 symbol / lots / direction 等执行细节。
+
+### 7.13 RiskResult
+
+```ts
+export interface RiskResult {
+  risk_id: string
+  approved: boolean
+
+  reason: ErrorCode | "OK"
+  message?: string
+  adjusted_risk_pct?: number
+  adjusted_legs?: Array<{
+    leg_id: string
+    lots: number
+    risk_pct?: number
+    reason?: ErrorCode | "OK"
+  }>
+
+  decision_id: string
+
+  snapshot_age_ms: number
+  symbol_metadata_age_ms: number
+  evaluated_at: number
+  valid_until: number
+}
+```
+
+说明：
+
+```text
+snapshot_age_ms        = 风控评估时使用的 account / position / order snapshot 距当前时间的最大年龄
+symbol_metadata_age_ms = 风控评估时使用的 symbol metadata 距当前时间的年龄
+evaluated_at           = 风控完成评估的时间戳
+valid_until            = 本次风控审批失效时间，由 Risk Layer 负责，必须不晚于相关 snapshot / order snapshot / metadata freshness 边界
+```
+
+`adjusted_legs` 是 Risk Layer 对多腿策略的唯一调整输出。单腿策略也应使用只有一个元素的 `adjusted_legs`，避免单腿和多腿走两套语义。
+
+这些字段用于审计和排查风控是否基于足够新鲜的账户状态与交易品种约束。
+
+### 7.14 ExecutionPlan
+
+```ts
+export interface ExecutionPlan {
+  plan_id: string
+  strategy_id: string
+
+  mode: "sequential" | "simultaneous" | "best_effort_atomic"
+  legs: ExecutionLeg[]
+
+  failure_policy: "cancel_all" | "partial_fill" | "retry"
+  rollback_policy?: RollbackPolicy
+
+  status:
+    | "PENDING"
+    | "RECONCILING"
+    | "MANUAL_RECONCILIATION_REQUIRED"
+    | "PARTIAL"
+    | "COMPLETED"
+    | "FAILED"
+    | "EXPIRED"
+    | "CANCELLED"
+  filled_legs: string[]
+  failed_legs: string[]
+}
+```
+
+Plan 级别状态用于多腿策略的聚合执行控制。Execution Layer 根据 `filled_legs`、`failed_legs` 与 `failure_policy` 决定是否继续执行、触发 `cancel_all` 或执行 rollback。
+
+### 7.15 ExecutionLeg
+
+```ts
+export interface ExecutionLeg {
+  leg_id: string
+
+  symbol: SymbolCode
+  action: "BUY" | "SELL" | "CLOSE" | "MODIFY" | "CANCEL"
+
+  lots?: number
+  sl?: number
+  tp?: number
+
+  ratio: number
+  dependency: string[]
+
+  status:
+    | "PENDING"
+    | "SENT"
+    | "DELIVERY_UNCONFIRMED"
+    | "RECONCILING"
+    | "MANUAL_RECONCILIATION_REQUIRED"
+    | "COMMAND_RECEIVED"
+    | "ACCEPTED"
+    | "REJECTED"
+    | "ORDER_SENT"
+    | "PARTIALLY_FILLED"
+    | "FILLED"
+    | "FAILED"
+    | "EXPIRED"
+    | "CANCELLED"
+}
+```
+
+### 7.16 ExecutionCommand
+
+```ts
+export interface ExecutionCommand {
+  command_id: string
+  plan_id?: string
+  leg_id?: string
+  strategy_id: string
+
+  account_id: string
+  terminal_id?: string
+  client_id?: string
+
+  symbol: SymbolCode
+  broker_symbol?: string
+  action: "BUY" | "SELL" | "CLOSE" | "MODIFY" | "CANCEL"
+  order_type?:
+    | "MARKET"
+    | "LIMIT"
+    | "STOP"
+    | "STOP_LIMIT"
+
+  lots?: number
+  price?: number
+  sl?: number
+  tp?: number
+  deviation_points?: number
+
+  magic: number
+  comment?: string
+
+  position_ticket?: string
+  broker_order_id?: string
+
+  filling_policy?: "FOK" | "IOC" | "RETURN"
+  time_policy?: "GTC" | "DAY" | "SPECIFIED"
+  expiration_time?: number
+
+  expires_at: number
+  idempotency_key: string
+
+  hmac: string
+}
+```
+
+`ExecutionCommand` 是不可变执行请求载荷，不承载全局生命周期状态。生命周期状态由 Execution Layer 维护。
+
+字段说明：
+
+```text
+account_id / terminal_id / client_id
+  → 多账户、多终端、多执行客户端路由和审计所需
+
+plan_id / leg_id
+  → 多腿执行投影所需；由 execution.plan 生成的 command 必须携带 leg_id
+
+symbol / broker_symbol
+  → symbol 是系统标准品种，broker_symbol 是券商实际交易品种名
+
+action
+  → 业务动作：BUY / SELL / CLOSE / MODIFY / CANCEL
+
+order_type
+  → 订单类型：市价 / 限价 / 停止 / stop-limit
+  → BUY / SELL 创建订单时必填
+  → CLOSE 默认为 MARKET，可为空
+  → MODIFY / CANCEL 可为空
+
+lots
+  → BUY / SELL 必填
+  → CLOSE 部分平仓时必填；全平可为空并由 Execution Client 按 position_ticket 解析
+  → MODIFY / CANCEL 可为空
+
+price
+  → LIMIT / STOP / STOP_LIMIT 必填；MARKET 可为空
+
+deviation_points
+  → MT5 市价单允许滑点
+
+magic / comment
+  → MT5 订单标识和审计备注
+
+position_ticket
+  → CLOSE 在 hedging 账户下必须明确目标 position
+  → MODIFY position 时必须明确目标 position
+
+broker_order_id
+  → MODIFY / CANCEL 时用于指定待修改或待取消订单
+
+filling_policy / time_policy / expiration_time
+  → MT5 order filling / time policy 映射
+
+expires_at
+  → command 最后可执行时间
+  → 由 Execution Layer 根据 strategy_decision.signal_expires_at、risk_result.valid_until 和 execution_policy.max_command_ttl_ms 派生
+  → Execution Layer 可以因为执行约束缩短它，但不得晚于任何上游有效期
+```
+
+action-specific validation：
+
+```text
+BUY / SELL
+  → lots 必填
+  → order_type 必填
+  → LIMIT / STOP / STOP_LIMIT 需要 price
+
+CLOSE
+  → hedging 账户必须提供 position_ticket
+  → lots 为空表示全平，lots 有值表示部分平仓
+
+MODIFY
+  → broker_order_id 或 position_ticket 至少一个必填
+  → sl / tp / price / expiration_time 至少一个修改字段必填
+
+CANCEL
+  → broker_order_id 必填
+  → lots / order_type / price 可为空
+```
+
+### 7.16.1 ExecutionCommandState
+
+```ts
+export interface ExecutionCommandState {
+  command_id: string
+  plan_id?: string
+  leg_id?: string
+
+  status:
+    | "CREATED"
+    | "DISPATCHED"
+    | "DELIVERY_UNCONFIRMED"
+    | "DELIVERY_FAILED"
+    | "RECONCILING"
+    | "MANUAL_RECONCILIATION_REQUIRED"
+    | "COMMAND_RECEIVED"
+    | "ACCEPTED"
+    | "REJECTED"
+    | "ORDER_SENT"
+    | "PARTIALLY_FILLED"
+    | "FILLED"
+    | "FAILED"
+    | "EXPIRED"
+    | "CANCELLED"
+
+  delivery_attempts: number
+  last_delivery_error?: string
+
+  created_at: number
+  dispatched_at?: number
+  command_received_at?: number
+  reconciling_at?: number
+  completed_at?: number
+  updated_at: number
+}
+```
+
+状态所有权：
+
+```text
+Execution Layer owns ExecutionCommandState
+Trading Gateway only reports delivery result / timeout as system.event
+Execution Client only reports command.received and execution.event
+```
+
+`ORDER_SENT` 由 `execution.event(status=ORDER_SENT)` 投影得到，用于区分“客户端接受命令”和“订单已提交到 broker”。恢复时仍以 `ExecutionEvent` 重放为准。
+
+#### Execution State Transition Rules
+
+Command 状态必须单向推进，terminal state 不得回退。
+
+```text
+CREATED
+  → DISPATCHED
+  → EXPIRED
+  → CANCELLED
+
+DISPATCHED
+  → COMMAND_RECEIVED
+  → DELIVERY_UNCONFIRMED
+  → DELIVERY_FAILED
+  → EXPIRED
+  → CANCELLED
+
+DELIVERY_UNCONFIRMED
+  → RECONCILING
+  → COMMAND_RECEIVED
+  → MANUAL_RECONCILIATION_REQUIRED
+  → EXPIRED
+  → FAILED
+
+RECONCILING
+  → COMMAND_RECEIVED
+  → ORDER_SENT
+  → PARTIALLY_FILLED
+  → FILLED
+  → MANUAL_RECONCILIATION_REQUIRED
+  → FAILED
+  → EXPIRED
+
+MANUAL_RECONCILIATION_REQUIRED
+  → COMMAND_RECEIVED
+  → ORDER_SENT
+  → PARTIALLY_FILLED
+  → FILLED
+  → FAILED
+  → EXPIRED
+  → CANCELLED
+
+COMMAND_RECEIVED
+  → ACCEPTED
+  → REJECTED
+  → CANCELLED
+  → EXPIRED
+
+ACCEPTED
+  → ORDER_SENT
+  → REJECTED
+  → FAILED
+  → CANCELLED
+  → EXPIRED
+
+ORDER_SENT
+  → PARTIALLY_FILLED
+  → FILLED
+  → CANCELLED
+  → FAILED
+
+PARTIALLY_FILLED
+  → FILLED
+  → FAILED
+  → CANCELLED
+
+Terminal states:
+  REJECTED / FILLED / FAILED / EXPIRED / CANCELLED
+```
+
+`MANUAL_RECONCILIATION_REQUIRED` 是自动流程阻塞状态，不是执行事实来源。人工处理只能基于 broker 证据和 `ExecutionEvent` / `OrderSnapshot` 恢复投影状态，不能伪造执行事实。
+
+Leg 与 Plan 状态不是事实来源，只能由 `ExecutionCommandState` 与 `ExecutionEvent` 投影：
+
+```text
+ExecutionLeg.status
+  → 按 leg_id 聚合该 leg 的 command states / execution events
+
+ExecutionPlan.status
+  → 按 plan_id 聚合所有 leg states
+  → 任一 leg 进入 PARTIALLY_FILLED 时 plan 不得回到 PENDING
+  → 所有 leg 终态后 plan 才能进入 COMPLETED / FAILED / CANCELLED / EXPIRED
+```
+
+`execution.command` 必须带 HMAC 完整性保护。Execution Engine 使用 command signing secret 对 command 的 canonical signing string 签名，Execution Client（例如 MT5 Adapter）验签通过后才允许执行。
+
+#### Execution Engine 签名与 Execution Client 验签约定
+
+Execution Engine 与 Execution Client 必须使用同一套 signing string 构造规则、同一 command signing secret 和同一 HMAC 算法。不要使用 JSON canonicalization 作为跨语言签名格式；不同语言对字段顺序、null、浮点数、转义和编码的处理很容易不一致。
+
+推荐签名格式：
+
+```text
+key=value&key=value&...
+```
+
+规则：
+
+```text
+1. 字段顺序固定，以 23.1 HMAC Signing String 的字段列表为准。
+2. hmac 字段本身不参与签名。
+3. 缺失的可选字段写为空字符串。
+4. 所有字符串使用 UTF-8。
+5. 所有字段值先做 RFC3986 percent-encoding。
+6. number 字段必须先格式化为固定小数或十进制字符串。
+7. bool / enum 使用大写枚举字符串。
+```
+
+数字格式建议：
+
+```text
+lots              → broker volume step 对齐后的字符串，保留 volume step 对应小数位
+price / sl / tp   → broker symbol digits 对齐后的字符串，保留 trailing zeros
+deviation_points  → 整数字符串
+magic             → 整数字符串
+time fields       → Unix milliseconds 整数字符串
+```
+
+canonical value 生成规则：
+
+```text
+undefined / missing optional field
+  → ""
+
+string
+  → 原始字符串先转 UTF-8，再做 RFC3986 percent-encoding
+
+number
+  → 先按字段规则格式化为十进制字符串，再做 RFC3986 percent-encoding
+
+enum
+  → 使用协议枚举值本身，例如 BUY / MARKET / IOC
+
+hmac
+  → 不参与 signing string
+```
+
+`price / sl / tp` 的 digits 与 `lots` 的 volume step 必须来自同一套 symbol metadata。Execution Engine 生成 command 时应使用 Trading Core State Store 中最新有效的 broker symbol metadata；MT5 Adapter 验签时使用本地 terminal 的同一 `broker_symbol` metadata。两侧 metadata 不一致时必须拒绝执行，而不是放宽验签。
+
+##### Signing String 伪代码
+
+以下 TypeScript 片段只表达 canonical string 算法；生产实现由 Execution Engine 生成，并必须与 MT5 Adapter golden vector 一致。
+
+```ts
+function rfc3986Encode(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (ch) =>
+    `%${ch.charCodeAt(0).toString(16).toUpperCase()}`
+  )
+}
+
+const fields: [string, string][] = [
+  ["account_id", command.account_id],
+  ["action", command.action],
+  ["broker_order_id", command.broker_order_id ?? ""],
+  ["broker_symbol", command.broker_symbol ?? ""],
+  ["client_id", command.client_id ?? ""],
+  ["command_id", command.command_id],
+  ["comment", command.comment ?? ""],
+  ["deviation_points", formatInt(command.deviation_points)],
+  ["expiration_time", formatInt(command.expiration_time)],
+  ["expires_at", formatInt(command.expires_at)],
+  ["filling_policy", command.filling_policy ?? ""],
+  ["idempotency_key", command.idempotency_key],
+  ["lots", formatLots(command.lots)],
+  ["magic", formatInt(command.magic)],
+  ["order_type", command.order_type ?? ""],
+  ["leg_id", command.leg_id ?? ""],
+  ["plan_id", command.plan_id ?? ""],
+  ["position_ticket", command.position_ticket ?? ""],
+  ["price", formatPrice(command.price)],
+  ["sl", formatPrice(command.sl)],
+  ["strategy_id", command.strategy_id],
+  ["symbol", command.symbol],
+  ["terminal_id", command.terminal_id ?? ""],
+  ["time_policy", command.time_policy ?? ""],
+  ["tp", formatPrice(command.tp)],
+]
+
+const canonical = fields
+  .map(([key, value]) => `${key}=${rfc3986Encode(value)}`)
+  .join("&")
+
+command.hmac = createHmac("sha256", COMMAND_SIGNING_SECRET)
+  .update(canonical)
+  .digest("hex")
+  .toLowerCase()
+```
+
+##### MT5 Adapter 验签（MQL5）
+
+```text
+1. 确认 execution.command 的 account_id / client_id / terminal_id 匹配本地 terminal context。
+2. 从收到的 execution.command 中取出除 hmac 外的签名字段。
+3. 按与 Execution Engine 完全相同的字段顺序构造 key=value&... signing string。
+4. 可选字段缺失时统一写为空字符串，不省略字段。
+5. 使用相同 command signing secret 计算 HMAC-SHA256。
+6. 将计算结果与收到的 hmac 字段比对。
+7. 验签失败则拒绝执行，并写 system.event: AUTHENTICATION_FAILED。
+8. 验签通过后先查本地 idempotency journal；已知 command 返回当前状态。
+9. 本地未见过的新 command 才使用 effective_server_now_ms 检查 expires_at；已过期则不得进入 command inbox，不得发送 broker order。
+```
+
+验签、身份和过期检查的顺序必须固定：
+
+```text
+session identity check
+  → 失败: SESSION_IDENTITY_MISMATCH
+
+HMAC check
+  → 失败: INVALID_HMAC / AUTHENTICATION_FAILED
+
+local idempotency journal check
+  → same command payload + already in inbox: 返回 command.received / 当前 execution.event，不继续后续检查
+  → same command payload + rejection record: 返回当前 rejection execution.event，不发送 command.received
+  → different command payload: DUPLICATE_IDEMPOTENCY_CONFLICT
+
+expires_at check for new command with effective_server_now_ms
+  → 失败: COMMAND_EXPIRED
+
+persist command inbox
+  → 成功后才允许发送 command.received
+```
+
+`expires_at` 判断必须使用 server-time domain。Execution Client 不得用本地 wall clock 判断过期，只能使用 time sync 维护的 `effective_server_now_ms`。如果 `clock_sync_status != SYNCED`，必须写 `TIME_SYNC_UNHEALTHY` 或 `CLOCK_SKEW_DETECTED` 并拒绝新 command，直到重新同步或人工处理。
+
+MQL5 RFC3986 编码规则：
+
+```text
+1. 使用 StringToCharArray(value, bytes, 0, WHOLE_ARRAY, CP_UTF8) 取得 UTF-8 bytes。
+2. StringToCharArray 会包含结尾 0 字节，编码时必须跳过最后的 null terminator。
+3. unreserved 字节保持原样：A-Z a-z 0-9 - _ . ~
+4. 其他字节编码为 %HH，HH 必须大写十六进制。
+5. 空格必须编码为 %20，不能编码为 +。
+6. 不使用表单 URL encoding，不依赖平台 UrlEncode。
+```
+
+MQL5 数字格式化规则：
+
+```text
+formatInt(value)
+  → IntegerToString((long)value)
+
+formatPrice(value, broker_symbol)
+  → digits = (int)SymbolInfoInteger(broker_symbol, SYMBOL_DIGITS)
+  → DoubleToString(NormalizeDouble(value, digits), digits)
+  → optional missing 时返回 ""
+
+formatLots(value, broker_symbol)
+  → step = SymbolInfoDouble(broker_symbol, SYMBOL_VOLUME_STEP)
+  → volume_digits = step 推导出的小数位
+  → aligned = MathRound(value / step) * step
+  → DoubleToString(NormalizeDouble(aligned, volume_digits), volume_digits)
+  → optional missing 时返回 ""
+```
+
+`DoubleToString` 必须保留固定小数位，不能使用会丢失 trailing zeros 的普通 double 转 string。MQL5 和 TypeScript 都必须先得到同一 canonical number string，再参与 signing string。
+
+MQL5 HMAC-SHA256 实现约束：
+
+```text
+1. 如果 command signing secret 的 UTF-8 bytes 长度 > 64，先 SHA256(secret_bytes)。
+2. 将 key bytes 右侧补 0 到 64 bytes。
+3. ipad = key XOR 0x36。
+4. opad = key XOR 0x5c。
+5. inner = SHA256(ipad || canonical_utf8_bytes)。
+6. digest = SHA256(opad || inner)。
+7. digest 输出 lowercase hex。
+```
+
+MQL5 可使用 `CryptEncode(CRYPT_HASH_SHA256, data, empty_key, out)` 作为 SHA256 primitive，再按 HMAC 标准拼接 ipad / opad。不要把 `command signing secret` 直接传给普通 SHA256 当作“keyed hash”，那不是 HMAC。
+
+MQL5 侧推荐工具函数边界：
+
+```text
+BuildExecutionCommandSigningString(command, broker_symbol_metadata)
+Rfc3986EncodeUtf8(value)
+FormatCommandString(value)
+FormatCommandInt(value)
+FormatCommandPrice(value, digits)
+FormatCommandLots(value, volume_step)
+HmacSha256HexLower(canonical, command_signing_secret)
+VerifyCommandHmac(command)
+```
+
+字段顺序固定为：
+
+```text
+account_id
+action
+broker_order_id
+broker_symbol
+client_id
+command_id
+comment
+deviation_points
+expiration_time
+expires_at
+filling_policy
+idempotency_key
+lots
+magic
+order_type
+leg_id
+plan_id
+position_ticket
+price
+sl
+strategy_id
+symbol
+terminal_id
+time_policy
+tp
+```
+
+该字段顺序不得在不同语言实现中自行调整。`hmac` 字段本身不得参与签名。
+
+### 7.17 ExecutionEvent
+
+```ts
+export interface ExecutionEvent {
+  execution_id: string
+  command_id: string
+  plan_id?: string
+  leg_id?: string
+
+  account_id: string
+  terminal_id?: string
+  client_id?: string
+
+  symbol: SymbolCode
+  broker_symbol?: string
+
+  status:
+    | "ACCEPTED"
+    | "ORDER_SENT"
+    | "REJECTED"
+    | "FILLED"
+    | "PARTIALLY_FILLED"
+    | "FAILED"
+    | "EXPIRED"
+    | "CANCELLED"
+
+  broker_order_id?: string
+  broker_deal_id?: string
+  position_ticket?: string
+  idempotency_key?: string
+
+  requested_lots?: number
+  fill_price?: number
+  filled_lots?: number
+  remaining_lots?: number
+
+  event_at: number
+  filled_at?: number
+  broker_filled_at?: number
+
+  error_code?: ErrorCode | string
+  message?: string
+}
+```
+
+说明：
+
+```text
+command.received = command delivery ack，不属于 ExecutionEvent
+event_at         = Execution Client 生成该执行回报时的 effective_server_now_ms
+filled_at        = Execution Client 观测到成交时的 effective_server_now_ms；仅在成交或部分成交时出现
+broker_filled_at = broker 原始成交时间戳；仅用于审计 / 对账，不参与控制判断
+```
+
+`ExecutionEvent` 必须尽量自描述，不应只能依赖 join `execution.command` 才能恢复关键上下文。`event_at` / `filled_at` 属于 server-time domain，用于系统审计和交易执行分析。
+
+### 7.18 Partial Fill 恢复语义
+
+当系统重启时，如果存在多腿策略且某些 leg 处于 `PARTIALLY_FILLED`，Execution Layer 必须根据 `RollbackPolicy` 决定恢复动作。
+
+```text
+rollback_policy.mode = close_filled
+  → 对已成交或部分成交的 leg 生成 CLOSE command
+  → plan.status = CANCELLED 或 FAILED
+
+rollback_policy.mode = none
+  → 不主动回滚
+  → plan.status = PARTIAL
+  → 写 audit.event，等待人工或上层策略处理
+```
+
+`ExecutionEvent` 是执行事实来源，`ExecutionCommandState` / `ExecutionLeg.status` / `ExecutionPlan.status` 是由事件流投影出的 materialized state。恢复时读取投影状态是为了快速判断当前计划状态；如果投影状态缺失或疑似损坏，必须从 `ExecutionEvent` 事件流重放生成投影，而不是让状态覆盖事实。
+
+### 7.19 AuditEntry
+
+```ts
+export interface AuditEntry {
+  entry_id: string
+  correlation_id: string
+  node: string
+  event_type: string
+  timestamp: number // server_now_ms
+  summary: string
+  metadata?: Record<string, unknown>
+}
+```
+
+### 7.20 RollbackPolicy
+
+```ts
+export interface RollbackPolicy {
+  mode: "close_filled" | "none"
+  max_retry_attempts?: number
+}
+```
+
+说明：
+
+```text
+close_filled = 若部分腿成交后整体失败，关闭已成交的腿
+none         = 不主动回滚，留给人工处理
+```
+
+### 7.21 StrategyRiskPolicy
+
+```ts
+export interface StrategyRiskPolicy {
+  max_risk_per_trade_pct: number
+  max_concurrent_legs: number
+  require_stop_loss: boolean
+  signal_expiry_bars: number
+}
+```
+
+`StrategyRiskPolicy` 是策略级风险约束，可视为全局 `RiskPolicy` 的子集或补充。最终批准仍由 Risk Layer 使用全局账户、持仓和策略上下文统一评估。
+
+---
+
+## 8. TradingState 设计
+
+Strategy & Decision Control Plane 统一操作 `TradingState`，不要让每个 decision module / workflow node 创建彼此割裂的状态对象。
+
+```ts
+export interface TradingState {
+  correlation_id: string
+
+  market?: MarketSnapshot
+  symbolMetadata?: SymbolMetadataSnapshot[]
+  indicators?: IndicatorSnapshot
+
+  rawSignal?: SignalRaw
+  scoredSignal?: SignalScored
+
+  strategyDecision?: StrategyDecision
+  agentReview?: AgentReview
+
+  tradeIntent?: TradeIntent
+  softRiskResult?: RiskResult
+
+  tradingCoreIntentResponse?: {
+    intent_id: string
+    status: "ACCEPTED" | "RISK_BLOCKED" | "REJECTED" | "DUPLICATE"
+    reason?: string
+    correlation_id: string
+    received_at: number
+  }
+
+  tradingCoreExecutionSummary?: {
+    plan_id?: string
+    commandStates: ExecutionCommandState[]
+    executionEvents: ExecutionEvent[]
+    updated_at: number
+  }
+
+  accountSnapshot?: AccountSnapshot
+  positionSnapshot?: PositionSnapshot[]
+  orderSnapshot?: OrderSnapshot[]
+
+  audit: AuditEntry[]
+}
+```
+
+`TradingState` 可以缓存 Trading Core 返回的 execution summary，用于解释、审计和 workflow 恢复；但它不是 execution state source of truth，不能写回或覆盖 Trading Core State Store。
+
+---
+
+## 9. TradingState 持久化与 Saga 恢复
+
+`TradingState` 不应只存在于单个编排 runtime 的内存中。每条交易链路以 `correlation_id` 作为 Saga ID，并在关键节点完成后持久化 checkpoint。
+
+### Checkpoint 结构
+
+```ts
+export interface TradingStateCheckpoint {
+  correlation_id: string
+  current_node: string
+  status: "RUNNING" | "COMPLETED" | "FAILED" | "EXPIRED"
+  updated_at: number
+  expires_at?: number
+  state: TradingState
+}
+```
+
+### Redis Key
+
+```text
+trading:saga:{correlation_id}
+```
+
+### TTL 与过期策略
+
+Saga checkpoint 必须定义生命周期，避免 Redis 中长期堆积无法恢复或无审计价值的状态。
+
+```text
+COMPLETED / FAILED 的 Saga：
+  TTL = 7 天
+  用于短期审计、排查和链路回放
+
+RUNNING 的 Saga：
+  如果超过 1 小时未更新
+  → 标记为 EXPIRED
+  → 写入 system.event: SAGA_EXPIRED
+
+EXPIRED 的 Saga：
+  TTL = 24 小时
+  用于排查后自动清理
+```
+
+过期判断基于：
+
+```text
+now - checkpoint.updated_at > 1 hour
+```
+
+Strategy & Decision Control Plane 启动和定时巡检时都应扫描超时的 RUNNING Saga。
+
+### 推荐 Checkpoint 节点
+
+```text
+receiveMarket.done
+computeIndicators.done
+scoreSignal.done
+signalFiltered.done
+strategyDecision.done
+agentReview.done
+tradeIntentBuilt.done
+tradeIntentSubmitted.done
+tradeIntentAccepted.done
+executionSummaryReceived.done
+audit.done
+```
+
+### 恢复规则
+
+```text
+Strategy & Decision Control Plane 重启时扫描未完成 Saga
+根据 current_node 找到最后一个有效 checkpoint
+从最后一个有效 event 节点恢复
+已完成节点不重复执行，或通过 idempotency_key 防重复
+```
+
+典型中断场景：
+
+```text
+TradeIntent 已提交 Trading Core
+Trading Core 返回 ACCEPTED
+但 Strategy & Decision Control Plane 尚未收到 execution.summary / terminal event
+```
+
+恢复后 Strategy & Decision Control Plane 不得重新生成 execution.command，也不得再次提交新的 intent_id。它必须用原 `intent_id / decision_id / correlation_id` 查询 Trading Core `/state` 或 intent summary；如果 Trading Core 已记录该 intent，则按 Trading Core 返回的状态继续 workflow。如果 Trading Core 没有记录该 intent，才允许用同一 `intent_id` 幂等重放 `POST /trade-intents`。
+
+### Saga 恢复时的 Snapshot / Order / Symbol Metadata Freshness
+
+Saga checkpoint 中的 `accountSnapshot` / `positionSnapshot` / `orderSnapshot` / `symbolMetadata` 可能已经过期。恢复时不得直接使用旧 snapshot、order snapshot 或 metadata 形成新的 TradeIntent。
+
+恢复规则：
+
+```text
+如果 checkpoint 中的 accountSnapshot / positionSnapshot / orderSnapshot / symbolMetadata 超过 max_snapshot_age_ms
+  → Strategy & Decision Control Plane 必须通过 Trading Core 请求刷新或等待 Trading Core 发布最新 summary
+  → 使用最新 summary 重新评估 strategy.decision / TradeIntent
+  → 如果刷新失败，则 Saga 标记 FAILED，并写 audit.event
+```
+
+典型场景：
+
+```text
+Saga 停在 tradeIntentBuilt.done
+系统重启后恢复
+如果 snapshot、order snapshot 或 symbol metadata 过期
+  → 不得直接 submitTradeIntentToTradingCore
+  → 必须先刷新 Trading Core state summary，并重新确认 TradeIntent 是否仍有效
+```
+
+---
+
+## 10. Strategy 抽象设计
+
+### 10.1 Strategy Definition
+
+策略定义描述策略本身，不携带运行状态。
+
+```ts
+export interface StrategyDefinition {
+  id: string
+  type: "trend" | "hedge" | "arbitrage" | "options"
+
+  legs: Leg[]
+  executionPolicy: ExecutionPolicy
+  riskPolicy: StrategyRiskPolicy
+}
+```
+
+### 10.2 Strategy Runtime
+
+策略运行时负责基于输入生成决策。
+
+```ts
+export interface StrategyRuntime {
+  definition: StrategyDefinition
+
+  evaluate(input: StrategyInput): Promise<StrategyDecision>
+}
+```
+
+### 10.3 StrategyInput
+
+```ts
+export interface StrategyInput {
+  market: MarketSnapshot
+  symbolMetadata: SymbolMetadataSnapshot[]
+  indicators: IndicatorSnapshot
+  scoredSignal: SignalScored
+  accountSnapshot: AccountSnapshot
+  positionSnapshot: PositionSnapshot[]
+  orderSnapshot: OrderSnapshot[]
+}
+```
+
+`StrategyInput` 是策略运行时的核心入口。策略只能基于明确传入的快照和信号评分生成 `StrategyDecision`，不直接读取 Redis、Gateway、MT5 或全局状态。
+
+### 10.4 Leg
+
+```ts
+export interface Leg {
+  leg_id: string
+  symbol: SymbolCode
+  direction: "BUY" | "SELL"
+  ratio: number
+  dependency: string[]
+}
+```
+
+### 10.5 ExecutionPolicy
+
+```ts
+export interface ExecutionPolicy {
+  mode: "sequential" | "simultaneous" | "best_effort_atomic"
+  failurePolicy: "cancel_all" | "partial_fill" | "retry"
+  timeout: number
+  max_command_ttl_ms: number
+  rollbackPolicy?: RollbackPolicy
+}
+```
+
+`best_effort_atomic` 不表示 broker 级真实原子提交。它表示 Execution Layer 尽量同时或按依赖提交多腿命令，并在部分失败或部分成交时按 `rollbackPolicy` 执行补偿。
+
+`max_command_ttl_ms` 是 execution policy 对投递窗口的上限，用于缩短 `execution.command.expires_at`，不能延长 `signal_expires_at` 或 `risk_result.valid_until`。
+
+---
+
+## 11. Signal Early Exit 与过期信号处理
+
+信号评分后必须经过条件路由，不满足阈值的信号不进入策略选择和风控。
+
+### 推荐流程
+
+```text
+signal.raw
+  → scoreSignal
+  → signal.scored
+  → IC / confidence threshold filter
+      ├── pass → selectStrategies
+      └── fail → audit.event + stop
+```
+
+### 推荐规则
+
+```ts
+if ((signal.ic_score ?? 0) < 0.05) {
+  return {
+    status: "SKIPPED",
+    reason: "IC score below threshold",
+    next: "audit",
+  }
+}
+```
+
+### 过期信号处理
+
+对于趋势策略，超过 2 根 bar 的信号视为过期。
+
+```text
+H1 策略：超过 2 小时丢弃
+H4 策略：超过 8 小时丢弃
+```
+
+过期信号处理结果：
+
+```text
+写 audit.event
+必要时写 system.event: SIGNAL_BACKPRESSURE_WARNING
+不形成 TradeIntent
+不提交 Trading Core
+```
+
+未过期并进入策略选择的信号，Strategy Runtime 必须在 `StrategyDecision.signal_expires_at` 中写入信号失效时间。Risk Layer 可以拒绝过期信号或 intent，但不能延长 `signal_expires_at`。
+
+---
+
+## 12. Account / Position / Order / Symbol Metadata 更新策略
+
+`account.snapshot`、`position.snapshot`、`order.snapshot` 和 `symbol.metadata` 由 Execution Client（例如 MT5 Adapter）负责发布。
+
+### 更新时机
+
+```text
+1. 每次 execution.event 之后立即发布
+2. 每 30 秒定时发布一次 heartbeat snapshot
+3. 连接恢复后立即发布 account.snapshot / position.snapshot / order.snapshot / symbol.metadata
+4. Risk Layer 需要时可通过 Trading Gateway 请求对应 Execution Client 按需刷新
+```
+
+### Risk Layer 使用规则
+
+Risk Layer 必须使用最新有效 snapshot、order snapshot 与 symbol metadata。
+
+```text
+如果 snapshot、order snapshot 或 symbol metadata 过期，则不得批准 TradeIntent，也不得生成 execution.plan / execution.command
+```
+
+推荐有效期：
+
+```text
+max_snapshot_age_ms = 30000 或 60000
+```
+
+如果超过有效期：
+
+```text
+risk.rejected reason = ACCOUNT_SNAPSHOT_STALE / ORDER_SNAPSHOT_STALE / SYMBOL_METADATA_STALE
+```
+
+---
+
+## 13. Agent Review 触发条件
+
+`agentReview` 不应无条件触发。Agent 调用存在延迟和成本，只有在信号价值较高、信号模糊或系统检测到异常时才进入 Agent Review。
+
+### 条件路由
+
+```text
+strategyDecision
+  ├── confidence >= 0.8 且无异常
+  │     → 跳过 agentReview
+  │     → 形成 TradeIntent 并提交 Trading Core
+  │
+  └── confidence < 0.8 或存在异常
+        → 进入 agentReview
+        → 按 AgentReview 结果形成 / 放弃 / 降风险 TradeIntent
+        → 提交 Trading Core
+```
+
+### 建议触发条件
+
+```text
+confidence < 0.8
+signal.scored 与 strategy.decision 出现冲突
+market regime = VOLATILE 或 UNKNOWN
+snapshot 接近过期但未超过硬阈值
+近期系统出现 STRATEGY_DEGRADED
+外部研究 / 回测服务返回高风险提示
+```
+
+### 不触发条件
+
+```text
+confidence >= 0.8
+signal.scored 清晰
+market regime = TREND
+无系统异常
+无风险预警
+```
+
+Agent Review 的输出只能影响解释、置信度修正、skip / reduce / manual_review 建议，不能直接生成交易命令。
+
+### 超时与 Fallback
+
+`agentReview` 节点必须设置硬超时，避免 LLM 调用阻塞主流程。
+
+推荐超时：
+
+```text
+agent_review_timeout_ms = 15000
+```
+
+超时 fallback：
+
+```ts
+const fallbackAgentReview: AgentReview = {
+  review_id: "agent_timeout",
+  score_adjustment: 0,
+  recommendation: "none",
+  reason: "AGENT_TIMEOUT",
+}
+```
+
+处理规则：
+
+```text
+Agent 超时不阻塞主流程
+写 system.event: AGENT_TIMEOUT
+使用 fallbackAgentReview 继续形成 TradeIntent 或按策略规则跳过
+Agent 返回格式错误时按超时等价处理
+```
+
+---
+
+## 14. Agent / LLM 边界
+
+Agent 可以接入，但权限必须固定。
+
+### 推荐 Agent 拓扑
+
+当前方案推荐少量、职责固定的 Agent 子图，不推荐 autonomous multi-agent debate 或 supervisor 自由派单来驱动 live trading。
+
+```text
+Deterministic Decision Workflow
+  ├── StrategyReviewAgent
+  │     → live path 可选节点
+  │     → 输入 signal / indicators / strategy.decision / snapshots
+  │     → 输出 AgentReview
+  │
+  ├── RiskExplanationAgent
+  │     → 非交易决策节点
+  │     → 输入 RiskResult / rejected reason / policy
+  │     → 输出 audit summary / operator explanation
+  │
+  ├── ReconciliationAssistant
+  │     → 仅用于 MANUAL_RECONCILIATION_REQUIRED
+  │     → 输入 execution events / order snapshots / spool records
+  │     → 输出 suggested reconciliation note
+  │
+  ├── IncidentAuditAgent
+  │     → post-trade / incident path
+  │     → 输入 audit.event / system.event / deadletter.event
+  │     → 输出 incident report
+  │
+  └── ResearchAgent
+        → async sidecar
+        → 输入 historical data / backtest result / external research
+        → 输出 external.research.result / external.strategy.candidate
+```
+
+live trading path 只允许 `StrategyReviewAgent` 参与，并且必须经过 `agentReviewGate` 条件触发。其他 Agent 不能阻塞或改变 live execution path。
+
+Agent 权限矩阵：
+
+| Agent                   | Live Path | 可写事件                  | 禁止                               |
+| ----------------------- | --------: | ------------------------- | ---------------------------------- |
+| StrategyReviewAgent     |      可选 | agent.review              | execution.command / risk.approved  |
+| RiskExplanationAgent    |        否 | audit.event               | 修改 RiskResult                    |
+| ReconciliationAssistant |        否 | audit.event / manual note | 修改 ExecutionEvent / 生成 command |
+| IncidentAuditAgent      |        否 | audit.event / report      | 修改业务状态                       |
+| ResearchAgent           |        否 | external.*                | 修改 live registry / command       |
+
+所有 Agent 输出必须是结构化 JSON，并通过 schema validation；失败则写 `deadletter.event` 或按对应 fallback 处理。
+
+### Agent 可以做
+
+```text
+分析市场 regime
+总结信号理由
+给 confidence adjustment
+识别异常行情
+建议 skip / reduce risk / manual review
+生成审计说明
+做研究和回测辅助
+```
+
+### Agent 不可以做
+
+```text
+直接下单
+直接写 execution.command
+绕过 Risk Engine
+放大仓位
+移除止损
+覆盖硬风控
+强制 BUY / SELL
+```
+
+### Agent 输出
+
+```ts
+export interface AgentReview {
+  review_id: string
+  score_adjustment: number
+  recommendation: "none" | "skip" | "reduce_risk" | "manual_review"
+  reason: string
+}
+```
+
+Agent 输出不得直接交易；任何由 Agent 影响的 TradeIntent 必须再经过 Risk Layer。
+
+### Manual Review / Manual Reconciliation 边界
+
+人工处理只能解除阻塞、确认外部事实或终止流程，不能绕过 Risk Layer 直接下单。
+
+允许人工操作：
+
+```text
+标记 signal / strategy.decision 为 rejected
+确认 manual_review 后允许继续形成 / 提交 TradeIntent
+为 MANUAL_RECONCILIATION_REQUIRED 填写 broker 侧核对结论
+请求 Trading Core 根据 broker 证据恢复 command / plan 投影状态；人工流程不能直接写 execution state
+请求刷新 account / position / order snapshot
+```
+
+禁止人工操作：
+
+```text
+直接生成 execution.command
+绕过 RiskResult 批准交易
+修改 ExecutionEvent 事实记录
+删除 Redis / spool 中的执行事实
+在 reconciliation 未完成时强制 retry command
+```
+
+人工处理结果必须写 `audit.event`，并保留 operator、reason、evidence、timestamp。
+
+---
+
+## 15. Risk Policy 设计
+
+```ts
+export interface RiskPolicy {
+  max_risk_per_trade_pct: number
+  max_daily_loss_pct: number
+  max_drawdown_pct: number
+
+  max_symbol_exposure_pct: number
+  max_total_exposure_pct: number
+
+  require_stop_loss: boolean
+  reject_expired_signal: boolean
+  max_approval_ttl_ms: number
+
+  max_concurrent_positions: number
+  require_valid_symbol_metadata: boolean
+  reject_trade_mode_disabled: boolean
+}
+```
+
+`max_approval_ttl_ms` 是 Risk Layer 对 `risk.approved` 的最长有效期。`RiskResult.valid_until` 必须不晚于 `evaluated_at + max_approval_ttl_ms`，也不得晚于本次评估依赖的 snapshot / order snapshot / symbol metadata freshness 边界。
+
+### 初始硬规则
+
+```text
+单笔风险 ≤ 账户 1%
+日最大亏损 ≤ 账户 3%
+最大回撤熔断 ≤ 账户 10%
+禁止无 SL 开新仓；CLOSE / CANCEL / 降风险 MODIFY 不受该规则阻塞
+禁止过期信号下单
+禁止重复 execution.command
+禁止使用过期 account / position snapshot 批准交易
+禁止使用过期 order snapshot 批准交易
+禁止使用过期 symbol metadata 批准交易
+禁止违反 volume_min / volume_max / volume_step / stops_level / trade_mode
+```
+
+---
+
+## 16. Backpressure 设计
+
+Redis Streams 的积压必须可观测，并影响信号处理路径。
+
+### 监控指标
+
+```text
+stream length
+consumer group lag
+oldest pending message age
+compute service latency
+orchestrator processing latency
+```
+
+### 处理策略
+
+当积压超过阈值时：
+
+```text
+Option A：Strategy & Decision Control Plane 暂停消费，等待 Compute Service 恢复
+Option B：丢弃过期 signal
+Option C：发 system.event 告警，人工介入
+```
+
+趋势策略默认采用 Option B：
+
+```text
+signal 超过 2 根 bar 的时间窗口就直接丢弃
+```
+
+### 处理结果
+
+```text
+写 audit.event
+写 system.event: SIGNAL_BACKPRESSURE_WARNING
+不形成 TradeIntent
+```
+
+### Execution Path Metrics / SLO
+
+执行链路必须单独监控，不能只看 Redis lag。
+
+推荐指标：
+
+```text
+gateway_active_sessions
+execution_client_heartbeat_lag_ms
+time_sync_rtt_ms
+time_sync_offset_ms
+time_sync_status
+wire_decode_error_count
+schema_deadletter_count
+hmac_failure_count
+command_dispatch_latency_ms
+command_received_latency_ms
+command_delivery_timeout_count
+delivery_unconfirmed_count
+reconciliation_duration_ms
+reconciliation_failed_count
+spool_depth
+spool_oldest_unflushed_age_ms
+spool_flush_failed_count
+snapshot_stale_count
+order_snapshot_stale_count
+symbol_metadata_stale_count
+clock_skew_detected_count
+time_sync_unhealthy_count
+```
+
+推荐默认阈值：
+
+```text
+command_received_latency_ms p95 > 1000
+  → WARNING
+
+delivery_ack_timeout_ms = 5000
+  → 超时进入 DELIVERY_UNCONFIRMED
+
+reconciliation_duration_ms > 10000
+  → WARNING
+
+spool_oldest_unflushed_age_ms > 30000
+  → ERROR
+
+spool_flush_failed_count > 0
+  → ERROR
+
+hmac_failure_count > 0
+  → WARNING；短时间连续出现则 CRITICAL
+
+time_sync_rtt_ms > max_time_sync_rtt_ms
+  → 丢弃该 sample
+
+time_sync_status != SYNCED
+  → TIME_SYNC_UNHEALTHY；拒绝新 execution.command
+
+time_sync_status 从 DEGRADED / UNSYNCED 恢复到 SYNCED
+  → TIME_SYNC_RESTORED
+
+abs(time_sync_offset_ms previous - current) > max_clock_offset_ms
+  → CLOCK_SKEW_DETECTED
+```
+
+这些指标用于 system.event 和 dashboard，不直接替代 Risk Layer 判断。
+
+### State Store / Redis 不可用时的降级行为
+
+Trading Core State Store 是执行状态强一致存储。Redis 是跨服务 fanout，不是执行状态唯一来源。
+
+```text
+Trading Core State Store 不可用：
+  → Trading Core 拒绝新的 trade.intent，返回 STATE_STORE_UNAVAILABLE
+  → 新 intent 不得进入 accepted 状态，也不得写入 idempotency journal
+  → Trading Core 不生成新的 execution.command
+  → 已 accepted 但尚未生成 command 的 intent 冻结，恢复后必须重新校验时间、snapshot freshness 和 Risk
+  → 已在途 broker 回报写本地 emergency append-only spool
+  → 触发 system.event: STATE_STORE_UNAVAILABLE；若主 store 无法写入，则先写 emergency spool
+  → 进入 MANUAL_RECONCILIATION_REQUIRED 或只读恢复模式
+
+Redis 不可用：
+  → Trading Core 继续维护本地 execution state
+  → Trading Core 继续处理已接受 intent 和已在途订单
+  → Redis fanout 写入 Trading Core local spool
+  → Strategy & Decision Control Plane 暂停依赖 Redis 的新 workflow
+  → UI / audit 可能延迟，但不得反向影响 Trading Core 已批准执行
+  → 触发 system.event: REDIS_UNAVAILABLE（恢复后补写）
+```
+
+在 Redis 恢复前：
+
+```text
+Execution Client 可以继续保持 TCP 连接
+Trading Gateway 可以继续维护 session
+Trading Gateway 必须继续接收已在途订单的 execution.event
+Trading Core 必须将 execution.event / command.received 写入 Trading Core State Store
+Trading Core 将 Redis fanout 记录写入本地 append-only spool
+Strategy & Decision Control Plane 不依赖 Redis lag 来判断执行事实
+```
+
+Redis 恢复后，Trading Core 必须先 flush fanout spool；Strategy & Decision Control Plane 再恢复消费，并以 Trading Core `/state` 或 execution summary 校准 workflow state。
+
+Trading Core State Store 恢复后：
+
+```text
+1. 先停止接收新的 trade.intent。
+2. replay emergency append-only spool 到 Trading Core State Store。
+3. 对所有 in-flight command / accepted intent 执行 reconciliation。
+4. 对已 accepted 但尚未生成 command 的 intent 重新校验 requested_at / signal_expires_at / snapshot freshness / Risk。
+5. 写 system.event: STATE_STORE_RESTORED。
+6. 只有 replay 与 reconciliation 完成后才恢复接收新的 trade.intent。
+```
+
+spool owner：
+
+```text
+Trading Core owns:
+  command.received
+  execution.event
+  account.snapshot
+  position.snapshot
+  order.snapshot
+  symbol.metadata
+  gateway-originated system.event
+
+Strategy & Decision Control Plane owns:
+  workflow checkpoint fallback
+  audit.event fallback
+  decision-control-plane-originated system.event
+```
+
+Trading Core 和 Strategy & Decision Control Plane 不得 flush 对方拥有的 spool。补写 Redis 时必须保留原始 `message_id` / `event_id`，并按 `message_id` / `event_id` 幂等去重。
+
+本地 spool 规则：
+
+```text
+append-only
+fsync or flush policy 明确配置
+每条记录包含 message_id / event_id / type / payload / received_at
+received_at 必须是 server-time domain
+补写 Redis 成功后标记 flushed
+重复补写必须按 message_id / event_id 幂等去重
+spool 损坏或缺口必须触发 MANUAL_RECONCILIATION_REQUIRED
+```
+
+推荐 spool record：
+
+```ts
+export interface LocalSpoolRecord<T> {
+  spool_id: string
+  message_id?: string
+  event_id?: string
+  type: string
+  payload: T
+  received_at: number
+  flushed_at?: number
+  flush_attempts: number
+  last_error?: string
+}
+```
+
+---
+
+## 17. system.event 设计
+
+`system.event` 是系统可观测性基础。
+
+### 类型
+
+```ts
+export type SystemEventType =
+  | "DECISION_CONTROL_PLANE_STARTED"
+  | "DECISION_CONTROL_PLANE_STOPPED"
+  | "GATEWAY_STARTED"
+  | "GATEWAY_STOPPED"
+  | "COMPUTE_SERVICE_UNHEALTHY"
+  | "COMPUTE_SERVICE_RESTORED"
+  | "EXECUTION_CLIENT_CONNECTION_LOST"
+  | "EXECUTION_CLIENT_CONNECTION_RESTORED"
+  | "SIGNAL_BACKPRESSURE_WARNING"
+  | "REDIS_STREAM_LAG_WARNING"
+  | "REDIS_UNAVAILABLE"
+  | "REDIS_RESTORED"
+  | "STATE_STORE_UNAVAILABLE"
+  | "STATE_STORE_RESTORED"
+  | "RISK_ENGINE_CIRCUIT_BREAKER_TRIGGERED"
+  | "STRATEGY_DEGRADED"
+  | "SAGA_EXPIRED"
+  | "COMMAND_DELIVERY_TIMEOUT"
+  | "COMMAND_DELIVERY_UNCONFIRMED"
+  | "COMMAND_DELIVERY_FAILED"
+  | "COMMAND_DISPATCH_BACKPRESSURE"
+  | "COMMAND_EXPIRED"
+  | "MANUAL_RECONCILIATION_REQUIRED"
+  | "AGENT_TIMEOUT"
+  | "AUTHENTICATION_FAILED"
+  | "SESSION_IDENTITY_MISMATCH"
+  | "CLOCK_SKEW_DETECTED"
+  | "TIME_SYNC_UNHEALTHY"
+  | "TIME_SYNC_RESTORED"
+  | "WIRE_FRAME_TOO_LARGE"
+  | "WIRE_PROTOCOL_VIOLATION"
+  | "LONG_TERM_AUDIT_WRITE_FAILED"
+  | "SECRET_ROTATION_STARTED"
+  | "SECRET_ROTATION_COMPLETED"
+  | "SECRET_ROTATION_FAILED"
+  | "DEADLETTER_CREATED"
+```
+
+### Payload
+
+```ts
+export interface SystemEvent {
+  type: SystemEventType
+  severity: "INFO" | "WARNING" | "ERROR" | "CRITICAL"
+  component: string
+  message: string
+  metadata?: Record<string, unknown>
+  timestamp: number // server_now_ms
+}
+```
+
+---
+
+## 18. 目标数据流
+
+```text
+MT5 Adapter
+  → Trading Core
+  → market.tick / market.bar / account.snapshot / position.snapshot / order.snapshot / symbol.metadata
+  → Trading Core State Store
+  → optional Redis / WS fanout
+
+MarketEventGraph
+  → consume market.bar / market.snapshot from Trading Core
+  → computeIndicators
+  → scoreSignal
+
+StrategyDecisionGraph
+  → filterSignal
+      ├── fail → audit.event + stop
+      └── pass → selectStrategies
+  → strategy.decision
+  → trade.intent
+
+AgentReviewSubgraph
+  → agentReview 条件路由
+      ├── skip → trade.intent
+      └── review → agent.review → trade.intent
+
+Trading Core
+  → receive trade.intent
+  → idempotency check
+  → load latest account / position / order / symbol / market state
+  → hard risk gate
+      ├── rejected → risk.rejected / event fanout
+      └── approved → risk.approved
+
+Execution Engine
+  → buildExecutionPlan
+  → execution.plan
+  → execution.command
+  → Trading Gateway / adapter delivery request
+      ├── rejected before socket write → EXPIRED / DELIVERY_FAILED / COMMAND_DISPATCH_BACKPRESSURE
+      └── accepted for socket write → execution.command.state(DISPATCHED)
+  → Execution Client
+  → command.received
+      └── timeout / disconnect → DELIVERY_UNCONFIRMED → reconciliation
+
+Execution Projection
+  → execution.command.state(COMMAND_RECEIVED)
+  → execution.event
+  → execution.command.state / execution.plan projection
+  → account.snapshot / position.snapshot / order.snapshot / symbol.metadata
+  → audit.event
+  → WS / Redis fanout to Strategy & Decision Control Plane / UI
+
+Reconciliation Engine
+  → reconciliation.request
+  → reconciliation.result
+  → order.snapshot / position.snapshot / account.snapshot / symbol.metadata
+  → update Trading Core execution state or MANUAL_RECONCILIATION_REQUIRED
+```
+
+---
+
+## 19. 典型趋势策略逻辑
+
+### 19.1 市场状态判断
+
+```text
+BBW 扩张 → 趋势模式
+BBW 收缩 → 震荡模式
+```
+
+趋势模式：
+
+```text
+PAR 方向
+EMA 排列
+ADX 强度
+```
+
+震荡模式：
+
+```text
+RSI 均值回归
+PAR 暂停
+```
+
+### 19.2 进场条件
+
+```text
+BBW 扩张确认
+EMA 21 / 55 / 200 多头或空头排列
+ADX > 25
+PAR 翻转方向一致
+```
+
+### 19.3 出场条件
+
+```text
+止损：PAR 反转 或 ATR × 2
+止盈：分批出场
+  50% 仓位 → 盈亏比 1:2 出场
+  50% 仓位 → PAR 跟踪止损
+强制出场：BBW 快速收缩
+```
+
+### 19.4 起始参数
+
+| 指标 | XAUUSD H4          | BTCUSD H4          |
+| ---- | ------------------ | ------------------ |
+| PAR  | step=0.02, max=0.2 | step=0.01, max=0.1 |
+| RSI  | period=14, 70/30   | period=21, 80/20   |
+| BB   | period=20, std=2.0 | period=20, std=2.5 |
+| EMA  | 21/55/200          | 21/55/200          |
+| ADX  | >25                | >25                |
+
+---
+
+## 20. 外部研究 / 回测服务接入边界
+
+外部研究 / 回测服务可以作为后期接入的研究、回测和策略候选 sidecar。
+
+### 建议定位
+
+```text
+research-agent
+strategy-lab
+backtest-service
+shadow-account-service
+strategy-candidate-generator
+```
+
+### 可接入层
+
+| 层                                | 角色                                            |
+| --------------------------------- | ----------------------------------------------- |
+| Event Backbone                    | 读写 external.research / external.backtest 事件 |
+| Compute Layer                     | 使用其分析和回测能力                            |
+| Strategy & Decision Control Plane | 作为 research / backtest tool                   |
+| Agent Layer                       | 提供策略研究、报告和辅助审查                    |
+
+### 不应承担
+
+```text
+实时 execution engine
+最终 risk-engine
+Execution Client adapter
+execution.command 生成者
+```
+
+### 推荐 Streams
+
+```text
+external.research.request
+external.research.result
+
+external.backtest.request
+external.backtest.result
+
+external.strategy.candidate
+external.strategy.export
+external.strategy.rejected
+
+external.shadow.report
+```
+
+### 接入原则
+
+```text
+外部服务可以影响 strategy.decision 的解释和置信度
+外部服务可以产生 backtest.result / strategy.candidate
+外部服务可以产生 agent.review 的研究输入
+外部服务不能绕过 risk-engine
+外部服务不能直接写 execution.command
+```
+
+### Strategy Candidate Promotion Gate
+
+`external.strategy.candidate` 不能直接进入 live strategy registry。候选策略必须经过 promotion gate。
+
+推荐流程：
+
+```text
+external.strategy.candidate
+  → offline backtest passed
+  → walk-forward / out-of-sample validation passed
+  → paper trading observation passed
+  → risk policy review passed
+  → manual approval
+  → versioned strategy config
+  → strategy.registry activation
+```
+
+上线约束：
+
+```text
+每个策略必须有 strategy_id / version / config_hash
+策略配置变更必须写 audit.event
+live activation 必须人工批准
+external service 不得直接修改 live registry
+promotion 失败必须写 external.strategy.rejected 或 audit.event
+```
+
+---
+
+## 21. 服务边界总结
+
+### mt5-adapter
+
+```text
+MQL5 EA
+TCP execution client
+market publisher
+symbol metadata publisher
+execution command receiver
+execution event reporter
+account / position / order snapshot publisher
+time sync client
+local terminal guard
+```
+
+### trading-core
+
+```text
+Rust implementation
+WS / HTTP API for UI and Strategy & Decision Control Plane
+Execution Client Protocol server
+Native TCP / Execution WebSocket bindings
+TransportAdapter abstraction
+GatewayInboundRouter / GatewayOutboundRouter
+Execution Client session registry
+TradeIntent receiver
+hard risk gate
+execution plan / command builder
+command lifecycle owner
+execution event projection
+idempotency journal
+reconciliation owner
+command / broker adapter routing
+heartbeat detection
+time sync authority
+transport framing / message boundary enforcement
+connection health
+SQLite / append-only State Store
+local append-only event spool / audit writer
+```
+
+### strategy-decision-control-plane
+
+```text
+TypeScript / Bun implementation
+LangGraph optional
+Cursor SDK optional
+Agent SDK optional
+Rule engine optional
+workflow state owner
+decision workflow checkpoint owner
+workflow owner
+strategy routing
+slow decision generation
+TradeIntent producer
+Trading Core HTTP / WS client
+execution summary consumer
+event cursor / resume consumer
+audit
+external service integration
+```
+
+### compute-service
+
+```text
+Python / FastAPI implementation
+technical indicators
+statistical models
+position sizing math
+hedge ratio
+basis
+regime detection
+```
+
+### risk-engine
+
+```text
+Trading Core 内部 domain module
+portfolio risk
+account risk
+strategy risk
+snapshot freshness validation
+symbol metadata validation
+broker trading constraint validation
+hard execution approval
+```
+
+### external-research-service
+
+```text
+external sidecar
+backtest
+strategy candidate
+shadow account
+research report
+agent support
+```
+
+### storage / audit
+
+```text
+SQLite / append-only log = authoritative execution state store
+Redis Streams = operational event fanout / replay aid
+Decision workflow checkpoint store = workflow checkpoints, not execution facts
+SQLite / Postgres / ClickHouse = long-term audit, research, analysis
+```
+
+### Long-term Audit Sink
+
+Trading Core State Store / Redis Streams 都不是长期审计唯一存储。以下事件必须异步落入长期审计库：
+
+```text
+execution.command
+command.received
+execution.event
+account.snapshot
+position.snapshot
+order.snapshot
+symbol.metadata
+reconciliation.request
+reconciliation.result
+audit.event
+deadletter.event
+manual review / manual reconciliation action
+spool flush result
+strategy activation / deactivation
+```
+
+长期审计规则：
+
+```text
+保留原始 event_id / message_id / correlation_id / causation_id
+保留原始 payload 和 schema_version
+写入失败不得阻塞已批准的执行流程，但必须写 system.event
+审计库不可反向驱动交易流程
+执行相关审计建议至少保留 1 年
+```
+
+---
+
+## 22. 设计决策结论
+
+最终目标架构定为：
+
+```text
+MT5 Adapter
+↔ Trading Core
+  使用 Execution Client Protocol
+  Native TCP / Execution WebSocket transport binding
+  WS / HTTP API + hard risk + execution engine + state store
+↔ Strategy & Decision Control Plane
+↔ Compute & Research Services
+↔ Redis Streams optional fanout
+↔ Audit / Replay / Research
+```
+
+核心设计边界：
+
+```text
+MQL5 只做 MT5 Adapter
+MT5 Adapter 是 Execution Client Protocol 的一种实现
+Trading Core 是交易正确性边界
+Trading Gateway 是 TCP / WS / HTTP gateway，不属于 Strategy & Decision Control Plane
+Execution Client Protocol 承担执行链路的低延迟双向通信
+Native TCP 与 Execution WebSocket 都可以作为 Execution Client Protocol transport binding
+Event WebSocket 可用于 dashboard / browser / decision event stream，不作为执行客户端 command 链路
+SQLite / append-only log 是执行状态强一致存储
+Redis Streams 做跨服务 fanout / replay aid，不是执行事实唯一来源
+Compute & Research Services 做无状态计算
+Strategy & Decision Control Plane 做慢决策、AI 编排、研究和人工流程
+Risk Engine 当前作为 Trading Core 内部 domain module
+Execution Event 是执行事实来源，ExecutionCommandState / ExecutionLeg.status / ExecutionPlan.status 是事实流投影
+Agent / 外部研究服务只做研究、分析、审查、候选生成
+```
+
+关键原则：
+
+```text
+strategy.decision 不是交易命令
+trade.intent 不是执行命令
+risk.approved 不是最终事实
+execution.command 是执行请求
+execution.event 是执行事实
+audit.event 是追踪与复盘基础
+Trading Gateway / Trading Core server time 是协议权威时间源
+所有控制时间必须使用 server-time domain，客户端本地 wall clock 不参与交易判断
+Execution Client 必须通过 time.sync 维护 effective_server_now_ms
+Trading Core State Store 必须持久化 execution state / idempotency journal / reconciliation checkpoint
+Decision workflow state 必须按 correlation_id 做 checkpoint，但不能覆盖 Trading Core execution state
+Saga 必须定义 TTL 与 EXPIRED 处理
+Risk Layer 必须使用最新有效 account / position / order snapshot 和 symbol metadata
+StrategyDecision 必须记录 signal_expires_at
+RiskResult 必须记录 snapshot_age_ms / symbol_metadata_age_ms / adjusted_legs / evaluated_at / valid_until
+ExecutionCommand.expires_at 是派生字段，不是 Execution Layer 拥有的业务有效期
+Execution Layer 拥有拒绝执行权，不得延长 signal_expires_at 或 risk_result.valid_until
+ExecutionEvent 必须记录 server-time domain 的 event_at，并在成交时记录 server-time domain 的 filled_at
+ExecutionEvent 必须携带 account / client / plan / leg / broker order 等恢复上下文
+OrderSnapshot 是 broker 订单状态观测，用于 reconciliation，不是执行事实来源
+过期 signal 不形成 TradeIntent
+agentReview 必须通过条件路由触发，不无条件执行
+agentReview 必须有超时 fallback
+execution.command 必须有 command.received ACK 回路
+未收到 command.received 时必须进入 DELIVERY_UNCONFIRMED / RECONCILING，不得盲目重试
+服务间调用必须具备最低限度认证
+Trading Gateway 必须绑定 session_id / client_id / account_id / terminal_id，不允许 payload 覆盖认证身份
+已过期 execution.command 不得进入 command inbox，不得发送 broker order
+max_inflight_commands 超限时不得推进到 DISPATCHED
+Saga 恢复后必须重新校验 snapshot / order snapshot / symbol metadata freshness
+PARTIALLY_FILLED 的多腿计划必须按 RollbackPolicy 恢复
+MANUAL_RECONCILIATION_REQUIRED 是自动流程阻塞状态，不是执行事实来源
+CANCEL 是显式 execution.command action，不能塞进 MODIFY 语义
+best_effort_atomic 只是补偿式多腿执行，不代表 broker 级真实原子提交
+execution.command 必须包含 account / terminal / broker / order policy 等实盘执行字段
+execution.command 必须具备 HMAC 完整性保护，签名使用固定 key=value 字符串，不使用 JSON.stringify canonical
+hello 之后的 Execution Client WireMessage 必须包含 message_id / session_id / schema_version / sequence
+每种 transport binding 必须约束 max_message_bytes；Native TCP frame 必须受 max_frame_bytes 约束，非法 frame/message 不得 ack
+sequence 只在单个 Execution Client session 内有效，不是全局事实序号
+Execution Client 重连恢复必须依赖 command journal / idempotency_key / execution.event
+MQL5 验签必须使用 UTF-8 RFC3986 编码、固定数字格式和标准 HMAC-SHA256
+Trading Core State Store 不可用时不得推进新交易流程
+Redis 不可用时 Trading Core 可以继续维护本地 execution state，但必须 spool Redis fanout
+Trading Core owns inbound execution spool，Strategy & Decision Control Plane owns workflow / audit spool
+external.strategy.candidate 必须经过 promotion gate 才能进入 live strategy registry
+所有跨服务时间必须使用 Unix milliseconds UTC server-time domain，并检测 clock skew / time sync health
+schema 不兼容或无法解析的消息必须进入 deadletter.event
+执行相关事件必须异步进入长期审计 sink
+secret rotation 必须支持 ACTIVE / NEXT / RETIRED / REVOKED
+market.tick 用于 MarketSnapshot 实时更新，market.bar 用于信号主流程
+Execution Client 必须负责 connect / send / receive / heartbeat / reconnect / framing / ack 的基础可靠通信
+```
+
+系统以事件为中心，以 Trading Core 为正确性边界，以 Execution Client 为 broker 执行端，以 Strategy & Decision Control Plane 为慢决策、AI 编排和状态工作流中心。
+
+---
+
+## 23. 实现规格拆解
+
+实现按以下依赖顺序拆：
+
+```text
+Execution Client message protocol
+  → 定义 Execution Client 与 Trading Core 能说什么
+  → 独立于 TCP / WebSocket 等 transport binding
+
+SQLite State Store
+  → 定义哪些消息必须变成事实事件、哪些只是 projection
+
+Rust crate boundary
+  → 按消息处理职责和 State Store 边界拆模块
+
+HTTP API schema
+  → 只暴露 State Store projection，不暴露内部 transport 细节
+```
+
+### 23.1 Execution Client Message Protocol Registry
+
+Execution Client message protocol 只服务 Execution Client 与 Trading Core 的双向执行链路。它独立于 transport；Native TCP 和 Execution WebSocket 都可以承载同一套 `WireMessage`。
+
+Transport binding 规则：
+
+```text
+Native TCP
+  → 4-byte unsigned big-endian length prefix
+  → UTF-8 JSON WireMessage payload
+
+Execution WebSocket
+  → one WebSocket message = one UTF-8 JSON WireMessage payload
+  → 不使用 TCP length prefix
+  → 必须限制 max_message_bytes
+
+HTTP
+  → 不作为 Execution Client full-duplex command transport
+
+Event WebSocket
+  → 不作为 Execution Client command transport
+```
+
+所有 `type` 必须进入 registry。未知 `type` 一律写 `deadletter.event`，不得进入业务流程。
+
+#### WireMessage Envelope
+
+```ts
+export interface WireMessage<T> {
+  message_id: string
+  type: ExecutionClientMessageType
+  schema_version: string
+
+  client_id?: string
+  session_id?: string
+  correlation_id?: string
+  causation_id?: string
+
+  sent_at?: number
+  sequence?: number
+
+  payload: T
+}
+```
+
+#### Message Type 命名规则
+
+```text
+连接控制：session.*
+时间同步：time.*
+连接健康：heartbeat
+传输确认：transport.*
+市场数据：market.*
+账户状态：account.* / position.* / order.* / symbol.*
+执行请求：execution.command
+执行回报：command.received / execution.event
+对账：reconciliation.*
+协议错误：protocol.error
+```
+
+固定类型集合：
+
+```ts
+export type ExecutionClientMessageType =
+  | "session.hello"
+  | "session.accepted"
+  | "session.rejected"
+  | "time.sync.request"
+  | "time.sync.response"
+  | "heartbeat"
+  | "transport.ack"
+  | "market.tick"
+  | "market.bar"
+  | "symbol.metadata"
+  | "account.snapshot"
+  | "position.snapshot"
+  | "order.snapshot"
+  | "execution.command"
+  | "command.received"
+  | "execution.event"
+  | "reconciliation.request"
+  | "reconciliation.result"
+  | "protocol.error"
+```
+
+#### Schema Version Format
+
+`schema_version` 使用固定格式：
+
+```text
+ecp.v<major>.<minor>
+```
+
+规则：
+
+```text
+示例：ecp.v1.0
+major 不同表示不兼容，必须拒绝并写 deadletter.event(reason=SCHEMA_MAJOR_MISMATCH)。
+minor 增加表示向后兼容，只允许新增 optional 字段。
+字段删除、必填字段新增、枚举值语义改变必须提升 major。
+同一 Trading Core 进程必须声明 supported_schema_versions。
+收到高于自身支持 minor 的消息时，可以按已知字段处理，但必须忽略未知 optional 字段。
+```
+
+#### Message Registry
+
+| type | direction | durable | ack | owner | purpose |
+|---|---|---:|---|---|---|
+| `session.hello` | client → core | no | `session.accepted/rejected` | gateway-session | 建立连接、身份、capabilities、resume cursor |
+| `session.accepted` | core → client | no | transport ack | gateway-session | 返回 session_id、协议参数、server_time |
+| `session.rejected` | core → client | no | none | gateway-session | 拒绝连接，随后关闭 socket |
+| `time.sync.request` | client → core | no | `time.sync.response` | gateway-time | 采样 server time |
+| `time.sync.response` | core → client | no | transport ack | gateway-time | 返回 server_receive_at / server_send_at |
+| `heartbeat` | client → core | no | transport ack | gateway-session | 连接健康、clock_sync_status、queue depth |
+| `transport.ack` | both | no | none | gateway-transport | 确认 wire message 已解析并进入对应处理队列 |
+| `market.tick` | client → core | latest-only | transport ack | market-ingest | 更新实时 market snapshot，不逐条长期持久化 |
+| `market.bar` | client → core | yes | transport ack | market-ingest | 已关闭 K 线，按 symbol/timeframe/timestamp 幂等 |
+| `symbol.metadata` | client → core | latest-state | transport ack | state-ingest | broker symbol 交易约束 |
+| `account.snapshot` | client → core | latest-state | transport ack | state-ingest | 账户权益 / 保证金快照 |
+| `position.snapshot` | client → core | latest-state | transport ack | state-ingest | 持仓快照 |
+| `order.snapshot` | client → core | latest-state | transport ack | state-ingest | broker 订单状态观测 |
+| `execution.command` | core → client | yes | `command.received` | execution-engine | 下单 / 撤单 / 改单 / 平仓请求 |
+| `command.received` | client → core | yes | transport ack | execution-engine | 客户端已持久化 command journal |
+| `execution.event` | client → core | yes | transport ack | execution-projection | broker 执行事实 |
+| `reconciliation.request` | core → client | yes | transport ack | reconciliation | 请求客户端回传 broker 当前状态 |
+| `reconciliation.result` | client → core | yes | transport ack | reconciliation | 对账结果与 snapshot 汇总 |
+| `protocol.error` | core → client | no | none | gateway-transport | 可解析 envelope 后的协议错误提示 |
+
+#### Payload Schema 边界
+
+```text
+session.hello
+  → HelloPayload
+  → 不要求 session_id
+  → 不要求 sent_at
+
+session.accepted
+  → HelloAcceptedPayload
+  → 返回 session_id / heartbeat_interval_ms / max_frame_bytes / max_message_bytes / time sync policy
+
+session.rejected
+  → SessionRejected
+  → 返回拒绝原因，发送后关闭 transport session
+
+time.sync.request
+  → TimeSyncRequest
+  → 不要求 sent_at
+
+time.sync.response
+  → TimeSyncResponse
+  → 必须使用 Trading Core server-time domain
+
+heartbeat
+  → HeartbeatPayload
+  → 必须包含 effective_server_now / clock_sync_status
+
+transport.ack
+  → TransportAck
+  → 只确认 message_id 已通过最小 envelope / schema 校验并进入 handler queue
+
+market.tick
+  → MarketTick
+  → latest-only，不作为 strategy 主信号事实
+
+market.bar
+  → MarketBar
+  → 已关闭 bar，主信号输入
+
+symbol.metadata
+  → SymbolMetadataSnapshot
+
+account.snapshot
+  → AccountSnapshot
+
+position.snapshot
+  → PositionSnapshot
+
+order.snapshot
+  → OrderSnapshot
+
+execution.command
+  → ExecutionCommand
+  → 必须 HMAC
+  → 必须 expires_at
+
+command.received
+  → CommandReceived
+  → 表示 Execution Client 已写入本地 command journal
+
+execution.event
+  → ExecutionEvent
+  → 执行事实来源
+
+reconciliation.request
+  → ReconciliationRequest
+
+reconciliation.result
+  → ReconciliationResult
+
+protocol.error
+  → ProtocolError
+  → 仅用于可解析 envelope 后的协议错误提示
+```
+
+#### 新增 Payload 类型
+
+```ts
+export interface SessionRejected {
+  reason: ErrorCode | "AUTHENTICATION_FAILED" | "SESSION_IDENTITY_MISMATCH"
+  message?: string
+  server_time: number
+}
+
+export interface TransportAck {
+  acked_message_id: string
+  acked_message_type: ExecutionClientMessageType
+  status: "ACCEPTED" | "DUPLICATE" | "REJECTED"
+  reason?: ErrorCode | "OK"
+  received_at: number
+}
+
+export interface ProtocolError {
+  related_message_id?: string
+  related_message_type?: ExecutionClientMessageType
+  reason: ErrorCode | "WIRE_PROTOCOL_VIOLATION" | "WIRE_FRAME_TOO_LARGE" | "DECODE_FAILED"
+  message?: string
+  server_time: number
+}
+
+export interface MarketTick {
+  account_id: string
+  symbol: SymbolCode
+  broker_symbol?: string
+  bid: number
+  ask: number
+  last?: number
+  volume?: number
+  observed_at: number
+}
+
+export interface CommandReceived {
+  command_id: string
+  idempotency_key: string
+  account_id: string
+  terminal_id?: string
+  client_id?: string
+  received_at: number
+  inbox_status: "RECORDED" | "DUPLICATE" | "EXPIRED" | "REJECTED"
+  reason?: ErrorCode | "OK"
+}
+
+export interface ReconciliationRequest {
+  request_id: string
+  account_id: string
+  terminal_id?: string
+  client_id?: string
+  reason:
+    | "DELIVERY_UNCONFIRMED"
+    | "CONNECTION_RESTORED"
+    | "MANUAL_REQUEST"
+    | "STATE_STORE_RESTORED"
+  command_ids?: string[]
+  since_server_time?: number
+}
+
+export interface ReconciliationResult {
+  request_id: string
+  account_id: string
+  terminal_id?: string
+  client_id?: string
+  observed_at: number
+  account?: AccountSnapshot
+  positions: PositionSnapshot[]
+  orders: OrderSnapshot[]
+  symbol_metadata: SymbolMetadataSnapshot[]
+  unresolved_command_ids: string[]
+}
+```
+
+#### ACK 语义
+
+```text
+transport.ack
+  → 只确认 WireMessage envelope 已解析、schema 已通过、进入对应 handler queue
+  → 不表示 command 已执行
+  → 不表示事件已改变 execution state
+
+command.received
+  → execution.command 的业务 ACK
+  → 表示 Execution Client 已持久化 command_id / idempotency_key
+  → 是 command lifecycle 从 DISPATCHED 推进的必要条件
+
+execution.event
+  → broker 执行事实
+  → 是 ACCEPTED / ORDER_SENT / FILLED / REJECTED / FAILED 等状态投影来源
+```
+
+#### HMAC Signing String
+
+`execution.command` 的 HMAC 签名字符串必须固定字段顺序，不能使用 JSON stringify / canonical JSON。
+
+签名 secret：
+
+```text
+command signing secret
+  → UTF-8 bytes
+  → HMAC-SHA256
+  → lowercase hex digest
+```
+
+固定字段顺序：
+
+```text
+command_id
+plan_id
+leg_id
+strategy_id
+account_id
+terminal_id
+client_id
+symbol
+broker_symbol
+action
+order_type
+lots
+price
+sl
+tp
+deviation_points
+magic
+comment
+position_ticket
+broker_order_id
+filling_policy
+time_policy
+expiration_time
+expires_at
+idempotency_key
+```
+
+生成规则：
+
+```text
+1. hmac 字段不参与签名。
+2. 缺失 optional 字段写为空字符串。
+3. 字段格式为 key=value。
+4. 字段之间用 & 连接。
+5. string / enum 使用 UTF-8 + RFC3986 percent-encoding。
+6. number 必须先按 symbol metadata / 字段规则格式化成确定字符串。
+7. digest = HMAC_SHA256(secret_utf8, signing_string_utf8)，输出 lowercase hex。
+```
+
+Golden signing vector：
+
+```text
+secret = test_command_secret_v1
+
+signing_string =
+command_id=cmd_20260526_000001&plan_id=plan_20260526_000001&leg_id=leg_1&strategy_id=trend_xau_h4_v1&account_id=acct_mt5_001&terminal_id=mt5_terminal_001&client_id=mt5_client_001&symbol=XAUUSD&broker_symbol=XAUUSD&action=BUY&order_type=MARKET&lots=0.10&price=&sl=2320.50&tp=2365.50&deviation_points=20&magic=26052601&comment=trend_xau_h4&position_ticket=&broker_order_id=&filling_policy=IOC&time_policy=GTC&expiration_time=&expires_at=1779800123000&idempotency_key=idem_cmd_20260526_000001
+
+hmac =
+044916a7aac911c86b107a0fb7ddb21529f2e8dcb755d3d0183d8fd3589f1d2e
+```
+
+#### Golden Sample JSON
+
+Golden samples 必须进入代码仓库测试目录，例如：
+
+```text
+tests/golden/execution_client_protocol/session_hello.json
+tests/golden/execution_client_protocol/execution_command_buy_market.json
+tests/golden/execution_client_protocol/command_received.json
+```
+
+`session_hello.json`：
+
+```json
+{
+  "message_id": "msg_hello_20260526_000001",
+  "type": "session.hello",
+  "schema_version": "ecp.v1.0",
+  "correlation_id": "corr_boot_20260526_000001",
+  "sequence": 1,
+  "payload": {
+    "client_id": "mt5_client_001",
+    "platform": "MT5",
+    "terminal_id": "mt5_terminal_001",
+    "account_id": "acct_mt5_001",
+    "token": "test_client_token",
+    "capabilities": [
+      "MARKET_ORDER",
+      "CANCEL_ORDER",
+      "RECONCILIATION_REQUEST"
+    ],
+    "resume": {
+      "previous_session_id": "sess_previous",
+      "last_gateway_message_id": "msg_cmd_previous",
+      "last_gateway_sequence": 41,
+      "pending_command_ids": []
+    }
+  }
+}
+```
+
+`execution_command_buy_market.json`：
+
+```json
+{
+  "message_id": "msg_cmd_20260526_000001",
+  "type": "execution.command",
+  "schema_version": "ecp.v1.0",
+  "session_id": "sess_20260526_000001",
+  "correlation_id": "corr_trade_20260526_000001",
+  "causation_id": "intent_20260526_000001",
+  "sent_at": 1779800000123,
+  "sequence": 42,
+  "payload": {
+    "command_id": "cmd_20260526_000001",
+    "plan_id": "plan_20260526_000001",
+    "leg_id": "leg_1",
+    "strategy_id": "trend_xau_h4_v1",
+    "account_id": "acct_mt5_001",
+    "terminal_id": "mt5_terminal_001",
+    "client_id": "mt5_client_001",
+    "symbol": "XAUUSD",
+    "broker_symbol": "XAUUSD",
+    "action": "BUY",
+    "order_type": "MARKET",
+    "lots": 0.1,
+    "sl": 2320.5,
+    "tp": 2365.5,
+    "deviation_points": 20,
+    "magic": 26052601,
+    "comment": "trend_xau_h4",
+    "filling_policy": "IOC",
+    "time_policy": "GTC",
+    "expires_at": 1779800123000,
+    "idempotency_key": "idem_cmd_20260526_000001",
+    "hmac": "044916a7aac911c86b107a0fb7ddb21529f2e8dcb755d3d0183d8fd3589f1d2e"
+  }
+}
+```
+
+`command_received.json`：
+
+```json
+{
+  "message_id": "msg_received_20260526_000001",
+  "type": "command.received",
+  "schema_version": "ecp.v1.0",
+  "session_id": "sess_20260526_000001",
+  "correlation_id": "corr_trade_20260526_000001",
+  "causation_id": "msg_cmd_20260526_000001",
+  "sent_at": 1779800000188,
+  "sequence": 17,
+  "payload": {
+    "command_id": "cmd_20260526_000001",
+    "idempotency_key": "idem_cmd_20260526_000001",
+    "account_id": "acct_mt5_001",
+    "terminal_id": "mt5_terminal_001",
+    "client_id": "mt5_client_001",
+    "received_at": 1779800000180,
+    "inbox_status": "RECORDED",
+    "reason": "OK"
+  }
+}
+```
+
+### 23.2 SQLite State Store Schema
+
+SQLite State Store 分两层：
+
+```text
+append-only facts
+  → 不可变事实事件，用于恢复、审计、重放
+
+projection tables
+  → 为 HTTP query / risk check / execution scheduling 优化的当前状态
+  → 可由 append-only facts 重建
+```
+
+State Store 启用：
+
+```text
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+所有写入必须包在 transaction 中。
+所有 server time 字段使用 INTEGER Unix milliseconds UTC。
+payload_json 存 canonical JSON text。
+payload_hash 存 SHA-256 hex，用于审计和重复检测。
+```
+
+#### SQLite Migration Strategy
+
+Migration 必须 forward-only、可审计、可重复校验。
+
+```sql
+CREATE TABLE schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  applied_at INTEGER NOT NULL
+);
+```
+
+规则：
+
+```text
+migration 文件命名：V0001__init.sql、V0002__add_command_delivery_attempts.sql
+version 必须单调递增，不允许跳号复用。
+checksum 使用 migration 文件内容 SHA-256 hex。
+启动时必须校验已应用 migration 的 checksum；不一致则拒绝启动。
+生产环境不做自动破坏性 DDL；需要 backfill / rebuild projection 时必须显式 maintenance mode。
+append-only facts 表不得通过 migration 删除历史列；废弃字段只能停止写入。
+projection 表可以 drop/rebuild，但必须能从 core_events / execution_events 重建。
+SQLite PRAGMA user_version 可以同步写入当前最高 migration version，schema_migrations 是权威记录。
+```
+
+#### SQLite Status Enum Registry
+
+所有 status / enum TEXT 字段必须在 migration 中使用 `CHECK (...)` 或由集中 enum table 约束。第一选择是 `CHECK`，因为值集合属于协议和状态机的一部分。
+
+```text
+execution_client_sessions.status
+  → ACTIVE / STALE / DISCONNECTED / REJECTED
+
+execution_client_sessions.clock_sync_status
+  → SYNCED / DEGRADED / UNSYNCED
+
+wire_inbox.status
+  → RECEIVED / ACKED / HANDLED / DUPLICATE / DEADLETTER / FAILED
+
+wire_outbox.status
+  → PENDING / SENT / ACKED / FAILED / CANCELLED
+
+trade_intents.status
+  → ACCEPTED / RISK_BLOCKED / REJECTED / DUPLICATE / EXPIRED / CANCELLED
+
+execution_plans.status
+  → PENDING / RECONCILING / MANUAL_RECONCILIATION_REQUIRED / PARTIAL / COMPLETED / FAILED / EXPIRED / CANCELLED
+
+execution_legs.status
+  → PENDING / SENT / DELIVERY_UNCONFIRMED / RECONCILING / MANUAL_RECONCILIATION_REQUIRED / COMMAND_RECEIVED / ACCEPTED / REJECTED / ORDER_SENT / PARTIALLY_FILLED / FILLED / FAILED / EXPIRED / CANCELLED
+
+execution_commands.action
+  → BUY / SELL / CLOSE / MODIFY / CANCEL
+
+execution_command_states.status
+  → CREATED / DISPATCHED / DELIVERY_UNCONFIRMED / DELIVERY_FAILED / RECONCILING / MANUAL_RECONCILIATION_REQUIRED / COMMAND_RECEIVED / ACCEPTED / REJECTED / ORDER_SENT / PARTIALLY_FILLED / FILLED / FAILED / EXPIRED / CANCELLED
+
+command_delivery_attempts.status
+  → PENDING / SENT / ACKED / BACKPRESSURE / NO_ACTIVE_SESSION / FAILED / TIMEOUT / CANCELLED
+
+execution_events.status
+  → ACCEPTED / ORDER_SENT / REJECTED / FILLED / PARTIALLY_FILLED / FAILED / EXPIRED / CANCELLED
+
+system_events.severity
+  → INFO / WARNING / ERROR / CRITICAL
+
+event_stream_log.topic
+  → market.snapshot / risk.summary / execution.summary / system.event / deadletter.summary
+
+outbound_spool.status
+  → PENDING / SENT / ACKED / FAILED / RETRYING / DEADLETTER
+```
+
+核心事实事件的 `event_type` 直接复用 durable message type，必要时加 domain suffix：
+
+```text
+market.bar
+symbol.metadata
+account.snapshot
+position.snapshot
+order.snapshot
+execution.command.created
+command.received
+execution.event
+reconciliation.request
+reconciliation.result
+trade.intent.accepted
+trade.intent.rejected
+risk.approved
+risk.rejected
+system.event
+deadletter.event
+```
+
+#### Core Append-only Tables
+
+```sql
+CREATE TABLE core_events (
+  event_id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  aggregate_type TEXT NOT NULL,
+  aggregate_id TEXT NOT NULL,
+
+  message_id TEXT,
+  schema_version TEXT NOT NULL,
+  correlation_id TEXT,
+  causation_id TEXT,
+
+  account_id TEXT,
+  client_id TEXT,
+  terminal_id TEXT,
+  strategy_id TEXT,
+  intent_id TEXT,
+  plan_id TEXT,
+  leg_id TEXT,
+  command_id TEXT,
+  idempotency_key TEXT,
+
+  event_at INTEGER NOT NULL,
+  received_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+
+  source TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL
+);
+
+CREATE INDEX idx_core_events_type_time ON core_events(event_type, event_at);
+CREATE INDEX idx_core_events_command ON core_events(command_id);
+CREATE INDEX idx_core_events_intent ON core_events(intent_id);
+CREATE INDEX idx_core_events_account_time ON core_events(account_id, event_at);
+CREATE UNIQUE INDEX idx_core_events_message_id ON core_events(message_id)
+  WHERE message_id IS NOT NULL;
+```
+
+```sql
+CREATE TABLE deadletter_events (
+  deadletter_id TEXT PRIMARY KEY,
+  message_id TEXT,
+  message_type TEXT,
+  schema_version TEXT,
+  reason TEXT NOT NULL,
+  raw_payload TEXT,
+  received_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE system_events (
+  system_event_id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  component TEXT NOT NULL,
+  message TEXT NOT NULL,
+  metadata_json TEXT,
+  timestamp INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+```
+
+#### Wire / Session Tables
+
+```sql
+CREATE TABLE execution_client_sessions (
+  session_id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  terminal_id TEXT,
+  platform TEXT NOT NULL,
+  status TEXT NOT NULL,
+  capabilities_json TEXT NOT NULL,
+  remote_addr TEXT,
+  connected_at INTEGER NOT NULL,
+  last_heartbeat_at INTEGER,
+  last_time_sync_at INTEGER,
+  clock_sync_status TEXT,
+  disconnected_at INTEGER
+);
+
+CREATE UNIQUE INDEX idx_active_session_identity
+ON execution_client_sessions(client_id, account_id, COALESCE(terminal_id, ''))
+WHERE status = 'ACTIVE';
+
+-- terminal_id may be NULL; SQLite UNIQUE allows multiple NULL values.
+-- COALESCE or a generated non-null terminal_key is required for active session uniqueness.
+
+CREATE TABLE wire_inbox (
+  message_id TEXT PRIMARY KEY,
+  session_id TEXT,
+  message_type TEXT NOT NULL,
+  sequence INTEGER,
+  received_at INTEGER NOT NULL,
+  handled_at INTEGER,
+  status TEXT NOT NULL,
+  payload_hash TEXT NOT NULL
+);
+
+CREATE TABLE wire_outbox (
+  message_id TEXT PRIMARY KEY,
+  session_id TEXT,
+  message_type TEXT NOT NULL,
+  sequence INTEGER,
+  command_id TEXT,
+  payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  sent_at INTEGER,
+  acked_at INTEGER,
+  last_error TEXT
+);
+```
+
+#### Execution Tables
+
+```sql
+CREATE TABLE trade_intents (
+  intent_id TEXT PRIMARY KEY,
+  decision_id TEXT NOT NULL,
+  strategy_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  status TEXT NOT NULL,
+  requested_at INTEGER NOT NULL,
+  signal_expires_at INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX idx_trade_intents_idempotency
+ON trade_intents(idempotency_key);
+
+CREATE TABLE risk_results (
+  risk_id TEXT PRIMARY KEY,
+  intent_id TEXT NOT NULL,
+  approved INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  snapshot_age_ms INTEGER NOT NULL,
+  symbol_metadata_age_ms INTEGER NOT NULL,
+  evaluated_at INTEGER NOT NULL,
+  valid_until INTEGER NOT NULL,
+  payload_json TEXT NOT NULL
+);
+
+CREATE TABLE execution_plans (
+  plan_id TEXT PRIMARY KEY,
+  intent_id TEXT NOT NULL,
+  strategy_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  failure_policy TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE execution_legs (
+  leg_id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE execution_commands (
+  command_id TEXT PRIMARY KEY,
+  plan_id TEXT,
+  leg_id TEXT,
+  account_id TEXT NOT NULL,
+  client_id TEXT,
+  terminal_id TEXT,
+  symbol TEXT NOT NULL,
+  action TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  hmac TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX idx_execution_commands_idempotency
+ON execution_commands(idempotency_key);
+
+CREATE TABLE command_delivery_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL,
+  session_id TEXT,
+  message_id TEXT,
+  status TEXT NOT NULL,
+  attempted_at INTEGER NOT NULL,
+  acked_at INTEGER,
+  error TEXT
+);
+
+CREATE INDEX idx_command_delivery_attempts_command
+ON command_delivery_attempts(command_id, attempted_at);
+
+CREATE TABLE execution_command_states (
+  command_id TEXT PRIMARY KEY,
+  plan_id TEXT,
+  leg_id TEXT,
+  status TEXT NOT NULL,
+  delivery_attempts INTEGER NOT NULL DEFAULT 0,
+  last_delivery_error TEXT,
+  created_at INTEGER NOT NULL,
+  dispatched_at INTEGER,
+  command_received_at INTEGER,
+  reconciling_at INTEGER,
+  completed_at INTEGER,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE execution_events (
+  execution_event_id TEXT PRIMARY KEY,
+  command_id TEXT,
+  plan_id TEXT,
+  leg_id TEXT,
+  account_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  broker_order_id TEXT,
+  position_ticket TEXT,
+  event_at INTEGER NOT NULL,
+  filled_at INTEGER,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+```
+
+#### Latest-state Projection Tables
+
+```sql
+CREATE TABLE market_bars (
+  account_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  timestamp INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  received_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, symbol, timeframe, timestamp)
+);
+
+CREATE TABLE market_snapshots (
+  account_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, symbol)
+);
+
+CREATE TABLE symbol_metadata_latest (
+  account_id TEXT NOT NULL,
+  broker_symbol TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, broker_symbol)
+);
+
+CREATE TABLE account_snapshots_latest (
+  account_id TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE position_snapshots_latest (
+  account_id TEXT NOT NULL,
+  position_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, position_id)
+);
+
+CREATE TABLE order_snapshots_latest (
+  account_id TEXT NOT NULL,
+  broker_order_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  observed_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, broker_order_id)
+);
+```
+
+#### Spool / Event Stream Tables
+
+```sql
+CREATE TABLE event_stream_log (
+  event_id TEXT PRIMARY KEY,
+  topic TEXT NOT NULL,
+  account_id TEXT,
+  event_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_event_stream_topic_time
+ON event_stream_log(topic, created_at);
+
+CREATE TABLE outbound_spool (
+  spool_id TEXT PRIMARY KEY,
+  target TEXT NOT NULL,
+  event_id TEXT,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_retry_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+```
+
+#### Message → Storage Mapping
+
+| Execution Client message type | append-only | projection / side effect |
+|---|---|---|
+| `session.hello` | `system_events` on accepted/rejected | `execution_client_sessions` |
+| `heartbeat` | `system_events` only on status change/anomaly | update `execution_client_sessions` |
+| `market.tick` | optional sampled `core_events` | upsert `market_snapshots` |
+| `market.bar` | `core_events` | upsert `market_bars`, update `market_snapshots` |
+| `symbol.metadata` | `core_events` | upsert `symbol_metadata_latest` |
+| `account.snapshot` | `core_events` | upsert `account_snapshots_latest` |
+| `position.snapshot` | `core_events` | upsert `position_snapshots_latest` |
+| `order.snapshot` | `core_events` | upsert `order_snapshots_latest` |
+| `execution.command` | `core_events` once per command creation | insert `execution_commands`, upsert `execution_command_states`, insert `command_delivery_attempts` per dispatch |
+| `command.received` | `core_events` | update `execution_command_states.command_received_at/status` |
+| `execution.event` | `core_events`, `execution_events` | project command / leg / plan state |
+| `reconciliation.request` | `core_events` | insert `wire_outbox`, mark commands RECONCILING |
+| `reconciliation.result` | `core_events` | update latest snapshots and reconciliation state |
+| invalid schema/type | `deadletter_events` | no business projection |
+
+### 23.3 Rust Crate Boundary
+
+Rust workspace 按协议和状态边界拆，不按“技术热闹程度”拆。crate 依赖必须保持单向，避免 gateway、execution、risk 互相调用成一个大泥球。
+
+推荐 workspace：
+
+```text
+crates/
+  trading-core-types
+  trading-core-wire
+  trading-core-store
+  trading-core-domain
+  trading-core-gateway
+  trading-core-risk
+  trading-core-execution
+  trading-core-reconciliation
+  trading-core-events
+  trading-core-http
+  trading-core-app
+```
+
+Workspace `Cargo.toml` 骨架：
+
+```toml
+[workspace]
+resolver = "2"
+members = [
+  "crates/trading-core-types",
+  "crates/trading-core-wire",
+  "crates/trading-core-store",
+  "crates/trading-core-domain",
+  "crates/trading-core-gateway",
+  "crates/trading-core-risk",
+  "crates/trading-core-execution",
+  "crates/trading-core-reconciliation",
+  "crates/trading-core-events",
+  "crates/trading-core-http",
+  "crates/trading-core-app",
+]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
+uuid = { version = "1", features = ["v7", "serde"] }
+```
+
+#### Crate 职责
+
+```text
+trading-core-types
+  → shared DTO / enum / error code / schema version
+  → 不依赖 store / gateway / execution
+
+trading-core-wire
+  → transport frame/message encode/decode
+  → WireMessage validation
+  → message registry
+  → transport ack envelope
+  → 不做 risk / execution state transition
+
+trading-core-store
+  → SQLite migrations
+  → repository traits / SQLx implementation
+  → transaction boundary
+  → append-only event writer
+  → projection writer / query reader
+
+trading-core-domain
+  → server time provider
+  → id generator
+  → signing string / HMAC
+  → state transition rules
+  → validation helpers
+
+trading-core-gateway
+  → Native TCP / Execution WS / Event WS transport adapters
+  → session registry
+  → GatewayInboundRouter / GatewayOutboundRouter pipeline
+  → delivery result reporting
+  → 不拥有 command lifecycle
+
+trading-core-risk
+  → build RiskRequest from State Store
+  → hard risk gate
+  → RiskResult creation
+  → no socket / HTTP dependency
+
+trading-core-execution
+  → TradeIntent handling after initial validation
+  → execution.plan / execution.command generation
+  → command signing
+  → ExecutionCommandState transitions
+  → dispatch request to gateway outbound port
+
+trading-core-reconciliation
+  → delivery unconfirmed recovery
+  → reconciliation.request generation
+  → reconciliation.result evaluation
+  → manual reconciliation state
+
+trading-core-events
+  → event stream manager
+  → WS cursor window
+  → Redis / long-term audit fanout spool
+  → no execution decision
+
+trading-core-http
+  → REST schema
+  → auth / read-only debug auth
+  → map HTTP request to application command/query
+  → no direct SQL string outside store query API
+
+trading-core-app
+  → binary composition root
+  → config / dependency injection / graceful shutdown
+```
+
+#### Dependency Direction
+
+下层 crate 不依赖上层 crate。越靠下越接近纯类型 / domain / storage，越靠上越接近 transport / composition。
+
+```text
+app
+  → gateway / http
+  → risk / execution / reconciliation / events
+  → store
+  → domain
+  → types
+```
+
+允许：
+
+```text
+execution → risk
+execution → store
+execution → domain
+execution → outbound delivery port trait defined in execution or domain
+gateway → wire
+gateway → store for session / wire inbox only
+gateway → outbound delivery port implementation
+http → execution application service
+http → store query service
+events → store projection reader
+```
+
+禁止：
+
+```text
+wire → store
+wire → execution
+gateway router → risk engine
+gateway router → direct SQL for execution state
+risk → gateway
+store → gateway / http / execution
+http → gateway session internals
+events → mutate execution_command_states
+```
+
+#### Handler Ownership
+
+| message / API | handler owner | writes |
+|---|---|---|
+| `session.hello` | gateway-session | sessions, system_events |
+| `heartbeat` | gateway-session | sessions, system_events on anomaly |
+| `time.sync.request` | gateway-time | none |
+| `market.tick` | gateway inbound → market ingest service | market_snapshots |
+| `market.bar` | gateway inbound → market ingest service | core_events, market_bars |
+| snapshots | state ingest service | core_events, latest-state tables |
+| `command.received` | execution service | core_events, execution_command_states |
+| `execution.event` | execution projection service | core_events, execution_events, command/leg/plan projection |
+| `execution.command` | execution service + gateway outbound port | execution_commands, execution_command_states, command_delivery_attempts, wire_outbox |
+| `reconciliation.request` | reconciliation service + gateway outbound port | core_events, wire_outbox, command state |
+| `reconciliation.result` | reconciliation service | core_events, latest snapshots, command state |
+| `POST /trade-intents` | execution application service | trade_intents, risk_results, plans, commands |
+| `GET /state` | HTTP query service | read-only projections |
+| `WS /events` | event stream manager | read-only event_stream_log / projection |
+
+#### Key Port Traits
+
+Port trait 必须定义在 domain / execution 侧，adapter 实现在 gateway / store 侧。这样 Execution Engine 可以请求投递，但不能知道具体 transport。
+
+```rust
+use async_trait::async_trait;
+use trading_core_types::{
+    AccountId, ClientId, CommandId, ErrorCode, ExecutionCommand,
+    ExecutionClientMessage, ReconciliationRequest, SessionId, TerminalId,
+};
+
+pub struct DeliveryRequest<T> {
+    pub account_id: AccountId,
+    pub client_id: Option<ClientId>,
+    pub terminal_id: Option<TerminalId>,
+    pub command_id: Option<CommandId>,
+    pub message: ExecutionClientMessage<T>,
+    pub expires_at: Option<i64>,
+}
+
+pub enum DeliveryOutcome {
+    AcceptedForWrite {
+        attempt_id: String,
+        message_id: String,
+        session_id: SessionId,
+        sent_at: i64,
+    },
+    NoActiveSession,
+    Backpressure {
+        queue_depth: usize,
+    },
+    TransportFailed {
+        error: String,
+    },
+}
+
+#[async_trait]
+pub trait OutboundDeliveryPort: Send + Sync {
+    async fn deliver_execution_command(
+        &self,
+        request: DeliveryRequest<ExecutionCommand>,
+    ) -> Result<DeliveryOutcome, ErrorCode>;
+
+    async fn deliver_reconciliation_request(
+        &self,
+        request: DeliveryRequest<ReconciliationRequest>,
+    ) -> Result<DeliveryOutcome, ErrorCode>;
+}
+```
+
+State Store port 示例：
+
+```rust
+use async_trait::async_trait;
+use trading_core_types::{
+    CommandId, CoreEvent, ExecutionCommand, ExecutionCommandState,
+    ExecutionEvent, TradeIntent,
+};
+
+#[async_trait]
+pub trait ExecutionRepository: Send + Sync {
+    async fn append_core_event(&self, event: CoreEvent) -> anyhow::Result<()>;
+    async fn insert_trade_intent(&self, intent: TradeIntent) -> anyhow::Result<()>;
+    async fn insert_execution_command(&self, command: ExecutionCommand) -> anyhow::Result<()>;
+    async fn update_command_state(&self, state: ExecutionCommandState) -> anyhow::Result<()>;
+    async fn append_execution_event(&self, event: ExecutionEvent) -> anyhow::Result<()>;
+    async fn get_command_state(&self, command_id: &CommandId) -> anyhow::Result<Option<ExecutionCommandState>>;
+}
+```
+
+Clock / ID port 示例：
+
+```rust
+pub trait ServerClock: Send + Sync {
+    fn now_ms(&self) -> i64;
+}
+
+pub trait IdGenerator: Send + Sync {
+    fn new_id(&self, prefix: &str) -> String;
+}
+```
+
+约束：
+
+```text
+OutboundDeliveryPort 只能返回 delivery outcome，不得直接修改 ExecutionCommandState。
+ExecutionRepository 的 transaction API 必须支持 intent / risk / plan / command 同事务写入。
+Gateway adapter 实现 OutboundDeliveryPort，并负责写 command_delivery_attempts / wire_outbox。
+Execution service 根据 DeliveryOutcome 推进 ExecutionCommandState。
+```
+
+### 23.4 HTTP API Schema
+
+HTTP API 不暴露 Execution Client transport session / raw WireMessage，也不允许 Control Plane 直接提交 `execution.command`。HTTP schema 由 State Store projection 决定。
+
+#### HTTP Auth Header
+
+所有 HTTP / Event WebSocket 请求必须携带认证信息。推荐格式：
+
+```http
+Authorization: Bearer <internal_service_token>
+X-Request-Id: req_20260526_000001
+X-Correlation-Id: corr_trade_20260526_000001
+X-Idempotency-Key: idem_intent_20260526_000001
+```
+
+规则：
+
+```text
+Authorization 必填。
+X-Request-Id 必填，用于 HTTP request 级追踪。
+X-Correlation-Id 推荐必填，用于跨 workflow / intent / command 串联。
+X-Idempotency-Key 对 POST /trade-intents 必填，必须等于或映射到 TradeIntent.idempotency_key。
+Debug read-only API 必须使用带 debug:read scope 的 token。
+Control Plane token 不得访问 /debug/commands 的 command payload HMAC，除非具备 execution:debug-sensitive scope。
+Event WebSocket 在 handshake 阶段使用同一 Authorization header。
+```
+
+scope 建议：
+
+```text
+control-plane:write-intent
+control-plane:read-state
+event:subscribe
+debug:read
+execution:debug-sensitive
+admin:maintenance
+```
+
+#### HTTP Error Response
+
+所有非 2xx 响应使用统一错误结构：
+
+```ts
+export interface HttpErrorResponse {
+  error_code: ErrorCode
+  message: string
+  request_id: string
+  correlation_id?: string
+  server_time: number
+  details?: Record<string, unknown>
+}
+```
+
+HTTP visible `ErrorCode` 必须来自 `7.1 Common Types` 的集中枚举。常用映射：
+
+| HTTP status | error_code | 场景 |
+|---:|---|---|
+| 400 | `BAD_REQUEST` / `SCHEMA_VALIDATION_FAILED` / `MISSING_REQUIRED_FIELD` / `INVALID_FIELD_TYPE` | JSON 无法解析或字段不合法 |
+| 401 | `UNAUTHORIZED` / `AUTHENTICATION_FAILED` | 缺少 token 或 token 无效 |
+| 403 | `FORBIDDEN` | token 有效但 scope 不足 |
+| 404 | `NOT_FOUND` | intent / command / event 不存在 |
+| 405 | `METHOD_NOT_ALLOWED` | endpoint 不支持该 method |
+| 409 | `CONFLICT` / `IDEMPOTENCY_KEY_CONFLICT` / `DUPLICATE_IDEMPOTENCY_CONFLICT` | idempotency key 对应不同 payload |
+| 422 | `TRADE_INTENT_EXPIRED` / `TRADE_INTENT_TIME_INVALID` / `TIME_SYNC_UNHEALTHY` / `ACCOUNT_SNAPSHOT_STALE` / `SYMBOL_METADATA_STALE` / `ORDER_SNAPSHOT_STALE` | 请求语义合法但不能进入执行流程 |
+| 429 | `RATE_LIMITED` / `COMMAND_DISPATCH_BACKPRESSURE` | ingress 限流或执行队列背压 |
+| 500 | `INTERNAL_ERROR` | 未分类内部错误 |
+| 503 | `SERVICE_UNAVAILABLE` / `STATE_STORE_UNAVAILABLE` / `REDIS_UNAVAILABLE` | 依赖不可用或服务降级 |
+
+成功响应状态码：
+
+| Endpoint | HTTP status | body status |
+|---|---:|---|
+| `POST /trade-intents` 新 intent 接收并进入流程 | 202 | `ACCEPTED` |
+| `POST /trade-intents` 同 idempotency key 重放且 payload 相同 | 200 | `DUPLICATE` |
+| `POST /trade-intents` 风控阻断 | 200 | `RISK_BLOCKED` |
+| `POST /trade-intents` 业务拒绝但请求已被审计记录 | 200 | `REJECTED` |
+| `GET /state` | 200 | n/a |
+| `GET /time` | 200 | n/a |
+| `GET /trade-intents/:intent_id` | 200 | n/a |
+| `GET /execution/commands/:command_id` | 200 | n/a |
+
+#### POST /trade-intents
+
+```ts
+export interface SubmitTradeIntentRequest {
+  intent: TradeIntent
+}
+
+export interface SubmitTradeIntentResponse {
+  intent_id: string
+  status:
+    | "ACCEPTED"
+    | "RISK_BLOCKED"
+    | "REJECTED"
+    | "DUPLICATE"
+  reason: ErrorCode | "OK"
+  correlation_id: string
+  accepted_at: number
+  state_ref?: {
+    plan_id?: string
+    risk_id?: string
+  }
+}
+```
+
+规则：
+
+```text
+ACCEPTED
+  → intent 已进入 State Store
+  → 不代表 broker 已成交
+
+DUPLICATE
+  → intent_id 或 idempotency_key 已存在
+  → 返回原始处理结果摘要
+
+RISK_BLOCKED / REJECTED
+  → 不生成 execution.command
+  → 必须可在 audit / risk summary 中查询原因
+```
+
+#### GET /state
+
+```ts
+export interface TradingCoreStateResponse {
+  server_time: number
+  clock_health: "HEALTHY" | "DEGRADED" | "UNHEALTHY"
+
+  account?: AccountSnapshot
+  positions: PositionSnapshot[]
+  orders: OrderSnapshot[]
+  symbols: SymbolMetadataSnapshot[]
+
+  sessions: Array<{
+    session_id: string
+    client_id: string
+    account_id: string
+    terminal_id?: string
+    platform: string
+    status: "ACTIVE" | "STALE" | "DISCONNECTED"
+    clock_sync_status?: "SYNCED" | "DEGRADED" | "UNSYNCED"
+    last_heartbeat_at?: number
+  }>
+
+  execution: {
+    open_plans: ExecutionPlan[]
+    pending_commands: ExecutionCommandState[]
+    recent_events: ExecutionEvent[]
+  }
+
+  risk: {
+    latest_results: RiskResult[]
+    circuit_breaker_active: boolean
+    circuit_breaker?: CircuitBreakerState
+  }
+}
+```
+
+`GET /state` 是 projection query，不是事实流导出。它用于 Control Plane 校准上下文、Debug UI 诊断、WS gap 后恢复。
+
+#### GET /time
+
+```ts
+export interface TradingCoreTimeResponse {
+  server_now_ms: number
+  server_receive_at: number
+  server_send_at: number
+  clock_health: "HEALTHY" | "DEGRADED" | "UNHEALTHY"
+  max_internal_server_skew_ms: number
+  max_decision_time_skew_ms: number
+  max_decision_time_sync_age_ms: number
+  max_decision_time_sync_rtt_ms: number
+  control_plane_time_sync_interval_ms: number
+  max_decision_intent_age_ms: number
+}
+```
+
+`server_now_ms` 必须等于 `server_send_at`。`server_receive_at / server_send_at` 用于 Control Plane 估算 offset；业务判断仍以 Trading Core 当前 server time 为准。
+
+#### GET /trade-intents/:intent_id
+
+```ts
+export interface TradeIntentStatusResponse {
+  intent_id: string
+  status: string
+  reason?: ErrorCode | "OK"
+  risk_id?: string
+  plan_id?: string
+  command_ids: string[]
+  created_at: number
+  updated_at: number
+}
+```
+
+#### GET /execution/commands/:command_id
+
+```ts
+export interface ExecutionCommandStatusResponse {
+  command_id: string
+  state: ExecutionCommandState
+  command?: ExecutionCommand
+  events: ExecutionEvent[]
+}
+```
+
+`command` payload 可以对 Debug UI 返回，但对普通 Control Plane 默认只返回 state summary。生产环境应按权限隐藏 HMAC 和 broker-sensitive 字段。
+
+#### WS /events Subscribe
+
+```ts
+export interface EventSubscribeRequest {
+  topics: Array<
+    | "market.snapshot"
+    | "risk.summary"
+    | "execution.summary"
+    | "system.event"
+    | "deadletter.summary"
+  >
+  account_id?: string
+  last_event_id?: string
+}
+
+export interface EventSubscribeResponse {
+  status: "SUBSCRIBED" | "RESUME_FAILED"
+  reason?: "GAP_DETECTED" | "CURSOR_EXPIRED" | "UNAUTHORIZED"
+  server_time: number
+  next_event_id?: string
+  requires_state_reload: boolean
+}
+```
+
+恢复规则：
+
+```text
+SUBSCRIBED + requires_state_reload=false
+  → cursor resume 成功
+
+RESUME_FAILED + requires_state_reload=true
+  → client 必须 GET /state / GET /time
+  → 然后重新 subscribe
+```
+
+#### Debug Read-only API
+
+```text
+GET /debug/state
+GET /debug/sessions
+GET /debug/events?since_event_id=...
+GET /debug/commands/:command_id
+```
+
+约束：
+
+```text
+必须使用 debug/read-only credential。
+不得提供 POST /debug/execute。
+不得直接写 execution.command。
+不得绕过 TradeIntent / Risk / Execution Engine。
+```
+
+---
+
+## 24. 第一版实现前验证清单
+
+第一版进入真实执行前，必须先通过 fake Execution Client / Paper Executor 的协议测试。
+
+### 必测场景
+
+```text
+Native TCP length-prefixed JSON 拆包 / 粘包
+Native TCP frame length <= 0 → WIRE_PROTOCOL_VIOLATION
+Native TCP frame length > max_frame_bytes → WIRE_FRAME_TOO_LARGE
+Execution WebSocket one message = one WireMessage
+Execution WebSocket message > max_message_bytes → WIRE_FRAME_TOO_LARGE
+WireMessage schema validation
+schema_version format ecp.v<major>.<minor>
+golden sample JSON parses in Rust / TS / MQL5
+hello / time.sync.request may omit sent_at
+post-sync business WireMessage missing sent_at → schema/deadletter
+schema major mismatch → deadletter.event
+unknown message type → deadletter.event
+session_id / client_id / account_id / terminal_id mismatch → SESSION_IDENTITY_MISMATCH
+HMAC golden vectors: Execution Engine generate / MQL5 verify
+HMAC golden vectors: wrong field order must fail
+HMAC golden vector matches 044916a7aac911c86b107a0fb7ddb21529f2e8dcb755d3d0183d8fd3589f1d2e
+RFC3986 encoding: 空格、中文、特殊字符
+number formatting: price digits / volume step / trailing zeros
+TradeIntent accepted / risk_blocked / duplicate / rejected
+TradeIntent cannot carry final execution.command fields
+Trading Core derives execution.plan / execution.command from TradeIntent
+HTTP retry with same intent_id is idempotent
+Event WebSocket cannot publish execution.command or broker order
+Execution WebSocket can carry execution.command only under Execution Client Protocol auth scope
+Event WebSocket event cursor resume followed by GET /state calibration
+Event WebSocket event replay window expired → resume_failed → GET /state calibration
+TransportAdapter reports delivery failure but cannot mutate ExecutionCommandState directly
+GatewayInboundRouter / GatewayOutboundRouter stage tests: no risk / execution state mutation
+Execution Client message registry rejects unknown type before business handler
+transport.ack does not advance ExecutionCommandState
+execution.command creation is stored once; delivery retry only adds command_delivery_attempts
+SQLite migrations create unique idempotency indexes
+SQLite migrations create CHECK constraints for all status enum fields
+schema_migrations checksum mismatch refuses startup
+State Store projection can be rebuilt from core_events for execution state
+crate dependency check: store does not depend on gateway / http / execution
+workspace Cargo.toml members match crate boundary
+OutboundDeliveryPort implementation cannot mutate ExecutionCommandState directly
+HTTP /state reads projection only and never exposes raw wire_inbox
+HTTP auth missing → 401 UNAUTHORIZED
+HTTP scope mismatch → 403 FORBIDDEN
+HTTP idempotency key conflict → 409 IDEMPOTENCY_KEY_CONFLICT
+time.sync request / response offset calculation
+heartbeat reports clock_sync_status and effective_server_now
+time sync high RTT sample discarded
+time sync stale / unhealthy → TIME_SYNC_UNHEALTHY
+client local wall clock drift does not affect expires_at
+decision control plane stale time sync → no new TradeIntent
+TradeIntent requested_at too old / future → TRADE_INTENT_TIME_INVALID
+expired TradeIntent signal_expires_at → TRADE_INTENT_EXPIRED
+internal server clock skew blocks command generation / dispatch
+expires_at derivation = min(signal_expires_at, risk_result.valid_until, server_now_ms + max_command_ttl_ms)
+Execution 不得延长 signal_expires_at / risk_result.valid_until
+expired execution.command 不进入 command inbox，不下单
+CANCEL command requires broker_order_id and may omit lots / order_type
+max_inflight_commands 超限 → COMMAND_DISPATCH_BACKPRESSURE
+command.received ACK 正常路径
+command.received 丢失 → DELIVERY_UNCONFIRMED → reconciliation
+重复 command_id / idempotency_key 不重复下单
+idempotency_key conflict → execution.event FAILED
+断线重连后重发 command.received / execution.event
+partial fill → plan PARTIAL → RollbackPolicy
+Redis unavailable → Trading Core fanout spool → Redis restored → flush
+State Store unavailable → reject new TradeIntent with STATE_STORE_UNAVAILABLE
+State Store restored → replay emergency spool before accepting new TradeIntent
+accepted-but-not-command intent freezes and revalidates after State Store restored
+spool duplicate flush 幂等
+manual reconciliation required path
+secret rotation ACTIVE / NEXT / RETIRED / REVOKED
+clock skew detected
+Control Plane /time sampling computes effective_trading_core_now_ms
+Control Plane stale time sync blocks TradeIntent before POST
+Circuit Breaker trigger blocks new TradeIntent with RISK_BLOCKED
+Circuit Breaker OPEN still allows reconciliation / execution.event / snapshots
+Circuit Breaker reset requires reconciliation and audit.event
+New Execution Client session resets both direction sequences to 1
+session.hello resume cursor includes previous_session_id / last message ids / pending_command_ids
+resume cursor does not auto-replay execution.command
+```
+
+### Fake Execution Client 能力
+
+```text
+模拟正常成交
+模拟拒单
+模拟 broker timeout
+模拟部分成交
+模拟 ACK 丢失
+模拟 socket 断线
+模拟 time sync high RTT
+模拟 time sync stale / unhealthy
+模拟 client wall clock drift
+模拟超大 frame / 非法 frame length
+模拟 session identity mismatch
+模拟 expired command
+模拟 max_inflight_commands 超限
+模拟重复 command
+模拟 Redis 恢复后的事件补写
+模拟 stale snapshot / stale symbol metadata
+```
+
+### 验收标准
+
+```text
+所有协议 golden tests 通过
+所有状态迁移符合 transition rules
+所有 terminal state 不回退
+所有执行相关事件进入长期审计 sink
+没有任何路径绕过 Risk Layer 生成 execution.command
+```
