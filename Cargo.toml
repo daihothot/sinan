@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/types",
+  "crates/protocol",
+  "crates/domain",
+  "crates/store",
+  "crates/gateway",
+  "crates/risk",
+  "crates/execution",
+  "crates/reconciliation",
+  "crates/events",
+  "crates/http",
+  "crates/core",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+hex = "0.4"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

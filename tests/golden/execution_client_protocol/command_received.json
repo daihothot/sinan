@@ -1,0 +1,20 @@
+{
+  "message_id": "msg_received_20260526_000001",
+  "type": "command.received",
+  "schema_version": "ecp.v1.0",
+  "session_id": "sess_20260526_000001",
+  "correlation_id": "corr_trade_20260526_000001",
+  "causation_id": "msg_cmd_20260526_000001",
+  "sent_at": 1779800000188,
+  "sequence": 17,
+  "payload": {
+    "command_id": "cmd_20260526_000001",
+    "idempotency_key": "idem_cmd_20260526_000001",
+    "account_id": "acct_mt5_001",
+    "terminal_id": "mt5_terminal_001",
+    "client_id": "mt5_client_001",
+    "received_at": 1779800000180,
+    "inbox_status": "RECORDED",
+    "reason": "OK"
+  }
+}

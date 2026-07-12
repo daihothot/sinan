@@ -1,0 +1,35 @@
+{
+  "message_id": "msg_cmd_20260526_000001",
+  "type": "execution.command",
+  "schema_version": "ecp.v1.0",
+  "session_id": "sess_20260526_000001",
+  "correlation_id": "corr_trade_20260526_000001",
+  "causation_id": "intent_20260526_000001",
+  "sent_at": 1779800000123,
+  "sequence": 42,
+  "payload": {
+    "command_id": "cmd_20260526_000001",
+    "plan_id": "plan_20260526_000001",
+    "leg_id": "leg_1",
+    "strategy_id": "trend_xau_h4_v1",
+    "account_id": "acct_mt5_001",
+    "terminal_id": "mt5_terminal_001",
+    "client_id": "mt5_client_001",
+    "symbol": "XAUUSD",
+    "broker_symbol": "XAUUSD",
+    "action": "BUY",
+    "order_type": "MARKET",
+    "lots": 0.1,
+    "sl": 2320.5,
+    "tp": 2365.5,
+    "deviation_points": 20,
+    "magic": 26052601,
+    "comment": "trend_xau_h4",
+    "filling_policy": "IOC",
+    "time_policy": "GTC",
+    "expires_at": 1779800123000,
+    "idempotency_key": "idem_cmd_20260526_000001",
+    "hmac": "044916a7aac911c86b107a0fb7ddb21529f2e8dcb755d3d0183d8fd3589f1d2e"
+  }
+}
+

@@ -1,64 +1,70 @@
-# Sinan Implementation Handoff
+# Sinan 实现交接文档
 
-## Project
+## 项目
 
-Sinan is a multi-platform quantitative trading system spanning research, strategy and decision control, hard risk control, execution, reconciliation, and broker/exchange adapters.
+Sinan 是一个多平台量化交易系统，覆盖研究、策略与决策控制、硬风控、执行、对账，以及券商和交易所适配器。
 
-The project name is **Sinan**. Concrete package names use the `sinan-*` prefix. Architecture layer names remain language- and framework-independent.
+项目名称为 **Sinan**。具体的 Cargo 包名使用 `sinan-*` 前缀；`crates/` 下的内部目录不带前缀，例如 `types`、`protocol` 和 `core`。架构层名称保持与具体语言和框架无关。
 
-## Authoritative Design
+## 权威设计
 
-The source of truth is:
+以下文档是唯一事实来源：
 
 ```text
 docs/quant_trading_7_layer_target_architecture.md
 ```
 
-Read the complete document before implementation, especially sections 4-7 and 23-24. If code and documentation conflict, stop and resolve the design explicitly; do not silently invent a third behavior.
+实现前必须完整阅读该文档，尤其是第 4-7 节和第 23-24 节。如果代码与文档冲突，应停止实现并明确解决设计冲突，不得静默引入第三种行为。
 
-## Current State
+## 当前状态
 
-- Architecture and implementation specifications are documented.
-- No Rust workspace or production code has been created yet.
-- The existing MQL5 EA remains in the MetaTrader workspace and is not part of this Rust repository.
-- The first implementation target is the Trading Core foundation, not the MT5 adapter or Control Plane.
+- 架构和实现规格已经完成记录，并与基础代码保持同步。
+- 第一里程碑的 Rust 工作区已经实现。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
+- `sinan-types`、`sinan-protocol`、三个协议黄金样例，以及带校验和验证的 SQLite migration 基础设施均已实现并通过测试。
+- 其余 crate 暂时仅作为后续里程碑所需的可编译占位。
+- 现有 MQL5 EA 仍位于 MetaTrader 工作区，不属于此 Rust 仓库。
+- 当前工作区基线已通过 `cargo fmt --all --check`、`cargo check --workspace` 和 `cargo test --workspace`。
 
-## Non-negotiable Architecture Decisions
+## 不可妥协的架构决策
 
-1. Trading Core is the trading correctness boundary.
-2. Strategy & Decision Control Plane submits `TradeIntent` with required `account_id` and stable `idempotency_key`; it never creates or sends `execution.command` directly.
-3. Risk Engine is a hard gate inside Trading Core.
-4. Execution Client Protocol is transport-independent.
-5. Native TCP and Execution WebSocket are Execution Client Protocol bindings.
-6. Event WebSocket (`/events`) is separate and cannot carry `execution.command`.
-7. SQLite append-only facts and projections are the authoritative local execution state.
-8. `ExecutionEvent` is the execution fact source; command, leg, and plan status are projections.
-9. `execution.command` requires HMAC-SHA256 using the fixed signing string in section 23.1.
-10. `transport.ack` uses the canonical payload in section 23.1; `transport.ack`, `command.received`, and `execution.event` have different semantics and must not be conflated.
-11. Trading Core server time is authoritative. Execution Client and Control Plane maintain offsets using monotonic clocks.
-12. Expired, unauthenticated, stale, unreconciled, or risk-blocked work must fail closed.
-13. WebSocket event gaps recover through bounded replay or `GET /state`; they never imply execution failure.
-14. Gateway transports and routers cannot mutate execution lifecycle state directly.
+1. Trading Core 是交易正确性边界。
+2. Strategy & Decision Control Plane 提交的 `TradeIntent` 必须包含 `account_id` 和稳定的 `idempotency_key`；它不得直接创建或发送 `execution.command`。
+3. Risk Engine 是 Trading Core 内部的硬门禁。
+4. Execution Client Protocol 与传输方式无关。
+5. Native TCP 和 Execution WebSocket 是 Execution Client Protocol 的传输绑定。
+6. Event WebSocket（`/events`）是独立通道，不得承载 `execution.command`。
+7. SQLite 中只追加的事实和 projection 是本地执行状态的权威来源。
+8. `ExecutionEvent` 是执行事实来源；command、leg 和 plan 状态都只是 projection。
+9. `execution.command` 必须按照第 23.1 节规定的固定签名字符串使用 HMAC-SHA256。
+10. `transport.ack` 使用第 23.1 节定义的权威 payload；`transport.ack`、`command.received` 和 `execution.event` 语义不同，不得混用。
+11. Trading Core 的服务器时间是权威时间。Execution Client 和 Control Plane 使用单调时钟维护时间偏移。
+12. 对于已过期、未认证、状态陈旧、未完成对账或被风控阻断的工作，必须失败关闭（fail closed）。
+13. WebSocket 事件缺口通过有界重放或 `GET /state` 恢复，事件缺口本身不表示执行失败。
+14. Gateway transport 和 router 不得直接修改执行生命周期状态。
+15. 每个 MQL5 Execution Client EA 都使用串行事件回调且没有后台 worker：`OnTimer` 独占有界网络泵的活性职责，`OnTick` 只采集并合并行情数据，`OnTradeTransaction` 必须先记录券商状态变化，再将报告加入队列。
+16. `sinan-risk` 在本地以确定性方式拥有最终批准 lots。Compute 的 position sizing 只提供建议；实时硬风控不得依赖 Compute/HTTP，Execution 必须精确映射已批准 lots，不得重新计算。
+17. `GET /state` 返回 `accounts: AccountSnapshot[]`；所有账户相关 projection 必须使用同一授权范围，并通过 `account_id` 关联。
+18. `TradeIntent.action` 持久化为 `trade_intents.action`，不得改名为 `direction`。
 
-## Rust Workspace Target
+## Rust 工作区目标
 
-Create this workspace:
+工作区结构如下：
 
 ```text
 sinan/
   Cargo.toml
   crates/
-    sinan-types/
-    sinan-protocol/
-    sinan-domain/
-    sinan-store/
-    sinan-gateway/
-    sinan-risk/
-    sinan-execution/
-    sinan-reconciliation/
-    sinan-events/
-    sinan-http/
-    sinan-core/
+    types/           # 包名：sinan-types
+    protocol/        # 包名：sinan-protocol
+    domain/          # 包名：sinan-domain
+    store/           # 包名：sinan-store
+    gateway/         # 包名：sinan-gateway
+    risk/            # 包名：sinan-risk
+    execution/       # 包名：sinan-execution
+    reconciliation/  # 包名：sinan-reconciliation
+    events/          # 包名：sinan-events
+    http/            # 包名：sinan-http
+    core/            # 包名：sinan-core
   docs/
     quant_trading_7_layer_target_architecture.md
   tests/
@@ -66,9 +72,9 @@ sinan/
       execution_client_protocol/
 ```
 
-`sinan-core` is the binary composition root. Other crates are libraries.
+`sinan-core` 是二进制组合根，其余 crate 均为库。
 
-Dependency direction:
+依赖方向：
 
 ```text
 sinan-core
@@ -79,42 +85,42 @@ sinan-core
   -> types
 ```
 
-`sinan-protocol` depends only on `sinan-types` and protocol-level libraries. It must not depend on store, gateway, risk, or execution.
+`sinan-protocol` 只能依赖 `sinan-types` 和协议级库，不得依赖 store、gateway、risk 或 execution。
 
-## First Milestone
+## 第一里程碑（已完成）
 
-Implement only the foundation below:
+第一里程碑只实现以下基础能力：
 
-1. Create the Cargo workspace and all crate directories.
-2. Implement `sinan-types`:
-   - shared IDs and newtypes;
-   - `ErrorCode`;
-   - execution, session, and storage status enums;
-   - common DTOs needed by the protocol.
-3. Implement `sinan-protocol`:
-   - `ExecutionClientMessageType`;
-   - generic `WireMessage<T>`;
-   - `ecp.v<major>.<minor>` parsing and compatibility checks;
-   - envelope validation;
-   - HMAC signing string generation and verification;
-   - Native TCP framing codec;
-   - transport-independent payload types.
-4. Materialize the three golden JSON files from section 23.1.
-5. Test the documented HMAC vector:
+1. 创建 Cargo 工作区和所有 crate 目录。
+2. 实现 `sinan-types`：
+   - 共享 ID 和 newtype；
+   - `ErrorCode`；
+   - execution、session 和 storage 状态枚举；
+   - 协议所需的通用 DTO。
+3. 实现 `sinan-protocol`：
+   - `ExecutionClientMessageType`；
+   - 泛型 `WireMessage<T>`；
+   - `ecp.v<major>.<minor>` 解析和兼容性检查；
+   - envelope 验证；
+   - HMAC 签名字符串生成和验证；
+   - Native TCP framing codec；
+   - 与传输方式无关的 payload 类型。
+4. 将第 23.1 节的三个黄金 JSON 文件落入仓库。
+5. 测试文档规定的 HMAC 向量：
 
 ```text
 secret: test_command_secret_v1
 expected: 044916a7aac911c86b107a0fb7ddb21529f2e8dcb755d3d0183d8fd3589f1d2e
 ```
 
-6. Implement `sinan-store` migration infrastructure and the initial `schema_migrations` migration.
-7. Add placeholder public APIs for the remaining crates only when required for workspace compilation.
+6. 实现 `sinan-store` migration 基础设施和初始 `schema_migrations` migration。
+7. 仅在工作区编译需要时，为其余 crate 添加公共占位 API。
 
-Do not implement TCP listeners, WebSocket servers, HTTP endpoints, Risk Engine policies, Execution Engine behavior, or MQL5 integration in this milestone.
+此里程碑不得实现 TCP listener、WebSocket server、HTTP endpoint、Risk Engine policy、Execution Engine 行为或 MQL5 集成。
 
-## First Milestone Acceptance Criteria
+## 第一里程碑验收标准
 
-The milestone is complete only when all pass:
+只有以下命令全部通过，第一里程碑才算完成：
 
 ```text
 cargo fmt --all --check
@@ -122,55 +128,60 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-Required tests:
+必需测试：
 
-- WireMessage JSON round-trip.
-- Unknown message type rejection.
-- Schema major mismatch rejection.
-- Higher compatible minor acceptance.
-- Golden JSON parsing.
-- Exact HMAC golden vector match.
-- Optional signing fields map to empty strings.
-- Fixed decimal formatting preserves required trailing zeros.
-- Native TCP length-prefix fragmentation and coalescing.
-- Oversized frame rejection.
-- Migration checksum mismatch rejection.
+- `WireMessage` JSON 往返序列化。
+- 拒绝未知消息类型。
+- 拒绝 schema major 版本不匹配。
+- 接受兼容的更高 minor 版本。
+- 解析黄金 JSON。
+- 精确匹配 HMAC 黄金向量。
+- 缺失的可选签名字段映射为空字符串。
+- 固定小数格式保留要求的末尾零。
+- Native TCP 长度前缀的拆包和粘包处理。
+- 拒绝超大 frame。
+- 拒绝 migration 校验和不匹配。
 
-## Implementation Constraints
+## 实现约束
 
-- Use server-time Unix milliseconds for business timestamps.
-- Use monotonic clocks only for local elapsed time and RTT.
-- Keep payload DTOs immutable where practical.
-- Use the repository's MIT license for all workspace crates.
-- Do not use JSON canonicalization for command HMAC.
-- Treat section 23.1 and its golden vector as the authoritative HMAC field order.
-- Require `X-Idempotency-Key` to equal `TradeIntent.idempotency_key`.
-- Do not let transport code own retry or command lifecycle decisions.
-- Keep migrations forward-only and checksum verified.
-- Preserve existing architecture vocabulary in public APIs.
-- Avoid adding dependencies without a concrete need.
+- 业务时间戳使用服务器时间域的 Unix 毫秒值。
+- 单调时钟只能用于本地经过时间和 RTT。
+- 在可行的情况下保持 payload DTO 不可变。
+- 所有工作区 crate 使用仓库的 MIT 许可证。
+- command HMAC 不得使用 JSON canonicalization。
+- 第 23.1 节及其黄金向量是 HMAC 字段顺序的权威来源。
+- `X-Idempotency-Key` 必须等于 `TradeIntent.idempotency_key`。
+- 风险百分比 `1.0` 表示一个百分点（`1%`），不是比例值。
+- 最终 position sizing 和 volume-step 比较使用十进制或定点整数运算。
+- 实时 `sinan-risk` / position sizing 不得添加 Compute Service 或 HTTP client 依赖。
+- transport 代码不得拥有重试决策或 command 生命周期决策。
+- migration 只允许向前执行，并且必须验证校验和。
+- 公共 API 必须保留现有架构术语。
+- 没有明确需要时，不得增加依赖。
 
-## Future Milestones
+## 后续里程碑
 
-After the foundation is stable:
+基础能力稳定后，按以下顺序推进：
 
-1. SQLite repositories and projections.
-2. Risk and circuit breaker domain logic.
-3. Execution command and state machine.
-4. Reconciliation.
-5. Gateway session registry and outbound delivery port.
-6. Native TCP and Execution WebSocket bindings.
-7. HTTP TradeIntent/state/time APIs and Event WebSocket.
-8. Fake Execution Client end-to-end tests.
-9. MQL5 and OKX adapters.
-10. Strategy & Decision Control Plane.
+1. SQLite repository 和 projection。
+2. Risk 与 circuit breaker 领域逻辑。
+3. Execution command 和状态机。
+4. 对账。
+5. Gateway session registry 和出站投递端口。
+6. Native TCP 和 Execution WebSocket 绑定。
+7. HTTP TradeIntent/state/time API 和 Event WebSocket。
+8. Fake Execution Client 端到端测试。
+9. MQL5 和 OKX 适配器。
+10. Strategy & Decision Control Plane。
 
-## Suggested Opening Prompt
+Risk 里程碑必须实现第 3.6、7.12-7.13 和 15 节规定的确定性 position-sizing 契约。Execution 里程碑必须精确映射已批准 lots，并在任何参数漂移时重新执行风控。MQL5 adapter 里程碑必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。这些内容都不属于第一里程碑交付范围。
+
+## 建议的开场提示
 
 ```text
-Read HANDOFF.md and docs/quant_trading_7_layer_target_architecture.md completely.
-Implement the First Milestone exactly as scoped in HANDOFF.md.
-Do not start network servers, Risk Engine, Execution Engine, HTTP APIs, or adapters yet.
-Run cargo fmt --all --check, cargo check --workspace, and cargo test --workspace before reporting completion.
-When the architecture is ambiguous, identify the conflict and resolve the documentation before coding.
+完整阅读 HANDOFF.md 和 docs/quant_trading_7_layer_target_architecture.md。
+将已经实现的第一里程碑视为经过验证的基线，修改前先运行其验收命令。
+只实现 HANDOFF.md 中下一项被明确选定的里程碑；不得跳过依赖边界或启动无关服务。
+报告完成前，运行 cargo fmt --all --check、cargo check --workspace 和 cargo test --workspace。
+架构存在歧义时，先指出冲突并解决文档问题，再修改代码。
 ```

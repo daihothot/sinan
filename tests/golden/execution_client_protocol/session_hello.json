@@ -1,0 +1,26 @@
+{
+  "message_id": "msg_hello_20260526_000001",
+  "type": "session.hello",
+  "schema_version": "ecp.v1.0",
+  "correlation_id": "corr_boot_20260526_000001",
+  "sequence": 1,
+  "payload": {
+    "client_id": "mt5_client_001",
+    "platform": "MT5",
+    "terminal_id": "mt5_terminal_001",
+    "account_id": "acct_mt5_001",
+    "token": "test_client_token",
+    "capabilities": [
+      "MARKET_ORDER",
+      "CANCEL_ORDER",
+      "RECONCILIATION_REQUEST"
+    ],
+    "resume": {
+      "previous_session_id": "sess_previous",
+      "last_gateway_message_id": "msg_cmd_previous",
+      "last_gateway_sequence": 41,
+      "pending_command_ids": []
+    }
+  }
+}
+
