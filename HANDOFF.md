@@ -18,10 +18,11 @@ docs/quant_trading_7_layer_target_architecture.md
 
 ## 当前状态
 
-- 架构和实现规格已经完成记录，并与基础代码保持同步。
-- 第一里程碑的 Rust 工作区已经实现。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
-- `sinan-types`、`sinan-protocol`、三个协议黄金样例，以及带校验和验证的 SQLite migration 基础设施均已实现并通过测试。
-- 其余 crate 暂时仅作为后续里程碑所需的可编译占位。
+- 架构和实现规格已经完成记录，并与当前代码保持同步。
+- 第一、第二里程碑的 Rust 工作区已经实现。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
+- `sinan-types`、`sinan-protocol`、三个协议黄金样例、SQLite migration、repository 和 state-ingest projection 均已实现并通过测试。
+- `sinan-store` 已有 22 张业务表的 V0002 schema、canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 ingest projection rebuild。
+- Risk、Execution、Reconciliation、Gateway、HTTP 等其余 crate 暂时仍是后续里程碑所需的可编译占位。
 - 现有 MQL5 EA 仍位于 MetaTrader 工作区，不属于此 Rust 仓库。
 - 当前工作区基线已通过 `cargo fmt --all --check`、`cargo check --workspace` 和 `cargo test --workspace`。
 
@@ -142,6 +143,63 @@ cargo test --workspace
 - 拒绝超大 frame。
 - 拒绝 migration 校验和不匹配。
 
+## 第二里程碑（已完成）
+
+第二里程碑实现 SQLite repository 和 state-ingest projection，不提前实现 Risk、Execution 或 Gateway 状态机：
+
+1. 新增 `V0002__state_store_schema.sql`：
+   - 创建第 23.2 节规定的 22 张业务表；
+   - 所有 status / action / mode / platform / message type 使用 `CHECK`；
+   - 所有 `payload_json` 配套 canonical JSON SHA-256 `payload_hash`；
+   - `execution_plans` / `execution_commands` 持久化 `risk_id`；
+   - `execution_events.execution_id` 为主键，`command_id` 必填且不引用 projection；
+   - 启用复合外键、查询索引和不可变事实 trigger；
+   - `event_stream_log` entry 禁止更新，但允许 bounded retention 删除。
+2. 实现 `SqliteStateStore` / `StoreOptions`：
+   - 统一启用 WAL、foreign keys 和 busy timeout；
+   - 自动执行 forward-only migration；
+   - 不公开绕过连接配置与 migration 校验的 unchecked pool 构造路径；
+   - 写事务使用 `BEGIN IMMEDIATE`，避免 read-then-write 的 `SQLITE_BUSY_SNAPSHOT`。
+3. 实现 `CanonicalJson` 和小写 SHA-256 hash，递归稳定排序 object key；该格式只用于存储和幂等检测，不用于 command HMAC。
+4. 实现 typed repository：
+   - core event、TradeIntent、ExecutionCommand、ExecutionEvent；
+   - wire inbox / outbox、session record；
+   - `ExecutionCommandState` insert / read / compare-and-swap 持久化原语；
+   - command-state CAS 同时匹配预期 status 和 `updated_at`；目标 `updated_at` 必须严格递增，已成功写入的完全相同请求可幂等重试；
+   - 初始 command-state 重放遇到同 immutable identity 的更高版本 projection 时保留现值并返回 `Duplicate`；同版本内容漂移或通过 insert 提交更高版本仍返回 conflict；
+   - 同主键和幂等键、同 payload 返回 `Duplicate`，任一唯一键复用不同 payload 返回稳定 conflict；
+   - typed read 校验 canonical hash 和 JSON / denormalized column 一致性。
+5. 实现 handler-specific 原子 ingest：
+   - account / position / order snapshot；
+   - symbol metadata；
+   - market bar；
+   - latest-only market snapshot；
+   - 重复 core fact 仍基于数据库中的原始事实幂等执行 projection apply，可修复缺失 projection，最终返回 `Duplicate`。
+6. latest projection 只允许更大的 `observed_at` 覆盖；更旧事实只追加；相同业务键和时间、不同 payload 返回 `ObservationConflict`。
+7. `AuthorizedAccountScope` 必须显式传入；空 scope 返回空集合。多表状态通过同一 SQLite read transaction 读取并稳定排序，market row 通过 `AccountMarketSnapshot` 保留账户归属。
+8. `rebuild_ingest_projections` 在单一 write transaction 中重放 account / symbol / position / order / market bar；失败整体回滚，不修改 tick-only `market_snapshots`。
+
+第二里程碑明确不包含：
+
+- `RiskResult` / execution plan / leg 的 typed commit bundle；相关 schema 已就绪，类型和原子 workflow 由 Risk / Execution 里程碑补齐。
+- `ExecutionCommandState`、leg 和 plan 的业务状态转换及 lifecycle rebuild；store 只提供 CAS 持久化原语。
+- position tombstone 或账户级 full-set replacement；当前只保留每个 `position_id` 的最新已知 observation，删除语义由 Reconciliation 里程碑实现。
+- session replacement / heartbeat registry、wire 状态迁移、delivery attempt 状态机。
+- HTTP、WebSocket、TCP listener 或任何外部服务。
+
+## 第二里程碑验收标准
+
+当前工作区已通过：
+
+```text
+cargo fmt --all --check
+cargo check --workspace
+cargo test --workspace
+git diff --check
+```
+
+当前共 85 项测试，其中 `sinan-store` 43 项，覆盖 migration 升级和校验、22 表 schema、FK / CHECK / trigger、生产连接初始化、canonical JSON、双键幂等、多连接并发 CAS、command-state 创建重放、重复事实补投影、事务回滚、授权查询、latest 冲突、冗余列损坏检测以及原子 rebuild 回滚。
+
 ## 实现约束
 
 - 业务时间戳使用服务器时间域的 Unix 毫秒值。
@@ -163,8 +221,8 @@ cargo test --workspace
 
 基础能力稳定后，按以下顺序推进：
 
-1. SQLite repository 和 projection。
-2. Risk 与 circuit breaker 领域逻辑。
+1. SQLite repository 和 projection。（已完成）
+2. Risk 与 circuit breaker 领域逻辑。（下一里程碑）
 3. Execution command 和状态机。
 4. 对账。
 5. Gateway session registry 和出站投递端口。
@@ -180,7 +238,7 @@ Risk 里程碑必须实现第 3.6、7.12-7.13 和 15 节规定的确定性 posit
 
 ```text
 完整阅读 HANDOFF.md 和 docs/quant_trading_7_layer_target_architecture.md。
-将已经实现的第一里程碑视为经过验证的基线，修改前先运行其验收命令。
+将已经实现的第一、第二里程碑视为经过验证的基线，修改前先运行其验收命令。
 只实现 HANDOFF.md 中下一项被明确选定的里程碑；不得跳过依赖边界或启动无关服务。
 报告完成前，运行 cargo fmt --all --check、cargo check --workspace 和 cargo test --workspace。
 架构存在歧义时，先指出冲突并解决文档问题，再修改代码。

@@ -1,6 +1,19 @@
 #![forbid(unsafe_code)]
 
-//! Forward-only SQLite schema migrations.
+//! SQLite migrations, repositories, and latest-state projections.
+
+mod connection;
+mod error;
+mod json;
+mod model;
+mod projection;
+mod repository;
+
+pub use connection::*;
+pub use error::*;
+pub use json::*;
+pub use model::*;
+pub use projection::*;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,11 +23,14 @@ use thiserror::Error;
 
 const SCHEMA_MIGRATIONS_TABLE: &str = "schema_migrations";
 
-const EMBEDDED_MIGRATIONS: &[Migration] = &[Migration::new(
-    1,
-    "init",
-    include_str!("../migrations/V0001__init.sql"),
-)];
+const EMBEDDED_MIGRATIONS: &[Migration] = &[
+    Migration::new(1, "init", include_str!("../migrations/V0001__init.sql")),
+    Migration::new(
+        2,
+        "state_store_schema",
+        include_str!("../migrations/V0002__state_store_schema.sql"),
+    ),
+];
 
 /// One immutable, forward-only database migration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

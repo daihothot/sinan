@@ -743,7 +743,10 @@ version = "0.1.0"
 name = "sinan-store"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "sha2",
+ "sinan-types",
  "sqlx",
  "thiserror",
  "tokio",

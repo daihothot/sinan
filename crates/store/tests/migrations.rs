@@ -2,6 +2,14 @@ use sinan_store::{migrate, Migration, MigrationError, Migrator};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 
 const INIT_SQL: &str = include_str!("../migrations/V0001__init.sql");
+const STATE_STORE_SQL: &str = include_str!("../migrations/V0002__state_store_schema.sql");
+
+fn embedded_migrations() -> [Migration; 2] {
+    [
+        Migration::new(1, "init", INIT_SQL),
+        Migration::new(2, "state_store_schema", STATE_STORE_SQL),
+    ]
+}
 
 async fn memory_pool() -> SqlitePool {
     SqlitePoolOptions::new()
@@ -12,26 +20,35 @@ async fn memory_pool() -> SqlitePool {
 }
 
 #[tokio::test]
-async fn first_run_applies_initial_migration() {
+async fn first_run_applies_all_embedded_migrations() {
     let pool = memory_pool().await;
 
     migrate(&pool).await.expect("migration should succeed");
 
-    let row: (i64, String, String, i64) =
-        sqlx::query_as("SELECT version, name, checksum, applied_at FROM schema_migrations")
-            .fetch_one(&pool)
-            .await
-            .expect("migration record should exist");
+    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("migration records should exist");
     let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(&pool)
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(row.0, 1);
-    assert_eq!(row.1, "init");
-    assert_eq!(row.2, Migration::new(1, "init", INIT_SQL).checksum());
-    assert!(row.3 > 0);
-    assert_eq!(user_version, 1);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[0].1, "init");
+    assert_eq!(rows[0].2, Migration::new(1, "init", INIT_SQL).checksum());
+    assert!(rows[0].3 > 0);
+    assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[1].1, "state_store_schema");
+    assert_eq!(
+        rows[1].2,
+        Migration::new(2, "state_store_schema", STATE_STORE_SQL).checksum()
+    );
+    assert!(rows[1].3 > 0);
+    assert_eq!(user_version, 2);
 }
 
 #[tokio::test]
@@ -46,7 +63,32 @@ async fn repeated_run_is_idempotent() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn version_one_database_upgrades_to_state_store_schema() {
+    let pool = memory_pool().await;
+    Migrator::new([Migration::new(1, "init", INIT_SQL)])
+        .expect("version one migration should be valid")
+        .run(&pool)
+        .await
+        .expect("version one should apply");
+
+    migrate(&pool).await.expect("version two should apply");
+
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("migration versions should be readable");
+    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+        .expect("user_version should be readable");
+
+    assert_eq!(versions, vec![1, 2]);
+    assert_eq!(user_version, 2);
 }
 
 #[tokio::test]
@@ -77,11 +119,10 @@ async fn changed_migration_contents_are_rejected() {
     migrate(&pool)
         .await
         .expect("initial migration should succeed");
-    let changed = Migrator::new([Migration::new(
-        1,
-        "init",
-        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);",
-    )])
+    let changed = Migrator::new([
+        Migration::new(1, "init", INIT_SQL),
+        Migration::new(2, "state_store_schema", "SELECT 2;"),
+    ])
     .expect("migration list should be valid");
 
     let error = changed
@@ -92,8 +133,8 @@ async fn changed_migration_contents_are_rejected() {
     assert!(matches!(
         error,
         MigrationError::ChecksumMismatch {
-            version: 1,
-            name: "init"
+            version: 2,
+            name: "state_store_schema"
         }
     ));
 }
@@ -104,8 +145,11 @@ async fn changed_migration_name_is_rejected() {
     migrate(&pool)
         .await
         .expect("initial migration should succeed");
-    let renamed = Migrator::new([Migration::new(1, "renamed", INIT_SQL)])
-        .expect("migration list should be valid");
+    let renamed = Migrator::new([
+        Migration::new(1, "init", INIT_SQL),
+        Migration::new(2, "renamed", STATE_STORE_SQL),
+    ])
+    .expect("migration list should be valid");
 
     let error = renamed
         .run(&pool)
@@ -115,10 +159,10 @@ async fn changed_migration_name_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::NameMismatch {
-            version: 1,
+            version: 2,
             expected: "renamed",
             actual
-        } if actual == "init"
+        } if actual == "state_store_schema"
     ));
 }
 
@@ -128,10 +172,10 @@ async fn gaps_in_applied_versions_are_rejected() {
     migrate(&pool)
         .await
         .expect("initial migration should succeed");
-    sqlx::query("UPDATE schema_migrations SET version = 2 WHERE version = 1")
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 1")
         .execute(&pool)
         .await
-        .expect("test fixture should update the stored version");
+        .expect("test fixture should remove the first stored version");
 
     let error = migrate(&pool)
         .await
@@ -154,7 +198,7 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
         .expect("initial migration should succeed");
     sqlx::query(
         "INSERT INTO schema_migrations (version, name, checksum, applied_at) \
-         VALUES (2, 'unknown', 'unknown', 1)",
+         VALUES (3, 'unknown', 'unknown', 1)",
     )
     .execute(&pool)
     .await
@@ -167,8 +211,8 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
     assert!(matches!(
         error,
         MigrationError::DatabaseAhead {
-            applied: 2,
-            available: 1
+            applied: 3,
+            available: 2
         }
     ));
 }
@@ -191,7 +235,7 @@ async fn lower_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 1,
+            expected: 2,
             actual: 0
         }
     ));
@@ -203,7 +247,7 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     migrate(&pool)
         .await
         .expect("initial migration should succeed");
-    sqlx::query("PRAGMA user_version = 2")
+    sqlx::query("PRAGMA user_version = 3")
         .execute(&pool)
         .await
         .expect("test fixture should raise user_version");
@@ -215,8 +259,8 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 1,
-            actual: 2
+            expected: 2,
+            actual: 3
         }
     ));
 }
@@ -228,9 +272,10 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         .await
         .expect("initial migration should succeed");
     let migrator = Migrator::new([
-        Migration::new(1, "init", INIT_SQL),
+        embedded_migrations()[0],
+        embedded_migrations()[1],
         Migration::new(
-            2,
+            3,
             "broken",
             "CREATE TABLE rollback_probe (id INTEGER PRIMARY KEY);\
              INSERT INTO missing_table DEFAULT VALUES;",
@@ -262,8 +307,8 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         .expect("user_version should be readable");
 
     assert!(!probe_exists);
-    assert_eq!(migration_count, 1);
-    assert_eq!(user_version, 1);
+    assert_eq!(migration_count, 2);
+    assert_eq!(user_version, 2);
 }
 
 #[test]

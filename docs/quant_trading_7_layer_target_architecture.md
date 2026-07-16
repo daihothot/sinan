@@ -5308,8 +5308,9 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 所有写入必须包在 transaction 中。
 所有 server time 字段使用 INTEGER Unix milliseconds UTC。
-payload_json 存 canonical JSON text。
-payload_hash 存 SHA-256 hex，用于审计和重复检测。
+所有名为 payload_json 的列都存 canonical JSON text。
+每个 payload_json 都必须配套 payload_hash；payload_hash 存 canonical JSON UTF-8 bytes 的小写 SHA-256 hex，用于审计和重复检测。
+State Store 只能通过统一配置并执行 migration 校验的连接构造路径对外创建，不得公开绕过 WAL、foreign_keys、busy_timeout 或 migration 的 unchecked pool 构造器。
 ```
 
 #### SQLite Migration Strategy
@@ -5328,15 +5329,38 @@ CREATE TABLE schema_migrations (
 规则：
 
 ```text
-migration 文件命名：V0001__init.sql、V0002__add_command_delivery_attempts.sql
+migration 文件命名：V0001__init.sql、V0002__state_store_schema.sql
 version 必须单调递增，不允许跳号复用。
 checksum 使用 migration 文件内容 SHA-256 hex。
 启动时必须校验已应用 migration 的 checksum；不一致则拒绝启动。
 生产环境不做自动破坏性 DDL；需要 backfill / rebuild projection 时必须显式 maintenance mode。
 append-only facts 表不得通过 migration 删除历史列；废弃字段只能停止写入。
-projection 表可以 drop/rebuild，但必须能从 core_events / execution_events 重建。
+durable projection 表可以 drop/rebuild，但必须能从 core_events / execution_events 重建。
+仅由可选 sampled market.tick 驱动的 market_snapshots 不属于 durable rebuild 保证；不得用缺少 bid / ask / spread 的 market.bar 伪造 MarketSnapshot。
+projection rebuild 必须在单一 transaction 内完成；任何解析、业务键校验或写入失败都必须整体回滚，并保留 rebuild 前的 projection。
 SQLite PRAGMA user_version 可以同步写入当前最高 migration version，schema_migrations 是权威记录。
 ```
+
+`core_events`、`deadletter_events`、`system_events`、`risk_results`、`execution_commands` 和 `execution_events` 是不可变事实；migration 必须通过 trigger 阻止 `UPDATE` / `DELETE`。`market_bars` 是由 `market.bar` core fact 重建的查询 projection，不属于不可变事实表。状态变化只能追加新事实，或写入明确的 projection / lifecycle table。
+
+`event_stream_log` 是 bounded summary replay log，不是执行事实来源。单条 entry 插入后禁止 `UPDATE`，但允许 Event Stream Manager 按 retention policy 批量 `DELETE`；删除时 `outbound_spool.event_id` 按外键规则置空。durable execution facts 的保留不受 event cursor window 影响。
+
+Projection rebuild 分为两个有明确 owner 的阶段：
+
+```text
+state-ingest rebuild（State Store owner）
+  → 从 core_events 重放 account / symbol / position / order / market.bar
+  → 重建 latest-state tables 与 market_bars
+  → 不重建 tick-only market_snapshots
+
+execution lifecycle rebuild（Execution owner）
+  → 保留 execution_commands、plan definition 和 leg definition
+  → 重置 command / leg / plan 的 materialized status
+  → 按确定性顺序重放 command.received 与 execution_events
+  → 状态转换规则由 Execution 里程碑实现，不得在 store 中复制一套状态机
+```
+
+`execution_plans` / `execution_legs` 的 definition 和 payload 属于 workflow journal，不通过删除 definition row 来重建；可重建的是其中的 materialized status 以及 `execution_command_states`。definition 缺失或损坏时必须 fail closed，不能从不完整的 execution event 猜测计划结构。
 
 #### SQLite Status Enum Registry
 
@@ -5543,6 +5567,7 @@ CREATE TABLE trade_intents (
   signal_expires_at INTEGER NOT NULL,
   idempotency_key TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -5560,11 +5585,13 @@ CREATE TABLE risk_results (
   symbol_metadata_age_ms INTEGER NOT NULL,
   evaluated_at INTEGER NOT NULL,
   valid_until INTEGER NOT NULL,
-  payload_json TEXT NOT NULL
+  payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL
 );
 
 CREATE TABLE execution_plans (
   plan_id TEXT PRIMARY KEY,
+  risk_id TEXT NOT NULL,
   intent_id TEXT NOT NULL,
   account_id TEXT NOT NULL,
   strategy_id TEXT NOT NULL,
@@ -5572,6 +5599,7 @@ CREATE TABLE execution_plans (
   mode TEXT NOT NULL,
   failure_policy TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -5583,11 +5611,13 @@ CREATE TABLE execution_legs (
   action TEXT NOT NULL,
   status TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE execution_commands (
   command_id TEXT PRIMARY KEY,
+  risk_id TEXT NOT NULL,
   plan_id TEXT,
   leg_id TEXT,
   account_id TEXT NOT NULL,
@@ -5598,6 +5628,7 @@ CREATE TABLE execution_commands (
   expires_at INTEGER NOT NULL,
   idempotency_key TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   hmac TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
@@ -5636,8 +5667,8 @@ CREATE TABLE execution_command_states (
 );
 
 CREATE TABLE execution_events (
-  execution_event_id TEXT PRIMARY KEY,
-  command_id TEXT,
+  execution_id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL,
   plan_id TEXT,
   leg_id TEXT,
   account_id TEXT NOT NULL,
@@ -5647,11 +5678,53 @@ CREATE TABLE execution_events (
   event_at INTEGER NOT NULL,
   filled_at INTEGER,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
 ```
 
+`execution_command_states` 的 compare-and-swap 必须同时匹配 immutable identity、预期 `status` 和预期 `updated_at`。目标 `updated_at` 必须严格大于预期值，防止 status 不变的并发 delivery update 同时成功；已经成功写入的完全相同目标状态允许幂等重试。
+
+初始 command-state insert 重放时，如果数据库已有相同 immutable identity 且 `updated_at` 更高的 projection，必须保留现值并返回 `Duplicate`，不得用初始状态覆盖；相同版本但内容不同，或试图通过 insert 而非 CAS 提交更高版本，必须返回 conflict。
+
 `risk_results.payload_json` 必须保留完整 `RiskResult`，包括 `sizing_version`、risk base / budget、sizing candidate provenance 和最终 `adjusted_legs`。对风险增加 intent，RiskResult 必须先于 execution plan / command 持久化，并与 intent / plan / command creation 使用同一 transaction boundary，保证每个 command lots 都能追溯到唯一风控审批。
+
+#### SQLite Foreign-key Registry
+
+V0002 启用以下持久化引用；复合键同时约束账户归属，nullable 引用只在值存在时生效：
+
+```text
+risk_results(intent_id, account_id)
+  → trade_intents(intent_id, account_id)
+
+execution_plans(risk_id, intent_id, account_id)
+  → risk_results(risk_id, intent_id, account_id)
+
+execution_legs(plan_id)
+  → execution_plans(plan_id)
+
+execution_commands(risk_id, account_id)
+  → risk_results(risk_id, account_id)
+execution_commands(plan_id, risk_id, account_id)
+  → execution_plans(plan_id, risk_id, account_id)
+execution_commands(plan_id, leg_id)
+  → execution_legs(plan_id, leg_id)
+
+execution_command_states(command_id, account_id)
+  → execution_commands(command_id, account_id)
+execution_command_states.plan / leg
+  → execution_plans / execution_legs
+
+wire_inbox.session_id → execution_client_sessions.session_id
+wire_outbox.session_id → execution_client_sessions.session_id
+wire_outbox.command_id → execution_commands.command_id
+command_delivery_attempts.command / session / message
+  → execution_commands / execution_client_sessions / wire_outbox
+
+outbound_spool.event_id → event_stream_log.event_id ON DELETE SET NULL
+```
+
+`core_events` 和 `execution_events` 故意不引用 projection：事实必须能在 projection 缺失或损坏时先落盘并参与恢复。Risk / plan / command workflow records 则必须按上述顺序在同一 write transaction 中创建，不能依赖关闭 `PRAGMA foreign_keys` 绕过约束。
 
 #### Latest-state Projection Tables
 
@@ -5662,6 +5735,7 @@ CREATE TABLE market_bars (
   timeframe TEXT NOT NULL,
   timestamp INTEGER NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   received_at INTEGER NOT NULL,
   PRIMARY KEY(account_id, symbol, timeframe, timestamp)
 );
@@ -5670,6 +5744,7 @@ CREATE TABLE market_snapshots (
   account_id TEXT NOT NULL,
   symbol TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   observed_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(account_id, symbol)
@@ -5680,6 +5755,7 @@ CREATE TABLE symbol_metadata_latest (
   broker_symbol TEXT NOT NULL,
   symbol TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   observed_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(account_id, broker_symbol)
@@ -5688,6 +5764,7 @@ CREATE TABLE symbol_metadata_latest (
 CREATE TABLE account_snapshots_latest (
   account_id TEXT PRIMARY KEY,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   observed_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -5697,6 +5774,7 @@ CREATE TABLE position_snapshots_latest (
   position_id TEXT NOT NULL,
   symbol TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   observed_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(account_id, position_id)
@@ -5706,6 +5784,7 @@ CREATE TABLE order_snapshots_latest (
   account_id TEXT NOT NULL,
   broker_order_id TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   observed_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(account_id, broker_order_id)
@@ -5721,6 +5800,7 @@ CREATE TABLE event_stream_log (
   account_id TEXT,
   event_type TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
 
@@ -5732,6 +5812,7 @@ CREATE TABLE outbound_spool (
   target TEXT NOT NULL,
   event_id TEXT,
   payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
   status TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
   next_retry_at INTEGER,
@@ -5747,7 +5828,7 @@ CREATE TABLE outbound_spool (
 | `session.hello` | `system_events` on accepted/rejected | `execution_client_sessions` |
 | `heartbeat` | `system_events` only on status change/anomaly | update `execution_client_sessions` |
 | `market.tick` | optional sampled `core_events` | upsert `market_snapshots` |
-| `market.bar` | `core_events` | upsert `market_bars`, update `market_snapshots` |
+| `market.bar` | `core_events` | insert `market_bars`; 不更新缺少 tick 字段的 `market_snapshots` |
 | `symbol.metadata` | `core_events` | upsert `symbol_metadata_latest` |
 | `account.snapshot` | `core_events` | upsert `account_snapshots_latest` |
 | `position.snapshot` | `core_events` | upsert `position_snapshots_latest` |
@@ -5758,6 +5839,23 @@ CREATE TABLE outbound_spool (
 | `reconciliation.request` | `core_events` | insert `wire_outbox`, mark commands RECONCILING |
 | `reconciliation.result` | `core_events` | update latest snapshots and reconciliation state |
 | invalid schema/type | `deadletter_events` | no business projection |
+
+Latest-state projection 的统一写入规则：
+
+```text
+fact append 与对应 projection write 必须位于同一 transaction。
+重复 fact 的 ingest 必须使用已存事实的 metadata / payload 幂等执行 projection apply；即使 projection 缺失也要能够自愈，最终仍返回 Duplicate。
+只有更大的 observed_at 才能覆盖 latest row；更旧的事实只追加，不回退 projection。
+同一业务键、相同 observed_at、相同 payload_hash 视为幂等重复。
+同一业务键、相同 observed_at、不同 payload_hash 必须返回 ObservationConflict，不允许以到达顺序静默覆盖。
+payload_json 中存在的 account_id / symbol / position_id / broker_order_id / broker_symbol 必须与 projection 列业务键一致；不一致视为持久化损坏。MarketBar / MarketSnapshot payload 没有 account_id，其账户身份必须来自已认证 envelope，并与 core_events.account_id / projection account_id 一致。
+所有列表查询必须使用确定性排序。
+授权账户集合必须显式传入；空集合返回空结果，绝不解释为“所有账户”。
+聚合多张 projection 的状态查询必须在同一 SQLite read transaction / snapshot 中完成。
+state-ingest replay 顺序固定为 received_at、created_at、event_id 升序，不依赖 SQLite rowid。
+```
+
+第一版 `PositionSnapshot` 是单仓位 observation，没有 tombstone 或账户级 generation。缺失某个 position 不表示删除；在 reconciliation 里程碑落地完整账户仓位集替换事实前，projection 和 rebuild 都只保留每个 `position_id` 的最新已知 observation，不得凭“本批未出现”删除仓位。需要当前开放仓位集合的流程必须等待新鲜 reconciliation full snapshot，否则 fail closed。
 
 ### 23.3 Rust Crate Boundary
 

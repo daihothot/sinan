@@ -1,5 +1,12 @@
 {
     "cSpell.words": [
-        "sinan"
+        "acked",
+        "Backtest",
+        "fanout",
+        "hmac",
+        "Ibkr",
+        "serde",
+        "sinan",
+        "thiserror"
     ]
 }
