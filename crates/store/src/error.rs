@@ -19,6 +19,13 @@ pub enum StoreError {
     #[error("stale {entity} write for {key}")]
     StaleWrite { entity: &'static str, key: String },
 
+    #[error("invalid {entity} record {key}: {reason}")]
+    InvalidRecord {
+        entity: &'static str,
+        key: String,
+        reason: String,
+    },
+
     #[error("{entity} record {key} is corrupt: {reason}")]
     CorruptData {
         entity: &'static str,

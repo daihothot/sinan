@@ -1,8 +1,8 @@
 use sinan_types::{
     AccountId, CausationId, ClientId, ClockSyncStatus, CommandId, CorrelationId, ExecutionCommand,
     ExecutionCommandState, ExecutionCommandStatus, ExecutionEvent, IdempotencyKey, IntentId, LegId,
-    MessageId, PlanId, RiskId, SessionId, SessionStatus, StrategyId, TerminalId, TradeIntent,
-    TradeIntentStatus, WireInboxStatus, WireOutboxStatus,
+    MessageId, PlanId, RiskId, RiskResult, SessionId, SessionStatus, StrategyId, TerminalId,
+    TradeIntent, TradeIntentStatus, WireInboxStatus, WireOutboxStatus,
 };
 
 use crate::json::CanonicalJson;
@@ -82,6 +82,17 @@ pub struct StoredTradeIntent {
     pub payload: CanonicalJson,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewRiskResult {
+    pub result: RiskResult,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredRiskResult {
+    pub result: RiskResult,
+    pub payload: CanonicalJson,
 }
 
 #[derive(Clone, Debug, PartialEq)]

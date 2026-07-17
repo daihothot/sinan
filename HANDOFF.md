@@ -19,12 +19,13 @@ docs/quant_trading_7_layer_target_architecture.md
 ## 当前状态
 
 - 架构和实现规格已经完成记录，并与当前代码保持同步。
-- 第一、第二里程碑的 Rust 工作区已经实现。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
+- 第一、第二、第三里程碑的 Rust 工作区已经实现。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
 - `sinan-types`、`sinan-protocol`、三个协议黄金样例、SQLite migration、repository 和 state-ingest projection 均已实现并通过测试。
 - `sinan-store` 已有 22 张业务表的 V0002 schema、canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 ingest projection rebuild。
-- Risk、Execution、Reconciliation、Gateway、HTTP 等其余 crate 暂时仍是后续里程碑所需的可编译占位。
+- `sinan-risk` 已实现不可变 `RiskRequest` / policy / capacity / full-set watermark 领域模型、确定性 Decimal position sizing evaluator 和纯 circuit breaker 状态机。
+- `sinan-types` 已增加带语义校验的共享 `RiskResult` / `AdjustedRiskLeg` DTO，`sinan-store` 已增加不可变 `risk_results` typed insert/get、幂等和损坏检测；Execution、Reconciliation、Gateway、HTTP 等仍是后续里程碑范围。
 - 现有 MQL5 EA 仍位于 MetaTrader 工作区，不属于此 Rust 仓库。
-- 当前工作区基线已通过 `cargo fmt --all --check`、`cargo check --workspace` 和 `cargo test --workspace`。
+- 当前工作区已通过 `cargo fmt --all --check`、`cargo check --workspace`、`cargo test --workspace` 和 `git diff --check`。
 
 ## 不可妥协的架构决策
 
@@ -46,6 +47,9 @@ docs/quant_trading_7_layer_target_architecture.md
 16. `sinan-risk` 在本地以确定性方式拥有最终批准 lots。Compute 的 position sizing 只提供建议；实时硬风控不得依赖 Compute/HTTP，Execution 必须精确映射已批准 lots，不得重新计算。
 17. `GET /state` 返回 `accounts: AccountSnapshot[]`；所有账户相关 projection 必须使用同一授权范围，并通过 `account_id` 关联。
 18. `TradeIntent.action` 持久化为 `trade_intents.action`，不得改名为 `direction`。
+19. `RiskRequest` 由 Trading Core 内可信本地 assembler 从同一一致性读快照组装后作为不可变完整输入交给 `sinan-risk`；Risk evaluator 不得自行补读 store 或调用网络服务。
+20. position / order 必须携带账户级 full-set 水位，即使集合为空也不能省略；market 必须显式携带 `account_id`，所有风控输入必须与 intent 账户一致。
+21. sizing 的 tick ceil、volume-step floor、预算、敞口和保证金比较必须在 Decimal 域完成；第一版不允许多空、相关性或对冲抵消 hard-risk budget。
 
 ## Rust 工作区目标
 
@@ -200,6 +204,62 @@ git diff --check
 
 当前共 85 项测试，其中 `sinan-store` 43 项，覆盖 migration 升级和校验、22 表 schema、FK / CHECK / trigger、生产连接初始化、canonical JSON、双键幂等、多连接并发 CAS、command-state 创建重放、重复事实补投影、事务回滚、授权查询、latest 冲突、冗余列损坏检测以及原子 rebuild 回滚。
 
+## 第三里程碑（已完成）
+
+第三里程碑只实现 Risk 与 circuit breaker 的纯领域逻辑和 `RiskResult` 持久化原语，不进入 Execution plan / command 状态机、Gateway 或 HTTP：
+
+1. 已定义完整不可变 `RiskRequest`：
+   - 固定 `risk_id` 和服务器时间域 `evaluated_at`；
+   - position / order 使用账户级 full-set watermarks，空集合也必须有新鲜证据，每一行必须属于声明的 full-set 水位；
+   - `pending_commands_reconciled_at` 约束 account / position / order / command-state 的因果水位；
+   - market snapshot 显式携带 `account_id`；
+   - `RiskCapacity` 绑定 `account_id / strategy_id`，并提供日内亏损、回撤、剩余账户 / 组合风险容量和 `remaining_strategy_legs`。
+2. 已定义 `RiskResult` / `AdjustedRiskLeg` 共享 DTO，并为 `risk_results` 增加 typed insert/get：
+   - payload 自包含 request / intent identity、`risk_request_hash`、candidate provenance、market / metadata / capacity age 和最终 lots；
+   - `RiskResult::validate` 拒绝 approved / rejected / no-op 的非法字段组合、非 finite 数值、非法时间、重复或错配 leg 以及风险算术漂移；
+   - 完整 payload 使用 canonical JSON/hash 持久化；
+   - typed read 校验 hash、冗余列以及父 intent 的 account / decision / action / signal 时间契约，并重建父 canonical payload；
+   - actionable approval 完整绑定父 intent 的腿 shape：单腿使用共享的 `leg:{intent_id}:0`，并精确匹配 symbol / action / ratio=1 / proposed_sl；多腿按 `leg_id` 一一匹配 symbol / action / ratio / proposed_sl，ratio 和 SL 按原始 `f64` 位模式比较；
+   - 相同 `risk_id` 和完整 identity/payload 可幂等重放，漂移返回 conflict；
+   - 同一 intent 允许通过不同 `risk_id` 追加多次评估。
+3. 已加入 pure circuit breaker 状态机：
+   - `CLOSED / OPEN / HALF_OPEN`、文档规定的触发源和 action gate；
+   - OPEN / HALF_OPEN 阻断风险增加动作，但继续允许状态读取、snapshot / execution event ingest、对账、人工审查、no-op 和已证明的风险降低动作；
+   - OPEN 只能先进入 HALF_OPEN；refresh / reconciliation 恢复证据必须携带完成时间且 `>= triggered_at`；
+   - OPEN 期间完全相同的 violation observation 保持幂等；健康 observation 只产生 `IncidentEvidenceCleared` 并保持 OPEN，清除旧 fingerprint，之后相同 violation 复发也会推进 `triggered_at` 和 recovery epoch，使旧恢复证据失效；
+   - 进入 HALF_OPEN 时记录日内亏损和回撤 baseline；原 incident 的财务阈值可暂时仍被触发，但观察期内任一财务值高于 baseline 都会重新 OPEN，即使新值低于 policy threshold；
+   - safety fallback fingerprint 保留具体 `CircuitBreakerError`，相同错误幂等，不同错误开启新 recovery epoch；
+   - 非法 policy、输入或服务器时间回退 fail closed；manual reset 产出完整 audit record。
+4. 已实现 pure deterministic evaluator：
+   - 当前唯一支持 `fixed-risk-at-stop.v1`，未知 sizing version fail closed，不允许标签与实际算法漂移；
+   - 所有 sizing 输入先以 base-10 文本转换到 Decimal，tick ceil、volume-step floor、预算、敞口和保证金比较全程使用 Decimal；
+   - HOLD 返回 approved no-op，所有 sizing 字段为空且不得创建 plan / command；
+   - 当前 CLOSE 缺少目标 position 和 close lots，必须返回 `RISK_REDUCTION_NOT_PROVABLE`；
+   - BUY / SELL 单腿 ratio 必须为 `1`，多腿按 `leg_id` 唯一匹配，不做多空、相关性或对冲抵消；
+   - 敞口按 `ceil(abs(conservative_price) / tick_size) * tick_value_loss` 的账户币种近似累加；
+   - 有效 pending order / command 保守分别累加，不依据方向或推测关联做抵消；
+   - active order / BUY-SELL command 的可选 `broker_symbol` 一旦存在，必须与 canonical symbol metadata 精确绑定；
+   - 第一版无法证明 pending MODIFY 只降低风险，任何 non-terminal MODIFY 都阻断新的风险增加 intent；
+   - `margin_initial > 0`，且同时满足 free-margin 和 `max_margin_usage_pct` 上限；
+   - Decimal lots 转为共享 `f64` DTO 后必须经 base-10 round-trip 复核，不得向上舍入或破坏 `volume_step`；
+   - `valid_until` 取 approval TTL、signal expiry、command reconciliation 和全部 snapshot / market / metadata freshness 边界的最小值；
+   - evaluator 返回 `Result<RiskResult, RiskEvaluationError>`：业务拒绝仍是可审计的 rejected `RiskResult`，只有无法构造合法审计身份或合法 fail-closed 结果时返回错误。
+
+第三里程碑的 trusted assembler 契约已经确定，但从 State Store 单一一致性读快照加载并组装 `RiskRequest` 的 application service 属于后续 Execution 集成范围，本里程碑不为 `sinan-risk` 增加 store 依赖。
+
+Pure circuit breaker 当前同样不依赖 Store，尚无 stable durable snapshot / restore adapter。下一里程碑必须先补充并验证完整 breaker state 的持久化恢复（含 recovery epoch / fingerprint、`incident_evidence_cleared_at`、HALF_OPEN 时间与财务 baseline、blocked count）；重启、缺失或损坏时必须 fail closed，禁止默认回到 `CLOSED`。如果该里程碑只实现纯 Execution domain，可以暂不接 Risk→Execution live flow；一旦接入，trusted assembler 和 intent / risk / plan / command 原子 transaction boundary 也必须同时落地。
+
+第三里程碑验收已经通过：
+
+```text
+cargo fmt --all --check
+cargo check --workspace
+cargo test --workspace
+git diff --check
+```
+
+当前共 175 项测试，其中 `sinan-risk` 69 项（28 项 circuit breaker、41 项 evaluator），覆盖单腿 / 多腿、cost buffer、volume-step floor、volume / exposure / margin 全局缩放、风险预算单调性、freshness、跨账户输入、pending command、HOLD / CLOSE、breaker gate 和 recovery epoch；`sinan-store` 共 56 项，其中 13 项 `risk_results` 集成测试；`sinan-types` 共 17 项，覆盖 RiskResult serde 与语义校验。
+
 ## 实现约束
 
 - 业务时间戳使用服务器时间域的 Unix 毫秒值。
@@ -222,8 +282,8 @@ git diff --check
 基础能力稳定后，按以下顺序推进：
 
 1. SQLite repository 和 projection。（已完成）
-2. Risk 与 circuit breaker 领域逻辑。（下一里程碑）
-3. Execution command 和状态机。
+2. Risk 与 circuit breaker 领域逻辑。（已完成）
+3. Circuit Breaker durable restore、Execution command 和状态机。（下一里程碑）
 4. 对账。
 5. Gateway session registry 和出站投递端口。
 6. Native TCP 和 Execution WebSocket 绑定。
@@ -232,14 +292,14 @@ git diff --check
 9. MQL5 和 OKX 适配器。
 10. Strategy & Decision Control Plane。
 
-Risk 里程碑必须实现第 3.6、7.12-7.13 和 15 节规定的确定性 position-sizing 契约。Execution 里程碑必须精确映射已批准 lots，并在任何参数漂移时重新执行风控。MQL5 adapter 里程碑必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。这些内容都不属于第一里程碑交付范围。
+Risk 里程碑已经实现第 3.6、7.12-7.13 和 15 节规定的确定性 position-sizing 契约。下一里程碑先实现 Circuit Breaker durable restore，再实现 Execution command / state machine；Execution 必须精确映射已批准 lots，并在任何参数漂移时重新执行风控。若尚未实现 trusted assembler 和原子 workflow commit，则不得接入 live Risk→Execution flow。MQL5 adapter 里程碑必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。
 
 ## 建议的开场提示
 
 ```text
 完整阅读 HANDOFF.md 和 docs/quant_trading_7_layer_target_architecture.md。
-将已经实现的第一、第二里程碑视为经过验证的基线，修改前先运行其验收命令。
-只实现 HANDOFF.md 中下一项被明确选定的里程碑；不得跳过依赖边界或启动无关服务。
+将已经实现的第一、第二、第三里程碑视为经过验证的基线；修改前先运行基线验收命令。
+只实现下一项被明确选择的 Circuit Breaker durable restore 与 Execution command / 状态机里程碑；不得跳过依赖边界或启动无关服务。
 报告完成前，运行 cargo fmt --all --check、cargo check --workspace 和 cargo test --workspace。
 架构存在歧义时，先指出冲突并解决文档问题，再修改代码。
 ```

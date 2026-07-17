@@ -1,11 +1,13 @@
 use crate::{
-    AccountId, BrokerDealId, BrokerOrderId, ClientId, CommandId, CorrelationId, DecisionId,
-    ErrorCodeOrString, ExecutionAction, ExecutionCommandStatus, ExecutionEventStatus, ExecutionId,
-    FillingPolicy, IdempotencyKey, IntentId, LegId, OrderSnapshotStatus, OrderType, PlanId,
-    PositionId, PositionSide, PositionTicket, StrategyId, SymbolCode, SymbolTradeMode, TerminalId,
-    TimePolicy, TimeframeCode, TradeIntentAction, TradeIntentLegAction,
+    AccountId, AdjustedRiskLegAction, BrokerDealId, BrokerOrderId, ClientId, CommandId,
+    CorrelationId, DecisionId, ErrorCodeOrString, ExecutionAction, ExecutionCommandStatus,
+    ExecutionEventStatus, ExecutionId, FillingPolicy, IdempotencyKey, IntentId, LegId,
+    OrderSnapshotStatus, OrderType, PlanId, PositionId, PositionSide, PositionTicket, RequestId,
+    RiskId, StrategyId, SymbolCode, SymbolTradeMode, TerminalId, TimePolicy, TimeframeCode,
+    TradeIntentAction, TradeIntentLegAction,
 };
 use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, error::Error, fmt};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MarketBar {
@@ -155,6 +157,468 @@ pub struct TradeIntent {
     pub proposed_legs: Option<Vec<TradeIntentLeg>>,
     pub signal_expires_at: i64,
     pub requested_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SizingCandidateProvenance {
+    pub leg_id: LegId,
+    pub symbol: SymbolCode,
+    pub action: AdjustedRiskLegAction,
+    pub ratio: f64,
+    pub worst_entry_price: f64,
+    pub stop_loss_price: f64,
+    pub estimated_cost_per_lot: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdjustedRiskLeg {
+    pub leg_id: LegId,
+    pub symbol: SymbolCode,
+    pub action: AdjustedRiskLegAction,
+    pub lots: f64,
+    pub risk_amount: f64,
+    pub risk_pct: f64,
+    pub sizing_entry_price: f64,
+    pub approved_sl: f64,
+    pub loss_per_lot: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ErrorCodeOrString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskResult {
+    pub risk_id: RiskId,
+    pub request_id: RequestId,
+    pub intent_id: IntentId,
+    pub account_id: AccountId,
+    pub risk_request_hash: String,
+    pub approved: bool,
+    pub reason: ErrorCodeOrString,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizing_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_base_amount: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_budget_amount: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjusted_risk_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizing_candidates: Option<Vec<SizingCandidateProvenance>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjusted_legs: Option<Vec<AdjustedRiskLeg>>,
+    pub decision_id: DecisionId,
+    pub snapshot_age_ms: i64,
+    pub market_snapshot_age_ms: i64,
+    pub symbol_metadata_age_ms: i64,
+    pub capacity_age_ms: i64,
+    pub evaluated_at: i64,
+    pub valid_until: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskResultValidationError {
+    field: &'static str,
+    reason: String,
+}
+
+impl RiskResultValidationError {
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    fn new(field: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            field,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for RiskResultValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} {}", self.field, self.reason)
+    }
+}
+
+impl Error for RiskResultValidationError {}
+
+impl RiskResult {
+    pub fn validate(&self) -> Result<(), RiskResultValidationError> {
+        validate_non_empty("risk_id", self.risk_id.as_str())?;
+        validate_non_empty("request_id", self.request_id.as_str())?;
+        validate_non_empty("intent_id", self.intent_id.as_str())?;
+        validate_non_empty("account_id", self.account_id.as_str())?;
+        validate_non_empty("decision_id", self.decision_id.as_str())?;
+        validate_sha256("risk_request_hash", &self.risk_request_hash)?;
+
+        if self.snapshot_age_ms < 0 {
+            return Err(RiskResultValidationError::new(
+                "snapshot_age_ms",
+                "must be non-negative",
+            ));
+        }
+        if self.symbol_metadata_age_ms < 0 {
+            return Err(RiskResultValidationError::new(
+                "symbol_metadata_age_ms",
+                "must be non-negative",
+            ));
+        }
+        if self.market_snapshot_age_ms < 0 {
+            return Err(RiskResultValidationError::new(
+                "market_snapshot_age_ms",
+                "must be non-negative",
+            ));
+        }
+        if self.capacity_age_ms < 0 {
+            return Err(RiskResultValidationError::new(
+                "capacity_age_ms",
+                "must be non-negative",
+            ));
+        }
+        if self.evaluated_at < 0 {
+            return Err(RiskResultValidationError::new(
+                "evaluated_at",
+                "must be non-negative",
+            ));
+        }
+        if self.valid_until < self.evaluated_at {
+            return Err(RiskResultValidationError::new(
+                "valid_until",
+                "must not precede evaluated_at",
+            ));
+        }
+
+        let sizing_fields_present = [
+            self.sizing_version.is_some(),
+            self.risk_base_amount.is_some(),
+            self.risk_budget_amount.is_some(),
+            self.adjusted_risk_pct.is_some(),
+            self.sizing_candidates.is_some(),
+            self.adjusted_legs.is_some(),
+        ];
+        let has_any_sizing = sizing_fields_present.iter().any(|present| *present);
+        let has_all_sizing = sizing_fields_present.iter().all(|present| *present);
+
+        if !self.approved {
+            if self.reason.as_str() == "OK" {
+                return Err(RiskResultValidationError::new(
+                    "reason",
+                    "must be an error code when approved is false",
+                ));
+            }
+            if !matches!(&self.reason, ErrorCodeOrString::Known(_)) {
+                return Err(RiskResultValidationError::new(
+                    "reason",
+                    "must be a centrally managed error code when approved is false",
+                ));
+            }
+            if has_any_sizing {
+                return Err(RiskResultValidationError::new(
+                    "sizing",
+                    "must be absent when approved is false",
+                ));
+            }
+            return Ok(());
+        }
+
+        if self.reason.as_str() != "OK" {
+            return Err(RiskResultValidationError::new(
+                "reason",
+                "must be OK when approved is true",
+            ));
+        }
+        if self.valid_until == self.evaluated_at {
+            return Err(RiskResultValidationError::new(
+                "valid_until",
+                "must follow evaluated_at when approved is true",
+            ));
+        }
+
+        if !has_any_sizing {
+            return Ok(());
+        }
+        if !has_all_sizing {
+            return Err(RiskResultValidationError::new(
+                "sizing",
+                "must contain every sizing field or none of them",
+            ));
+        }
+
+        let sizing_version = self.sizing_version.as_deref().expect("checked above");
+        validate_non_empty("sizing_version", sizing_version)?;
+        let risk_base = validate_positive_finite(
+            "risk_base_amount",
+            self.risk_base_amount.expect("checked above"),
+        )?;
+        let risk_budget = validate_positive_finite(
+            "risk_budget_amount",
+            self.risk_budget_amount.expect("checked above"),
+        )?;
+        let adjusted_risk_pct = validate_positive_finite(
+            "adjusted_risk_pct",
+            self.adjusted_risk_pct.expect("checked above"),
+        )?;
+        if risk_budget > risk_base {
+            return Err(RiskResultValidationError::new(
+                "risk_budget_amount",
+                "must not exceed risk_base_amount",
+            ));
+        }
+        if adjusted_risk_pct > 100.0 {
+            return Err(RiskResultValidationError::new(
+                "adjusted_risk_pct",
+                "must not exceed 100",
+            ));
+        }
+
+        let candidates = self.sizing_candidates.as_deref().expect("checked above");
+        let adjusted_legs = self.adjusted_legs.as_deref().expect("checked above");
+        validate_sizing_legs(
+            candidates,
+            adjusted_legs,
+            risk_base,
+            risk_budget,
+            adjusted_risk_pct,
+        )
+    }
+}
+
+fn validate_sizing_legs(
+    candidates: &[SizingCandidateProvenance],
+    adjusted_legs: &[AdjustedRiskLeg],
+    risk_base: f64,
+    risk_budget: f64,
+    adjusted_risk_pct: f64,
+) -> Result<(), RiskResultValidationError> {
+    if candidates.is_empty() {
+        return Err(RiskResultValidationError::new(
+            "sizing_candidates",
+            "must not be empty for an actionable approval",
+        ));
+    }
+    if adjusted_legs.is_empty() {
+        return Err(RiskResultValidationError::new(
+            "adjusted_legs",
+            "must not be empty for an actionable approval",
+        ));
+    }
+    if candidates.len() != adjusted_legs.len() {
+        return Err(RiskResultValidationError::new(
+            "adjusted_legs",
+            "must correspond one-to-one with sizing_candidates",
+        ));
+    }
+
+    let mut candidate_ids = HashSet::with_capacity(candidates.len());
+    for candidate in candidates {
+        validate_non_empty("sizing_candidates[].leg_id", candidate.leg_id.as_str())?;
+        validate_non_empty("sizing_candidates[].symbol", candidate.symbol.as_str())?;
+        if !candidate_ids.insert(candidate.leg_id.as_str()) {
+            return Err(RiskResultValidationError::new(
+                "sizing_candidates[].leg_id",
+                format!("must be unique; duplicate {}", candidate.leg_id),
+            ));
+        }
+        validate_positive_finite("sizing_candidates[].ratio", candidate.ratio)?;
+        validate_positive_finite(
+            "sizing_candidates[].worst_entry_price",
+            candidate.worst_entry_price,
+        )?;
+        validate_positive_finite(
+            "sizing_candidates[].stop_loss_price",
+            candidate.stop_loss_price,
+        )?;
+        validate_finite(
+            "sizing_candidates[].estimated_cost_per_lot",
+            candidate.estimated_cost_per_lot,
+        )?;
+        let stop_is_valid = match candidate.action {
+            AdjustedRiskLegAction::Buy => candidate.stop_loss_price < candidate.worst_entry_price,
+            AdjustedRiskLegAction::Sell => candidate.stop_loss_price > candidate.worst_entry_price,
+        };
+        if !stop_is_valid {
+            return Err(RiskResultValidationError::new(
+                "sizing_candidates[].stop_loss_price",
+                "must be below BUY entry or above SELL entry",
+            ));
+        }
+    }
+
+    let mut adjusted_ids = HashSet::with_capacity(adjusted_legs.len());
+    let mut actual_risk = 0.0;
+    for leg in adjusted_legs {
+        validate_non_empty("adjusted_legs[].leg_id", leg.leg_id.as_str())?;
+        validate_non_empty("adjusted_legs[].symbol", leg.symbol.as_str())?;
+        if !adjusted_ids.insert(leg.leg_id.as_str()) {
+            return Err(RiskResultValidationError::new(
+                "adjusted_legs[].leg_id",
+                format!("must be unique; duplicate {}", leg.leg_id),
+            ));
+        }
+        validate_positive_finite("adjusted_legs[].lots", leg.lots)?;
+        validate_positive_finite("adjusted_legs[].risk_amount", leg.risk_amount)?;
+        validate_positive_finite("adjusted_legs[].risk_pct", leg.risk_pct)?;
+        validate_positive_finite("adjusted_legs[].sizing_entry_price", leg.sizing_entry_price)?;
+        validate_positive_finite("adjusted_legs[].approved_sl", leg.approved_sl)?;
+        validate_positive_finite("adjusted_legs[].loss_per_lot", leg.loss_per_lot)?;
+        if leg.risk_pct > 100.0 {
+            return Err(RiskResultValidationError::new(
+                "adjusted_legs[].risk_pct",
+                "must not exceed 100",
+            ));
+        }
+        if leg
+            .reason
+            .as_ref()
+            .is_some_and(|reason| reason.as_str() != "OK")
+        {
+            return Err(RiskResultValidationError::new(
+                "adjusted_legs[].reason",
+                "must be absent or OK for an approved leg",
+            ));
+        }
+
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.leg_id == leg.leg_id)
+            .ok_or_else(|| {
+                RiskResultValidationError::new(
+                    "adjusted_legs[].leg_id",
+                    format!("has no sizing candidate for {}", leg.leg_id),
+                )
+            })?;
+        if candidate.symbol != leg.symbol || candidate.action != leg.action {
+            return Err(RiskResultValidationError::new(
+                "adjusted_legs",
+                format!(
+                    "identity for {} must match its sizing candidate",
+                    leg.leg_id
+                ),
+            ));
+        }
+        if !same_f64_bits(leg.sizing_entry_price, candidate.worst_entry_price)
+            || !same_f64_bits(leg.approved_sl, candidate.stop_loss_price)
+        {
+            return Err(RiskResultValidationError::new(
+                "adjusted_legs",
+                format!(
+                    "entry and stop for {} must match its sizing candidate",
+                    leg.leg_id
+                ),
+            ));
+        }
+
+        let expected_risk_amount = leg.lots * leg.loss_per_lot;
+        if !approximately_equal(leg.risk_amount, expected_risk_amount) {
+            return Err(RiskResultValidationError::new(
+                "adjusted_legs[].risk_amount",
+                "must equal lots * loss_per_lot",
+            ));
+        }
+
+        let expected_leg_pct = leg.risk_amount / risk_base * 100.0;
+        if !approximately_equal(leg.risk_pct, expected_leg_pct) {
+            return Err(RiskResultValidationError::new(
+                "adjusted_legs[].risk_pct",
+                "must equal risk_amount / risk_base_amount * 100",
+            ));
+        }
+        actual_risk += leg.risk_amount;
+        if !actual_risk.is_finite() {
+            return Err(RiskResultValidationError::new(
+                "adjusted_legs[].risk_amount",
+                "sum must remain finite",
+            ));
+        }
+    }
+
+    if actual_risk > risk_budget && !approximately_equal(actual_risk, risk_budget) {
+        return Err(RiskResultValidationError::new(
+            "adjusted_legs[].risk_amount",
+            "sum must not exceed risk_budget_amount",
+        ));
+    }
+    let expected_adjusted_pct = actual_risk / risk_base * 100.0;
+    if !approximately_equal(adjusted_risk_pct, expected_adjusted_pct) {
+        return Err(RiskResultValidationError::new(
+            "adjusted_risk_pct",
+            "must equal total adjusted leg risk / risk_base_amount * 100",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_non_empty(field: &'static str, value: &str) -> Result<(), RiskResultValidationError> {
+    if value.trim().is_empty() {
+        Err(RiskResultValidationError::new(field, "must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_sha256(field: &'static str, value: &str) -> Result<(), RiskResultValidationError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(RiskResultValidationError::new(
+            field,
+            "must be a 64-character lowercase SHA-256 hex digest",
+        ))
+    }
+}
+
+fn validate_finite(field: &'static str, value: f64) -> Result<f64, RiskResultValidationError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(RiskResultValidationError::new(field, "must be finite"))
+    }
+}
+
+fn validate_positive_finite(
+    field: &'static str,
+    value: f64,
+) -> Result<f64, RiskResultValidationError> {
+    validate_finite(field, value)?;
+    if value > 0.0 {
+        Ok(value)
+    } else {
+        Err(RiskResultValidationError::new(
+            field,
+            "must be greater than zero",
+        ))
+    }
+}
+
+fn approximately_equal(left: f64, right: f64) -> bool {
+    if !left.is_finite() || !right.is_finite() {
+        return false;
+    }
+    if left == right {
+        return true;
+    }
+    if left.is_sign_negative() != right.is_sign_negative() {
+        return false;
+    }
+    left.to_bits().abs_diff(right.to_bits()) <= 128
+}
+
+fn same_f64_bits(left: f64, right: f64) -> bool {
+    left.is_finite() && right.is_finite() && left.to_bits() == right.to_bits()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

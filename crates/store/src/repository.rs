@@ -1,10 +1,11 @@
-use std::{fmt::Display, str::FromStr};
+use std::{collections::HashSet, fmt::Display, str::FromStr};
 
 use serde::de::DeserializeOwned;
 use sinan_types::{
-    AccountId, CausationId, ClientId, ClockSyncStatus, CommandId, CorrelationId, ExecutionCommand,
-    ExecutionCommandState, ExecutionEvent, ExecutionId, IdempotencyKey, IntentId, LegId, MessageId,
-    PlanId, RiskId, SessionId, StrategyId, TerminalId, TradeIntent,
+    single_leg_id, AccountId, AdjustedRiskLegAction, CausationId, ClientId, ClockSyncStatus,
+    CommandId, CorrelationId, ExecutionCommand, ExecutionCommandState, ExecutionEvent, ExecutionId,
+    IdempotencyKey, IntentId, LegId, MessageId, PlanId, RiskId, RiskResult, SessionId, StrategyId,
+    TerminalId, TradeIntent, TradeIntentAction, TradeIntentLegAction, TradeIntentStatus,
 };
 use sqlx::{Row, SqliteConnection};
 
@@ -14,9 +15,10 @@ use crate::{
     json::CanonicalJson,
     model::{
         CommandStateUpdate, CoreEventMetadata, NewCoreEvent, NewExecutionCommand,
-        NewExecutionEvent, NewSessionRecord, NewTradeIntent, NewWireInbox, NewWireOutbox,
-        StoredCoreEvent, StoredExecutionCommand, StoredExecutionEvent, StoredSessionRecord,
-        StoredTradeIntent, StoredWireInbox, StoredWireOutbox, WriteOutcome,
+        NewExecutionEvent, NewRiskResult, NewSessionRecord, NewTradeIntent, NewWireInbox,
+        NewWireOutbox, StoredCoreEvent, StoredExecutionCommand, StoredExecutionEvent,
+        StoredRiskResult, StoredSessionRecord, StoredTradeIntent, StoredWireInbox,
+        StoredWireOutbox, WriteOutcome,
     },
 };
 
@@ -24,6 +26,16 @@ const CORE_EVENT_COLUMNS: &str = "event_id, event_type, aggregate_type, aggregat
     message_id, schema_version, correlation_id, causation_id, account_id, client_id, \
     terminal_id, strategy_id, intent_id, plan_id, leg_id, command_id, idempotency_key, \
     event_at, received_at, created_at, source, payload_json, payload_hash";
+
+const RISK_RESULT_COLUMNS: &str = "r.risk_id, r.intent_id, r.account_id, r.approved, r.reason, \
+    r.snapshot_age_ms, r.symbol_metadata_age_ms, r.evaluated_at, r.valid_until, r.payload_json, \
+    r.payload_hash, i.intent_id AS parent_intent_id, i.decision_id AS intent_decision_id, \
+    i.strategy_id AS intent_strategy_id, i.account_id AS intent_account_id, \
+    i.symbol AS intent_symbol, i.action AS intent_action, i.status AS intent_status, \
+    i.requested_at AS intent_requested_at, i.signal_expires_at AS intent_signal_expires_at, \
+    i.idempotency_key AS intent_idempotency_key, i.payload_json AS intent_payload_json, \
+    i.payload_hash AS intent_payload_hash, i.created_at AS intent_created_at, \
+    i.updated_at AS intent_updated_at";
 
 impl SqliteStateStore {
     pub async fn append_core_event(
@@ -42,6 +54,16 @@ impl SqliteStateStore {
     ) -> Result<WriteOutcome<StoredTradeIntent>, StoreError> {
         let mut transaction = self.begin_write().await?;
         let outcome = transaction.insert_trade_intent(intent).await?;
+        transaction.commit().await?;
+        Ok(outcome)
+    }
+
+    pub async fn insert_risk_result(
+        &self,
+        result: NewRiskResult,
+    ) -> Result<WriteOutcome<StoredRiskResult>, StoreError> {
+        let mut transaction = self.begin_write().await?;
+        let outcome = transaction.insert_risk_result(result).await?;
         transaction.commit().await?;
         Ok(outcome)
     }
@@ -130,6 +152,13 @@ impl SqliteStateStore {
         fetch_trade_intent_by_id(self.pool(), intent_id).await
     }
 
+    pub async fn get_risk_result(
+        &self,
+        risk_id: &RiskId,
+    ) -> Result<Option<StoredRiskResult>, StoreError> {
+        fetch_risk_result_by_id(self.pool(), risk_id).await
+    }
+
     pub async fn get_execution_command(
         &self,
         command_id: &CommandId,
@@ -186,6 +215,20 @@ impl WriteTransaction {
         intent: NewTradeIntent,
     ) -> Result<WriteOutcome<StoredTradeIntent>, StoreError> {
         insert_trade_intent_on(self.connection(), intent).await
+    }
+
+    pub async fn insert_risk_result(
+        &mut self,
+        result: NewRiskResult,
+    ) -> Result<WriteOutcome<StoredRiskResult>, StoreError> {
+        insert_risk_result_on(self.connection(), result).await
+    }
+
+    pub async fn get_risk_result(
+        &mut self,
+        risk_id: &RiskId,
+    ) -> Result<Option<StoredRiskResult>, StoreError> {
+        fetch_risk_result_by_id(self.connection(), risk_id).await
     }
 
     pub async fn insert_execution_command(
@@ -597,6 +640,534 @@ fn trade_intent_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredTradeInte
         payload,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+pub(crate) async fn insert_risk_result_on(
+    connection: &mut SqliteConnection,
+    new_result: NewRiskResult,
+) -> Result<WriteOutcome<StoredRiskResult>, StoreError> {
+    new_result
+        .result
+        .validate()
+        .map_err(|error| StoreError::InvalidRecord {
+            entity: "risk_result",
+            key: format!("risk_id={}", new_result.result.risk_id),
+            reason: error.to_string(),
+        })?;
+    let payload = CanonicalJson::from_serializable(&new_result.result)?;
+
+    if let Some(existing) =
+        fetch_risk_result_by_id(&mut *connection, &new_result.result.risk_id).await?
+    {
+        return resolve_risk_result_replay(existing, &new_result, &payload);
+    }
+
+    validate_risk_result_intent_identity(connection, &new_result).await?;
+    let result = &new_result.result;
+    let approved = if result.approved { 1_i64 } else { 0_i64 };
+    let insert = sqlx::query(
+        "INSERT INTO risk_results (\
+            risk_id, intent_id, account_id, approved, reason, snapshot_age_ms, \
+            symbol_metadata_age_ms, evaluated_at, valid_until, payload_json, payload_hash\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(result.risk_id.as_str())
+    .bind(result.intent_id.as_str())
+    .bind(result.account_id.as_str())
+    .bind(approved)
+    .bind(result.reason.as_str())
+    .bind(result.snapshot_age_ms)
+    .bind(result.symbol_metadata_age_ms)
+    .bind(result.evaluated_at)
+    .bind(result.valid_until)
+    .bind(payload.as_str())
+    .bind(payload.sha256_hex())
+    .execute(&mut *connection)
+    .await?;
+
+    let inserted = StoredRiskResult {
+        result: new_result.result.clone(),
+        payload: payload.clone(),
+    };
+    if insert.rows_affected() == 1 {
+        return Ok(WriteOutcome::Inserted(inserted));
+    }
+
+    match fetch_risk_result_by_id(connection, &new_result.result.risk_id).await? {
+        Some(existing) => resolve_risk_result_replay(existing, &new_result, &payload),
+        None => Err(StoreError::conflict(
+            "risk_result",
+            format!("risk_id={}", new_result.result.risk_id),
+        )),
+    }
+}
+
+async fn validate_risk_result_intent_identity(
+    connection: &mut SqliteConnection,
+    result: &NewRiskResult,
+) -> Result<(), StoreError> {
+    let Some(parent) = fetch_trade_intent_by_id(&mut *connection, &result.result.intent_id).await?
+    else {
+        return Err(StoreError::NotFound {
+            entity: "trade_intent",
+            key: format!("intent_id={}", result.result.intent_id),
+        });
+    };
+
+    if parent.intent.account_id != result.result.account_id
+        || parent.intent.decision_id != result.result.decision_id
+    {
+        return Err(StoreError::conflict(
+            "risk_result",
+            format!(
+                "risk_id={}, intent_id={}",
+                result.result.risk_id, result.result.intent_id
+            ),
+        ));
+    }
+
+    validate_risk_result_intent_contract(&result.result, &parent.intent).map_err(|reason| {
+        StoreError::InvalidRecord {
+            entity: "risk_result",
+            key: format!("risk_id={}", result.result.risk_id),
+            reason,
+        }
+    })?;
+
+    Ok(())
+}
+
+fn validate_risk_result_intent_contract(
+    result: &RiskResult,
+    intent: &TradeIntent,
+) -> Result<(), String> {
+    let has_any_sizing = result.sizing_version.is_some()
+        || result.risk_base_amount.is_some()
+        || result.risk_budget_amount.is_some()
+        || result.adjusted_risk_pct.is_some()
+        || result.sizing_candidates.is_some()
+        || result.adjusted_legs.is_some();
+    let has_actionable_sizing = result
+        .sizing_candidates
+        .as_ref()
+        .is_some_and(|candidates| !candidates.is_empty())
+        && result
+            .adjusted_legs
+            .as_ref()
+            .is_some_and(|legs| !legs.is_empty());
+
+    if result.approved
+        && intent.proposed_legs.as_ref().is_some_and(|legs| {
+            legs.iter()
+                .any(|leg| leg.action == TradeIntentLegAction::Close)
+        })
+    {
+        return Err("intent containing a CLOSE leg cannot be approved".to_owned());
+    }
+
+    match intent.action {
+        TradeIntentAction::Buy | TradeIntentAction::Sell
+            if result.approved && !has_actionable_sizing =>
+        {
+            return Err(format!(
+                "approved {} intent must contain actionable sizing",
+                intent.action
+            ));
+        }
+        TradeIntentAction::Hold if has_any_sizing => {
+            return Err("HOLD intent must not contain sizing".to_owned());
+        }
+        TradeIntentAction::Close if result.approved => {
+            return Err("CLOSE intent cannot be approved in the first implementation".to_owned());
+        }
+        TradeIntentAction::Close if has_any_sizing => {
+            return Err("CLOSE intent must not contain sizing".to_owned());
+        }
+        _ => {}
+    }
+
+    if result.approved
+        && matches!(
+            intent.action,
+            TradeIntentAction::Buy | TradeIntentAction::Sell
+        )
+    {
+        validate_approved_sizing_shape(result, intent)?;
+    }
+
+    if result.approved {
+        if result.evaluated_at < intent.requested_at {
+            return Err(format!(
+                "approved result evaluated_at {} precedes intent requested_at {}",
+                result.evaluated_at, intent.requested_at
+            ));
+        }
+        if result.evaluated_at >= intent.signal_expires_at {
+            return Err(format!(
+                "approved result evaluated_at {} must precede intent signal_expires_at {}",
+                result.evaluated_at, intent.signal_expires_at
+            ));
+        }
+        if result.valid_until > intent.signal_expires_at {
+            return Err(format!(
+                "approved result valid_until {} exceeds intent signal_expires_at {}",
+                result.valid_until, intent.signal_expires_at
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_approved_sizing_shape(result: &RiskResult, intent: &TradeIntent) -> Result<(), String> {
+    let candidates = result
+        .sizing_candidates
+        .as_deref()
+        .ok_or_else(|| "approved actionable intent is missing sizing candidates".to_owned())?;
+
+    match intent.proposed_legs.as_deref() {
+        None => {
+            if candidates.len() != 1 {
+                return Err(format!(
+                    "approved single-leg intent must contain exactly one sizing candidate, found {}",
+                    candidates.len()
+                ));
+            }
+            let expected_action = match intent.action {
+                TradeIntentAction::Buy => AdjustedRiskLegAction::Buy,
+                TradeIntentAction::Sell => AdjustedRiskLegAction::Sell,
+                TradeIntentAction::Close | TradeIntentAction::Hold => {
+                    return Err(format!(
+                        "{} intent cannot have actionable sizing",
+                        intent.action
+                    ));
+                }
+            };
+            let expected_stop = intent.proposed_sl.ok_or_else(|| {
+                "approved single-leg intent must define proposed_sl for sizing provenance"
+                    .to_owned()
+            })?;
+            let candidate = &candidates[0];
+            if candidate.leg_id != single_leg_id(&intent.intent_id)
+                || candidate.symbol != intent.symbol
+                || candidate.action != expected_action
+                || !risk_shape_number_matches(candidate.ratio, 1.0)
+                || !risk_shape_number_matches(candidate.stop_loss_price, expected_stop)
+            {
+                return Err(
+                    "single-leg sizing candidate must match the derived leg id and intent symbol, action, ratio=1 and proposed_sl".to_owned(),
+                );
+            }
+        }
+        Some(proposed_legs) => {
+            if proposed_legs
+                .iter()
+                .any(|leg| leg.action == TradeIntentLegAction::Close)
+            {
+                return Err("intent containing a CLOSE leg cannot be approved".to_owned());
+            }
+            if candidates.len() != proposed_legs.len() {
+                return Err(format!(
+                    "approved multi-leg intent requires one sizing candidate per proposed leg; expected {}, found {}",
+                    proposed_legs.len(),
+                    candidates.len()
+                ));
+            }
+
+            let mut proposed_leg_ids = HashSet::with_capacity(proposed_legs.len());
+            for proposed_leg in proposed_legs {
+                if !proposed_leg_ids.insert(proposed_leg.leg_id.as_str()) {
+                    return Err(format!(
+                        "proposed multi-leg intent contains duplicate leg_id {}",
+                        proposed_leg.leg_id
+                    ));
+                }
+                let candidate = candidates
+                    .iter()
+                    .find(|candidate| candidate.leg_id == proposed_leg.leg_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "approved multi-leg sizing is missing proposed leg {}",
+                            proposed_leg.leg_id
+                        )
+                    })?;
+                let expected_action = match proposed_leg.action {
+                    TradeIntentLegAction::Buy => AdjustedRiskLegAction::Buy,
+                    TradeIntentLegAction::Sell => AdjustedRiskLegAction::Sell,
+                    TradeIntentLegAction::Close => {
+                        return Err("intent containing a CLOSE leg cannot be approved".to_owned());
+                    }
+                };
+                let expected_stop = proposed_leg.proposed_sl.ok_or_else(|| {
+                    format!(
+                        "approved proposed leg {} must define proposed_sl for sizing provenance",
+                        proposed_leg.leg_id
+                    )
+                })?;
+                if candidate.symbol != proposed_leg.symbol
+                    || candidate.action != expected_action
+                    || !risk_shape_number_matches(candidate.ratio, proposed_leg.ratio)
+                    || !risk_shape_number_matches(candidate.stop_loss_price, expected_stop)
+                {
+                    return Err(format!(
+                        "sizing candidate {} must match its proposed leg symbol, action, ratio and proposed_sl",
+                        candidate.leg_id
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn risk_shape_number_matches(left: f64, right: f64) -> bool {
+    left.is_finite() && right.is_finite() && left.to_bits() == right.to_bits()
+}
+
+fn resolve_risk_result_replay(
+    existing: StoredRiskResult,
+    incoming: &NewRiskResult,
+    payload: &CanonicalJson,
+) -> Result<WriteOutcome<StoredRiskResult>, StoreError> {
+    if existing.payload == *payload {
+        Ok(WriteOutcome::Duplicate(existing))
+    } else {
+        Err(StoreError::conflict(
+            "risk_result",
+            format!("risk_id={}", incoming.result.risk_id),
+        ))
+    }
+}
+
+async fn fetch_risk_result_by_id<'e, E>(
+    executor: E,
+    risk_id: &RiskId,
+) -> Result<Option<StoredRiskResult>, StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let query = format!(
+        "SELECT {RISK_RESULT_COLUMNS} FROM risk_results r \
+         LEFT JOIN trade_intents i ON i.intent_id = r.intent_id \
+         WHERE r.risk_id = ?"
+    );
+    let row = sqlx::query(&query)
+        .bind(risk_id.as_str())
+        .fetch_optional(executor)
+        .await?;
+    row.map(risk_result_from_row).transpose()
+}
+
+fn risk_result_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredRiskResult, StoreError> {
+    let key: String = row.try_get("risk_id")?;
+    let payload = CanonicalJson::from_stored(
+        "risk_result",
+        &key,
+        row.try_get("payload_json")?,
+        row.try_get("payload_hash")?,
+    )?;
+    let result: RiskResult = deserialize_payload("risk_result", &key, &payload)?;
+    let intent_id = IntentId::from(row.try_get::<String, _>("intent_id")?);
+    result.validate().map_err(|error| {
+        StoreError::corrupt(
+            "risk_result",
+            &key,
+            format!("payload failed semantic validation: {error}"),
+        )
+    })?;
+
+    validate_column(
+        "risk_result",
+        &key,
+        "risk_id",
+        &key,
+        result.risk_id.as_str(),
+    )?;
+    validate_column(
+        "risk_result",
+        &key,
+        "intent_id",
+        intent_id.as_str(),
+        result.intent_id.as_str(),
+    )?;
+    validate_column(
+        "risk_result",
+        &key,
+        "account_id",
+        &row.try_get::<String, _>("account_id")?,
+        result.account_id.as_str(),
+    )?;
+    validate_i64_column(
+        "risk_result",
+        &key,
+        "approved",
+        row.try_get("approved")?,
+        if result.approved { 1 } else { 0 },
+    )?;
+    validate_column(
+        "risk_result",
+        &key,
+        "reason",
+        &row.try_get::<String, _>("reason")?,
+        result.reason.as_str(),
+    )?;
+    validate_i64_column(
+        "risk_result",
+        &key,
+        "snapshot_age_ms",
+        row.try_get("snapshot_age_ms")?,
+        result.snapshot_age_ms,
+    )?;
+    validate_i64_column(
+        "risk_result",
+        &key,
+        "symbol_metadata_age_ms",
+        row.try_get("symbol_metadata_age_ms")?,
+        result.symbol_metadata_age_ms,
+    )?;
+    validate_i64_column(
+        "risk_result",
+        &key,
+        "evaluated_at",
+        row.try_get("evaluated_at")?,
+        result.evaluated_at,
+    )?;
+    validate_i64_column(
+        "risk_result",
+        &key,
+        "valid_until",
+        row.try_get("valid_until")?,
+        result.valid_until,
+    )?;
+
+    let parent = trade_intent_from_risk_result_row(&row, &key)?;
+    validate_column(
+        "risk_result",
+        &key,
+        "parent intent_id",
+        parent.intent.intent_id.as_str(),
+        result.intent_id.as_str(),
+    )?;
+    validate_column(
+        "risk_result",
+        &key,
+        "parent intent account_id",
+        parent.intent.account_id.as_str(),
+        result.account_id.as_str(),
+    )?;
+    validate_column(
+        "risk_result",
+        &key,
+        "parent intent decision_id",
+        parent.intent.decision_id.as_str(),
+        result.decision_id.as_str(),
+    )?;
+    validate_risk_result_intent_contract(&result, &parent.intent).map_err(|reason| {
+        StoreError::corrupt(
+            "risk_result",
+            &key,
+            format!("parent trade_intent contract mismatch: {reason}"),
+        )
+    })?;
+
+    Ok(StoredRiskResult { result, payload })
+}
+
+fn trade_intent_from_risk_result_row(
+    row: &sqlx::sqlite::SqliteRow,
+    risk_key: &str,
+) -> Result<StoredTradeIntent, StoreError> {
+    let key = row
+        .try_get::<Option<String>, _>("parent_intent_id")?
+        .ok_or_else(|| {
+            StoreError::corrupt("risk_result", risk_key, "parent trade_intent is missing")
+        })?;
+    let payload = CanonicalJson::from_stored(
+        "trade_intent",
+        &key,
+        row.try_get("intent_payload_json")?,
+        row.try_get("intent_payload_hash")?,
+    )?;
+    let intent: TradeIntent = deserialize_payload("trade_intent", &key, &payload)?;
+
+    validate_column(
+        "trade_intent",
+        &key,
+        "intent_id",
+        &key,
+        intent.intent_id.as_str(),
+    )?;
+    validate_column(
+        "trade_intent",
+        &key,
+        "decision_id",
+        &row.try_get::<String, _>("intent_decision_id")?,
+        intent.decision_id.as_str(),
+    )?;
+    validate_column(
+        "trade_intent",
+        &key,
+        "strategy_id",
+        &row.try_get::<String, _>("intent_strategy_id")?,
+        intent.strategy_id.as_str(),
+    )?;
+    validate_column(
+        "trade_intent",
+        &key,
+        "account_id",
+        &row.try_get::<String, _>("intent_account_id")?,
+        intent.account_id.as_str(),
+    )?;
+    validate_column(
+        "trade_intent",
+        &key,
+        "symbol",
+        &row.try_get::<String, _>("intent_symbol")?,
+        intent.symbol.as_str(),
+    )?;
+    validate_column(
+        "trade_intent",
+        &key,
+        "action",
+        &row.try_get::<String, _>("intent_action")?,
+        intent.action.as_str(),
+    )?;
+    validate_i64_column(
+        "trade_intent",
+        &key,
+        "requested_at",
+        row.try_get("intent_requested_at")?,
+        intent.requested_at,
+    )?;
+    validate_i64_column(
+        "trade_intent",
+        &key,
+        "signal_expires_at",
+        row.try_get("intent_signal_expires_at")?,
+        intent.signal_expires_at,
+    )?;
+    validate_column(
+        "trade_intent",
+        &key,
+        "idempotency_key",
+        &row.try_get::<String, _>("intent_idempotency_key")?,
+        intent.idempotency_key.as_str(),
+    )?;
+
+    Ok(StoredTradeIntent {
+        intent,
+        status: parse_enum_column::<TradeIntentStatus>(
+            "trade_intent",
+            &key,
+            "status",
+            row.try_get("intent_status")?,
+        )?,
+        payload,
+        created_at: row.try_get("intent_created_at")?,
+        updated_at: row.try_get("intent_updated_at")?,
     })
 }
 

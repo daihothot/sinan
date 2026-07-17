@@ -1736,13 +1736,14 @@ strategy.decision
 trade.intent
 agent.review
 account.snapshot
-position.snapshot
-order.snapshot
+position full-set snapshot + account-level watermark
+order full-set snapshot + account-level watermark
 symbol.metadata
 pending execution.command
 pending execution.command state
 risk policy
-market snapshot
+account-scoped market snapshot
+risk capacity snapshot
 ```
 
 #### 输出
@@ -1767,7 +1768,9 @@ strategy.decision
   → execution.plan / execution.command
 ```
 
-Risk Layer 是执行前的硬边界，也是最终可执行 lots 的唯一 owner。Risk Layer 拥有 `risk.approved` 的有效期语义，但 `execution.command.expires_at` 仍由 Execution Engine 根据上游有效期和 execution policy 派生。Execution Layer 只能把已批准 lots 映射到 plan / command，不得重算或放大。
+Risk Layer 是执行前的硬边界，也是最终可执行 lots 的唯一 owner。Risk Layer 只接受 Trading Core 内可信 assembler 组装完成的不可变 `RiskRequest`，自身不读取 State Store、不调用 Compute Service，也不访问 HTTP / socket。assembler 必须在同一一致性读快照内校验账户作用域、完整集合水位和 pending command 对应关系；Risk Layer 对相同完整输入执行纯函数式评估。
+
+Risk Layer 拥有 `risk.approved` 的有效期语义，但 `execution.command.expires_at` 仍由 Execution Engine 根据上游有效期和 execution policy 派生。Execution Layer 只能把已批准 lots 映射到 plan / command，不得重算或放大。
 
 #### Circuit Breaker
 
@@ -1828,7 +1831,9 @@ Event Stream
 自动重置只允许从 OPEN → HALF_OPEN，不允许直接 OPEN → CLOSED。
 进入 HALF_OPEN 前必须完成 account / position / order / symbol metadata refresh。
 进入 HALF_OPEN 前必须完成 pending command reconciliation。
-HALF_OPEN 观察窗口内不得出现新的 hard risk violation。
+每项 refresh / reconciliation 证据必须携带服务器时间域的完成时间，且完成时间不得早于当前 breaker triggered_at；单纯 boolean 不足以证明本次熔断后的恢复工作已经完成。
+进入 HALF_OPEN 时记录 daily realized loss 与 equity drawdown baseline。造成原 incident 的财务阈值可以暂时仍被触发，但观察窗口内任一财务值高于对应 baseline 都视为新的 hard risk violation 并重新 OPEN，即使新值低于 policy threshold。
+HALF_OPEN 观察窗口内不得出现其他新的 hard risk violation。
 HALF_OPEN 只能允许 no-op validation 或风险降低动作。
 恢复 CLOSED 必须满足：
   → clock health HEALTHY
@@ -1840,12 +1845,49 @@ HALF_OPEN 只能允许 no-op validation 或风险降低动作。
 manual reset 必须写 audit.event，并记录 operator_id / reason / before_state / after_state。
 ```
 
-推荐状态结构：
+恢复证据结构使用可缺省时间戳表达“尚未完成”，不使用完成 boolean：
 
 ```ts
-export interface CircuitBreakerState {
+export interface HalfOpenReadiness {
+  account_refreshed_at_ms?: number
+  positions_refreshed_at_ms?: number
+  orders_refreshed_at_ms?: number
+  symbol_metadata_refreshed_at_ms?: number
+  pending_commands_reconciled_at_ms?: number
+}
+```
+
+进入 `HALF_OPEN` 时，上述字段必须全部存在并且逐项满足 `completed_at_ms >= 当前 breaker triggered_at`。
+
+`OPEN` 和 `HALF_OPEN` 都只阻断风险增加的 TradeIntent / command；读取状态、摄取 snapshot / execution event、reconciliation、manual review、no-op validation 和经过 hard risk gate 证明的风险降低动作仍可继续。非法 policy、输入、服务器时间回退或恢复证据不足必须保持 active 或转为 `OPEN`，不得 fail open。
+
+Breaker 必须把当前 hard-risk violation evidence 纳入 incident fingerprint。`OPEN` 状态重复观察完全相同 evidence 时保持幂等；出现不同的新 violation evidence 时，必须以本次服务器时间推进 `triggered_at` 并开启新的 recovery epoch，使旧 incident 之后、但新 incident 之前完成的 refresh / reconciliation 证据全部失效。进入 HALF_OPEN 前，above-limit 的 daily loss / drawdown 数值变化也属于 fingerprint 变化，不能沿用旧 readiness。不得因为 breaker 已经是 `OPEN` 就沿用旧恢复水位。
+
+`OPEN` 收到不再包含 hard-risk violation 的健康 observation 时仍然保持 `OPEN`，记录服务器时间域的 `incident_evidence_cleared_at`，清除当前 fingerprint，并产生 `IncidentEvidenceCleared` transition；该时间参与后续 transition 的单调时间校验。清除后即使相同 violation 再次出现，也必须作为新 incident 推进 recovery epoch，不能恢复旧 fingerprint 的幂等身份。
+
+非法 policy、输入或时间导致的 safety fallback 必须把具体 `CircuitBreakerError` 纳入 fingerprint，而不是只记录笼统的 `SafetyInvariantViolation`。完全相同的错误保持幂等，不同错误必须开启新的 recovery epoch；durable adapter 不得丢失该错误身份。
+
+面向 `GET /state` 的只读摘要结构：
+
+```ts
+export type CircuitBreakerReason =
+  | "OK"
+  | "DAILY_REALIZED_LOSS_LIMIT"
+  | "EQUITY_DRAWDOWN_LIMIT"
+  | "CONSECUTIVE_BROKER_REJECTIONS"
+  | "CONSECUTIVE_COMMAND_FAILURES"
+  | "MANUAL_RECONCILIATION_REQUIRED"
+  | "STORE_RECOVERY_RECONCILIATION_PENDING"
+  | "TIME_SYNC_UNHEALTHY"
+  | "SNAPSHOT_STALE"
+  | "SYMBOL_METADATA_STALE"
+  | "MANUAL_TRIGGER"
+  | "HARD_RISK_VIOLATION_DURING_RECOVERY"
+  | "SAFETY_INVARIANT_VIOLATION"
+
+export interface CircuitBreakerSummary {
   status: "CLOSED" | "OPEN" | "HALF_OPEN"
-  reason?: ErrorCode | "OK"
+  reason: CircuitBreakerReason
   triggered_at?: number
   triggered_by?: string
   reset_at?: number
@@ -1855,7 +1897,9 @@ export interface CircuitBreakerState {
 }
 ```
 
-`GET /state.risk.circuit_breaker_active` 等价于 `CircuitBreakerState.status != "CLOSED"`。推荐同时返回完整 `circuit_breaker` 对象，避免只有 boolean 无法判断原因。
+`CircuitBreakerReason` 是领域内详细触发原因，例如 daily loss、drawdown、broker failure、store recovery 或 safety invariant；它不同于对外拒绝响应使用的通用 `ErrorCode=RISK_ENGINE_CIRCUIT_BREAKER_TRIGGERED`。`GET /state.risk.circuit_breaker_active` 等价于 `CircuitBreakerSummary.status != "CLOSED"`。推荐同时返回 `circuit_breaker: CircuitBreakerSummary`，避免只有 boolean 无法判断原因。
+
+`sinan-risk` 第三里程碑只提供 pure state transition，不依赖 State Store，也尚未定义可直接反序列化的 durable breaker snapshot。Application integration 必须在启用 live execution 前补充带 schema version 和不变量校验的持久化 / restore adapter，完整恢复 `OPEN / HALF_OPEN`、recovery epoch、具体 incident / safety-error fingerprint、`incident_evidence_cleared_at`、`half_opened_at`、两项 financial baseline 和 blocked count。进程重启、snapshot 缺失或恢复校验失败时必须保持 / 创建 `OPEN` safety state，绝不能以默认 `CLOSED` 启动。该 durable restore 是下一里程碑的硬前置，不得把面向 `GET /state` 的简化 `CircuitBreakerSummary` 当作持久化格式。
 
 ---
 
@@ -2401,6 +2445,13 @@ export type ErrorCode =
   | "RATE_LIMITED"
   | "INTERNAL_ERROR"
   | "SERVICE_UNAVAILABLE"
+  | "MARKET_SNAPSHOT_STALE"
+  | "RISK_INPUT_INVALID"
+  | "RISK_LIMIT_EXCEEDED"
+  | "EXPOSURE_LIMIT_EXCEEDED"
+  | "POSITION_LIMIT_EXCEEDED"
+  | "RISK_REDUCTION_NOT_PROVABLE"
+  | "PENDING_EXPOSURE_CONFLICT"
   | "RISK_ENGINE_CIRCUIT_BREAKER_TRIGGERED"
   | "REDIS_UNAVAILABLE"
   | "STATE_STORE_UNAVAILABLE"
@@ -2625,7 +2676,7 @@ export interface TradeIntent {
 
 `TradeIntent.account_id` 标识目标交易账户，必须与调用方的授权账户范围一致。`TradeIntent.idempotency_key` 是 TradeIntent 业务幂等键，必须与 `POST /trade-intents` 的 `X-Idempotency-Key` 一致，并由 Trading Core 持久化后再进入 hard risk 与 execution flow。
 
-`proposed_risk_pct` 使用 percentage-point 口径，`1.0` 表示 `1%`，不是 `100%` 或 `0.01%`。它是上游提议上限，不是最终风险批准，也不是 lots。
+`proposed_risk_pct` 使用 percentage-point 口径，`1.0` 表示 `1%`，不是 `100%` 或 `0.01%`。它是上游提议上限，不是最终风险批准，也不是 lots。BUY / SELL intent 的值必须 finite 且位于 `(0, 100]`；零、负数或超过 `100` 是畸形输入，必须返回 `RISK_INPUT_INVALID`，不得靠 policy min 静默修正。HOLD 固定为 `0` 并走 no-op shape，不进入 actionable sizing。
 
 `TradeIntent.signal_expires_at` 与 `TradeIntent.requested_at` 必须使用 Trading Core server-time domain。Strategy & Decision Control Plane 不能用本地 wall clock 生成控制时间；需要通过 Trading Core `/state`、`/time` 或 WS heartbeat 维护 server time offset。
 
@@ -2642,11 +2693,7 @@ export interface AgentReview {
 }
 ```
 
-`score_adjustment` 有效范围为 `-1.0 ~ 1.0`。Risk Layer 使用前必须 clamp：
-
-```ts
-const scoreAdjustment = Math.max(-1.0, Math.min(1.0, review.score_adjustment))
-```
+`score_adjustment` 必须是 finite 且位于 `-1.0 ~ 1.0`；越界输入必须 fail closed，不得在 hard-risk path 中静默 clamp，因为 clamp 会改变已绑定到 `risk_request_hash` 的输入语义。第一版 pure evaluator 只接受缺省 review 或 `recommendation="none"`；`skip / reduce_risk / manual_review` 必须先在 Strategy & Decision Control Plane 完成有审计记录的决策，不能由 Risk evaluator 隐式改写 TradeIntent 风险或绕过人工流程。当前模型尚未携带该决策的结构化 resolution，因此这些 recommendation 直接进入 `RiskRequest` 时返回 `RISK_INPUT_INVALID`。
 
 ### 7.10 AccountSnapshot
 
@@ -2743,8 +2790,32 @@ export interface PositionSizingCandidate {
   estimated_cost_per_lot: number
 }
 
+export interface RiskStateWatermarks {
+  positions_observed_at: number
+  orders_observed_at: number
+  pending_commands_reconciled_at: number
+}
+
+export interface RiskCapacity {
+  account_id: string
+  strategy_id: string
+  observed_at: number
+  daily_realized_loss_pct: number
+  equity_drawdown_pct: number
+  remaining_account_risk_pct: number
+  remaining_portfolio_risk_pct: number
+  remaining_strategy_legs: number
+}
+
+export interface RiskMarketSnapshot {
+  account_id: string
+  snapshot: MarketSnapshot
+}
+
 export interface RiskRequest {
   request_id: string
+  risk_id: string
+  evaluated_at: number
 
   decision: StrategyDecision
   intent: TradeIntent
@@ -2759,23 +2830,38 @@ export interface RiskRequest {
 
   policy: RiskPolicy
   strategy_policy: StrategyRiskPolicy
-  markets: MarketSnapshot[]
+  markets: RiskMarketSnapshot[]
   sizing_candidates: PositionSizingCandidate[]
+  state_watermarks: RiskStateWatermarks
+  capacity: RiskCapacity
 }
 ```
 
-`RiskRequest` 是 Trading Core 内部风控评估对象，不是 Strategy & Decision Control Plane 的外部提交 payload。外部只提交 `TradeIntent`；Trading Core 基于本地最新状态组装 `RiskRequest`。
+`RiskRequest` 是 Trading Core 内部不可变风控评估对象，不是 Strategy & Decision Control Plane 的外部提交 payload。外部只提交 `TradeIntent`；Trading Core 内可信 assembler 必须通过本地 State Store 的单一一致性读快照组装完整 `RiskRequest`，固定 `risk_id` 和服务器时间域的 `evaluated_at` 后再交给 pure evaluator。Risk Layer 不得在评估过程中补读状态、调用 Compute Service 或依赖网络服务。
 
-Trading Core 必须在 hard risk 前从 `TradeIntent`、最新 market snapshot 和本地 execution policy 派生 `sizing_candidates`。`worst_entry_price` 必须包含对 spread 和允许滑点的保守估计；pending order 必须使用候选入场价再叠加不利执行 buffer。每个风险增加 leg 必须按 `leg_id` / `symbol` 唯一匹配一个 candidate、一份新鲜 market snapshot 和一份新鲜 symbol metadata；任一缺失都必须 fail closed。
+`positions` 和 `orders` 必须分别表示目标账户的完整集合；`state_watermarks.positions_observed_at` 和 `orders_observed_at` 是账户级 full-set 水位，即使数组为空也必须存在。每个 position / order 行的 `observed_at` 必须精确等于对应 full-set 水位。`pending_commands_reconciled_at` 证明 command lifecycle 与 broker order 集合已经完成对账；account、position full-set 和 order full-set 证据不得早于该水位，`capacity.observed_at` 不得早于这四项依赖证据中的任一项。逐行 latest observation 不能证明未出现的 position / order 已不存在，因此 assembler 在尚无新鲜且因果一致的 full-set / reconciliation 证据时必须 fail closed。`account`、capacity、所有 position / order / metadata / pending command 以及 `RiskMarketSnapshot.account_id` 必须与 `intent.account_id` 一致。
 
-`pending_commands` 提供不可变 command 载荷，`pending_command_states` 提供 lifecycle 状态。Risk Layer 做敞口和重复下单检查时应以 state 判断 command 是否仍然有效，以 command payload 读取 symbol / lots / action 等执行细节。
+Trading Core 必须在 hard risk 前从 `TradeIntent`、同账户最新 market snapshot 和本地 execution policy 派生 `sizing_candidates`。`worst_entry_price` 必须包含对 spread 和允许滑点的保守估计；pending order 必须使用候选入场价再叠加不利执行 buffer。没有显式 `proposed_legs` 的单腿 BUY / SELL 必须使用稳定合成 ID `leg:{intent_id}:0` 且 ratio 必须为 `1`；多腿必须按唯一 `leg_id` 将 intent leg、candidate、metadata 和 account-scoped market 一一匹配，并同时校验 symbol / action 一致。任一缺失、重复或错配都必须 fail closed。
+
+`pending_commands` 提供不可变 command 载荷，`pending_command_states` 提供 lifecycle 状态。两者必须按 `command_id` 一一对应，并精确匹配 `account_id / plan_id / leg_id`；state 的 lifecycle 时间不得晚于 `pending_commands_reconciled_at`，terminal status 必须携带合法 `completed_at`，非 terminal status 不得携带完成时间。Risk Layer 做敞口和重复下单检查时以 state 判断 command 是否仍然有效，以 command payload 读取 symbol / lots / action 等执行细节。合法 terminal command 不要求无关的 market / metadata；非 terminal BUY / SELL command 必须有合法的 order type、lots，并为非 MARKET order 提供 price。
+
+Active order / BUY-SELL command 的 `broker_symbol` 保持 optional；但一旦存在，必须与同一 canonical `symbol` 的 `SymbolMetadataSnapshot.broker_symbol` 精确一致。不得把 broker symbol B 标成 canonical symbol A 后使用 A 的 tick value / margin 计算。position / order 的核心 identity 和 canonical symbol 也不得为空。
+
+第一版 `RiskRequest` 没有携带 MODIFY 的 risk-reduction proof。任何 non-terminal MODIFY 都可能在当前 full-set snapshot 之后改变 pending order price / lots 或放宽 position stop，因此 Risk evaluator 必须以 `PENDING_EXPOSURE_CONFLICT` 阻断新的风险增加 intent；不得从 action 名称推断它只降低风险。CLOSE / CANCEL 继续按修改生效前的完整 position / order 暴露计数，是保守上界。未来只有模型能绑定 target、before/after 参数并证明风险不增加后，才能放行 pending MODIFY。
+
+`capacity` 是与本次账户、策略和状态水位一致的日内亏损、回撤、剩余账户 / 组合风险容量及 `remaining_strategy_legs` 快照。`account_id / strategy_id` 必须与 intent 一致，新 legs 数不得超过 trusted assembler 给出的剩余策略容量。它必须参与 freshness、因果水位和 hard-limit 校验，不得由 Risk Layer 在评估期间从外部服务临时获取。
+
+Rust evaluator 的边界为 `Result<RiskResult, RiskEvaluationError>`。策略、状态、行情或算术导致的业务拒绝必须返回 `Ok(RiskResult { approved: false, ... })` 以形成可持久化审计事实；只有空 `risk_id / request_id / intent_id / account_id / decision_id`、非法 `evaluated_at`，或连 fail-closed 结果都无法通过 `RiskResult::validate` 时，才返回 `Err(RiskEvaluationError)`，因为此时无法构造合法审计身份。
 
 ### 7.13 RiskResult
 
 ```ts
 export interface RiskResult {
   risk_id: string
+  request_id: string
+  intent_id: string
   account_id: string
+  risk_request_hash: string
   approved: boolean
 
   reason: ErrorCode | "OK"
@@ -2784,6 +2870,7 @@ export interface RiskResult {
   risk_base_amount?: number
   risk_budget_amount?: number
   adjusted_risk_pct?: number
+  sizing_candidates?: PositionSizingCandidate[]
   adjusted_legs?: Array<{
     leg_id: string
     symbol: SymbolCode
@@ -2800,7 +2887,9 @@ export interface RiskResult {
   decision_id: string
 
   snapshot_age_ms: number
+  market_snapshot_age_ms: number
   symbol_metadata_age_ms: number
+  capacity_age_ms: number
   evaluated_at: number
   valid_until: number
 }
@@ -2810,18 +2899,37 @@ export interface RiskResult {
 
 ```text
 snapshot_age_ms        = 风控评估时使用的 account / position / order snapshot 距当前时间的最大年龄
+market_snapshot_age_ms = 风控评估时使用的 account-scoped market snapshot 最大年龄
 symbol_metadata_age_ms = 风控评估时使用的 symbol metadata 距当前时间的年龄
+capacity_age_ms        = 风控评估时使用的 RiskCapacity 年龄
 evaluated_at           = 风控完成评估的时间戳
 valid_until            = 本次风控审批失效时间，由 Risk Layer 负责，必须不晚于相关 snapshot / order snapshot / metadata freshness 边界
 ```
 
-`adjusted_legs` 是 Risk Layer 对单腿和多腿策略的最终可执行手数输出。对 `approved=true` 且包含任一风险增加 BUY / SELL leg 的结果，`sizing_version`、`risk_base_amount`、`risk_budget_amount`、`adjusted_risk_pct` 和 `adjusted_legs` 必填；`adjusted_legs` 必须与风险增加 legs 按 `leg_id` 一一对应，不得缺失、重复或增加额外 leg。单腿策略使用只有一个元素的 `adjusted_legs`。
+`risk_request_hash` 是完整不可变 `RiskRequest` 确定性序列化后的 lowercase SHA-256，用于把审批结果绑定到唯一输入；`sizing_candidates` 在 actionable approval 中保留最终 sizing 所使用的完整 candidate provenance。对 `approved=true` 且包含任一风险增加 BUY / SELL leg 的结果，`sizing_version`、`risk_base_amount`、`risk_budget_amount`、`adjusted_risk_pct`、`sizing_candidates` 和 `adjusted_legs` 必填；candidate 与 `adjusted_legs` 必须按 `leg_id` 一一对应，不得缺失、重复或增加额外 leg。单腿策略使用只有一个元素的 candidate 和 `adjusted_legs`。
 
-`approved=false` 的 `RiskResult` 不得携带可执行 lots。第一版保守地将所有 BUY / SELL 视为风险增加；CLOSE 只有在其目标和手数不超过新鲜 `PositionSnapshot` 时才视为降低风险；HOLD 不生成 execution plan / command。
+`approved=false` 的 `RiskResult` 不得携带可执行 lots。第一版动作规则固定如下：
+
+```text
+HOLD
+  → approved=true 的 no-op RiskResult
+  → sizing_version / risk base / budget / adjusted_risk_pct / adjusted_legs 全部为空
+  → Execution 不得创建 plan / command
+
+CLOSE
+  → 当前 TradeIntent 没有目标 position 和 close lots，无法证明只降低风险
+  → approved=false，reason=RISK_REDUCTION_NOT_PROVABLE
+  → 不得创建 plan / command
+
+BUY / SELL
+  → 一律按风险增加处理并执行完整 sizing / hard-limit 校验
+```
+
+只有未来模型能够明确表达目标 position 和 close lots，并可由新鲜 full-set position 证据证明不会反向开仓时，`CLOSE` 才能改为风险降低路径。
 
 #### Position Sizing 确定性换算
 
-第一版使用保守的 fixed-risk-at-stop 模型。单腿 ratio 固定为 `1`；多腿 ratio 是相对 lots 系数，风险预算按所有腿的绝对最坏止损损失求和，不得使用相关性、对冲或预期抵消减少 hard-risk budget。
+第一版使用保守的 fixed-risk-at-stop 模型。单腿 ratio 固定为 `1`；多腿 ratio 是相对 lots 系数，风险预算、敞口和保证金按所有腿的绝对风险贡献求和，不得使用多空方向、相关性、对冲或预期抵消减少 hard-risk budget。
 
 ```text
 risk_base = min(max(account.balance, 0), max(account.equity, 0))
@@ -2850,19 +2958,35 @@ lots_i = floor_to_volume_step(raw_lots_i, metadata.volume_step)
 
 actual_risk = sum(lots_i * loss_per_lot_i)
 adjusted_risk_pct = actual_risk / risk_base * 100
+
+notional_per_lot_i =
+  ceil(abs(conservative_price_i) / metadata.tick_size)
+  * metadata.tick_value_loss
+
+new_margin = sum(lots_i * metadata.margin_initial_i)
+
+pending_margin + new_margin <= account.free_margin
+
+account.margin + pending_margin + new_margin
+  <= risk_base * RiskPolicy.max_margin_usage_pct / 100
 ```
+
+`notional_per_lot_i` 是第一版账户币种敞口的保守近似，`conservative_price_i` 使用 candidate 的不利价格。当前仓位、有效 pending order / command 和新批准 legs 的账户总敞口及逐品种敞口都必须按该口径累加后分别检查 `max_total_exposure_pct` 和 `max_symbol_exposure_pct`。Risk evaluator 不根据方向、broker order id 或推测的 command-order 对应关系抵消 pending order 与 pending command；二者同时存在时保守累加敞口和保证金，直到 reconciliation 提供 terminal / 去重后的可信完整输入。`margin_initial` 缺失、非 finite 或 `<= 0` 时无法证明新保证金上界，必须 fail closed。
 
 在计算 lots 前后必须执行以下硬约束：
 
 ```text
 risk_base、approved_risk_pct、ratio、worst_entry_price、stop_loss_price、tick_size、tick_value_loss 必须 finite 且符合各自的正值 / 方向约束。
 BUY 必须 stop_loss_price < worst_entry_price；SELL 必须 stop_loss_price > worst_entry_price。
-lots 必须使用 decimal / scaled integer 按 volume_step 向下取整，不得用 binary float 做最终 step 和预算比较。
+所有 sizing 输入通过有限值校验后，必须先按其 base-10 文本表示转换为 Decimal；Rust 实现使用 `f64::to_string()` 后解析 `rust_decimal::Decimal`。止损 tick 的 ceil、volume-step floor、risk budget、actual risk、敞口和保证金比较从此全部在 Decimal 域完成，不得用 binary float 做最终 step、预算或上限比较。
+Decimal lots 写入共享 `f64` DTO 前必须转为 finite `f64`，再用该 `f64` 的 base-10 文本解析回 Decimal。round-trip 后的值不得大于原 Decimal lots，且必须仍然精确落在 `volume_step` 上；否则以 `INVALID_VOLUME` fail closed，不得把不可执行的审计值交给 Execution。
 账户 / 品种敞口、volume_max 或保证金上限可以确定性缩小全局 scale，缩小后必须重新向下取整和校验。
 任一必需 leg 向下取整后 lots < volume_min 时拒绝整个 intent，不得向上补到 volume_min，也不得静默删除该 leg。
 lots 必须 <= volume_max 且 actual_risk <= risk_budget；无法确定损失或保证金上界时 fail closed。
 同一完整 RiskRequest 与 sizing_version 必须产生字节级可重现的 sizing 结果。
 ```
+
+`RiskResult.valid_until` 必须取以下时间边界的最小值，不得因缺项而延长：`evaluated_at + max_approval_ttl_ms`、`decision.signal_expires_at` / `intent.signal_expires_at`，以及本次依赖的 account、position full-set watermark、order full-set watermark、pending-command reconciliation watermark、risk capacity、market 和 symbol metadata 各自的 freshness 截止时间。任一 freshness 边界已经到期时拒绝审批。
 
 Execution Layer 必须按 `leg_id` 把 `RiskResult.adjusted_legs[].lots` 原样映射到 `ExecutionLeg.lots` 和 `ExecutionCommand.lots`。Execution Layer 不得重算、round、clamp、放大或静默缩小 lots；`formatLots` 只能格式化 HMAC 字符串，不得改变数值。如果价格、SL、metadata、保证金或 execution policy 变化导致原审批无法原样执行，必须拒绝生成 / 投递 command 并用新输入重新进入 Risk Layer。
 
@@ -4052,10 +4176,16 @@ export interface RiskPolicy {
 
   max_symbol_exposure_pct: number
   max_total_exposure_pct: number
+  max_margin_usage_pct: number
 
   require_stop_loss: boolean
   reject_expired_signal: boolean
   max_approval_ttl_ms: number
+  max_snapshot_age_ms: number
+  max_order_snapshot_age_ms: number
+  max_market_snapshot_age_ms: number
+  max_symbol_metadata_age_ms: number
+  max_capacity_age_ms: number
 
   max_concurrent_positions: number
   require_valid_symbol_metadata: boolean
@@ -4063,9 +4193,9 @@ export interface RiskPolicy {
 }
 ```
 
-`max_approval_ttl_ms` 是 Risk Layer 对 `risk.approved` 的最长有效期。`RiskResult.valid_until` 必须不晚于 `evaluated_at + max_approval_ttl_ms`，也不得晚于本次评估依赖的 snapshot / order snapshot / symbol metadata freshness 边界。
+`max_approval_ttl_ms` 是 Risk Layer 对 `risk.approved` 的最长有效期。`RiskResult.valid_until` 必须不晚于 `evaluated_at + max_approval_ttl_ms`、signal expiry，以及本次评估依赖的 account / position full-set / order full-set / pending-command reconciliation / risk capacity / market / symbol metadata freshness 边界。
 
-`position_sizing_version` 标识确定性换算算法和参数版本，必须原样写入 `RiskResult.sizing_version` 和审计 payload。同一版本不得在不修改版本号的情况下改变取整、价值换算或成本 buffer 规则。
+`position_sizing_version` 标识确定性换算算法和参数版本，必须原样写入 `RiskResult.sizing_version` 和审计 payload。第一版唯一支持值为 `fixed-risk-at-stop.v1`；未知值必须返回 `RISK_INPUT_INVALID`，不得继续运行 v1 算法却标记成其他版本。未来新增版本必须显式 dispatch 到对应实现。同一版本不得在不修改版本号的情况下改变取整、价值换算或成本 buffer 规则。
 
 ### 初始硬规则
 
@@ -4078,8 +4208,11 @@ export interface RiskPolicy {
 禁止重复 execution.command
 禁止使用过期 account / position snapshot 批准交易
 禁止使用过期 order snapshot 批准交易
+禁止以逐行 latest observation 或空数组替代账户级 position / order full-set 水位
+禁止使用跨账户或过期 market snapshot 批准交易
 禁止使用过期 symbol metadata 批准交易
 禁止缺失或使用非法 tick_value_loss 做 position sizing
+禁止缺失或使用非法 margin_initial 证明新保证金上界
 禁止违反 volume_min / volume_max / volume_step / stops_level / trade_mode
 禁止向上取整到 volume_min，或产生 actual_risk > risk_budget 的 lots
 ```
@@ -5687,7 +5820,9 @@ CREATE TABLE execution_events (
 
 初始 command-state insert 重放时，如果数据库已有相同 immutable identity 且 `updated_at` 更高的 projection，必须保留现值并返回 `Duplicate`，不得用初始状态覆盖；相同版本但内容不同，或试图通过 insert 而非 CAS 提交更高版本，必须返回 conflict。
 
-`risk_results.payload_json` 必须保留完整 `RiskResult`，包括 `sizing_version`、risk base / budget、sizing candidate provenance 和最终 `adjusted_legs`。对风险增加 intent，RiskResult 必须先于 execution plan / command 持久化，并与 intent / plan / command creation 使用同一 transaction boundary，保证每个 command lots 都能追溯到唯一风控审批。
+`risk_results.payload_json` 必须保留完整 `RiskResult`，包括 request / intent identity、`risk_request_hash`、`sizing_version`、risk base / budget、sizing candidate provenance、market / metadata / capacity age 和最终 `adjusted_legs`。typed repository 必须以 canonical JSON/hash 写入和读取，执行 `RiskResult` 语义校验，并校验 payload 与 denormalized 列以及父 `TradeIntent` 的 account / decision identity 一致。repository 还必须把父 intent 的 `action / requested_at / signal_expires_at` 和完整腿 shape 纳入契约：BUY / SELL approval 必须携带完整 actionable sizing；单腿 candidate 必须恰好一个，使用 `leg:{intent_id}:0` 并匹配父 intent 的 symbol / action / ratio=1 / proposed_sl；多腿按 `leg_id` 一一匹配 symbol / action / ratio / proposed_sl，不得缺腿或增加额外腿。ratio / proposed_sl 属于 provenance identity，使用原始 `f64` 位模式精确比较，不使用算术容差。HOLD 不得携带 sizing，但允许 approved no-op；第一版 CLOSE 不得 approved 且不得携带 sizing。approved 结果必须满足 `evaluated_at >= requested_at`、`evaluated_at < signal_expires_at` 且 `valid_until <= signal_expires_at`。typed read 必须从父 canonical payload 重建并重新验证上述契约，任何父行或 shape 漂移均报告损坏数据。相同 `risk_id`、父 intent 和完整 payload 的重放返回 Duplicate；相同 `risk_id` 的任意 identity / payload 漂移返回 conflict。同一 intent 可以使用不同 `risk_id` 追加多次独立评估，既有 `risk_results` 不得更新或删除。
+
+对风险增加 intent，`RiskResult` 必须先于 execution plan / command 持久化。Execution 里程碑必须在 repository 的同一 transaction boundary 内组合 intent / risk result / plan / command creation，保证每个 command lots 都能追溯到唯一风控审批；Risk 领域模块本身不得依赖 store。
 
 #### SQLite Foreign-key Registry
 
@@ -5910,6 +6045,7 @@ hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
@@ -6302,7 +6438,7 @@ export interface TradingCoreStateResponse {
   risk: {
     latest_results: RiskResult[]
     circuit_breaker_active: boolean
-    circuit_breaker?: CircuitBreakerState
+    circuit_breaker?: CircuitBreakerSummary
   }
 }
 ```
@@ -6446,13 +6582,34 @@ TradeIntent cannot carry final execution.command fields
 Trading Core derives execution.plan / execution.command from TradeIntent
 HTTP retry with same intent_id and same idempotency_key is idempotent
 position sizing same complete RiskRequest + sizing_version → byte-for-byte reproducible result
+unknown position_sizing_version → RISK_INPUT_INVALID; no implicit algorithm fallback
 Compute Service unavailable → live hard-risk position sizing remains available locally
+position / order empty set without fresh account-level full-set watermark → fail closed
+position / order row watermark mismatch, or account / full-set / capacity evidence predating command reconciliation → fail closed
+cross-account market / metadata / snapshot input → fail closed
+RiskCapacity account / strategy mismatch or insufficient remaining_strategy_legs → fail closed
 position sizing known vectors: single-leg / multi-leg / cost buffer / volume-step floor
 position sizing missing SL / market / tick_value_loss / fresh metadata → fail closed
+BUY / SELL proposed_risk_pct outside (0, 100] or non-finite → RISK_INPUT_INVALID
 position sizing raw lots < volume_min → reject whole intent; never round up or drop a leg
 position sizing respects volume_max / exposure / margin caps and actual_risk <= risk_budget
+pending order / command margin is conservatively accumulated without inferred offset
+UNKNOWN or internally inconsistent broker order, mismatched command state identity / lifecycle → fail closed
+terminal command state without completed_at, or non-terminal state with completed_at → fail closed
+active order / BUY-SELL command broker_symbol mismatches canonical symbol metadata → fail closed
+non-terminal MODIFY without a structured risk-reduction proof → PENDING_EXPOSURE_CONFLICT
+Decimal lots that round up or lose volume-step alignment through the executable f64 DTO → INVALID_VOLUME
 position sizing properties: step-aligned; wider stop or smaller budget never increases lots
 multi-leg sizing sums absolute worst-stop loss and applies no correlation / hedge offset
+HOLD → approved no-op RiskResult without sizing fields or execution plan
+CLOSE without target position / close lots → RISK_REDUCTION_NOT_PROVABLE
+circuit breaker recovery evidence timestamp < triggered_at → remain OPEN
+circuit breaker different incident evidence while OPEN → advance recovery epoch; old readiness remains invalid
+circuit breaker healthy observation while OPEN → IncidentEvidenceCleared; same violation recurring starts a new epoch
+circuit breaker HALF_OPEN financial value above baseline → reopen, even when below policy threshold
+circuit breaker same safety error is idempotent; different CircuitBreakerError starts a new epoch
+RiskResult repository enforces parent intent action / requested_at / signal_expires_at and complete single/multi-leg shape on write and typed read
+single-leg RiskResult leg_id != leg:{intent_id}:0, or parent ratio / SL differs by one f64 ULP → reject as invalid
 approved risk-increasing RiskResult missing adjusted_legs or leg_id mismatch → no execution plan
 ExecutionCommand.lots exactly equals approved RiskResult lots; parameter drift → re-risk / reject
 Event WebSocket cannot publish execution.command or broker order

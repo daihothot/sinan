@@ -119,6 +119,13 @@ string_enum! {
         RateLimited => "RATE_LIMITED",
         InternalError => "INTERNAL_ERROR",
         ServiceUnavailable => "SERVICE_UNAVAILABLE",
+        MarketSnapshotStale => "MARKET_SNAPSHOT_STALE",
+        RiskInputInvalid => "RISK_INPUT_INVALID",
+        RiskLimitExceeded => "RISK_LIMIT_EXCEEDED",
+        ExposureLimitExceeded => "EXPOSURE_LIMIT_EXCEEDED",
+        PositionLimitExceeded => "POSITION_LIMIT_EXCEEDED",
+        RiskReductionNotProvable => "RISK_REDUCTION_NOT_PROVABLE",
+        PendingExposureConflict => "PENDING_EXPOSURE_CONFLICT",
         RiskEngineCircuitBreakerTriggered => "RISK_ENGINE_CIRCUIT_BREAKER_TRIGGERED",
         RedisUnavailable => "REDIS_UNAVAILABLE",
         StateStoreUnavailable => "STATE_STORE_UNAVAILABLE",
@@ -151,6 +158,13 @@ string_enum! {
         Buy => "BUY",
         Sell => "SELL",
         Close => "CLOSE"
+    }
+}
+
+string_enum! {
+    pub enum AdjustedRiskLegAction {
+        Buy => "BUY",
+        Sell => "SELL"
     }
 }
 

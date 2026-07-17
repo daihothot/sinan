@@ -98,3 +98,8 @@ string_newtype!(
     TerminalId,
     TimeframeCode,
 );
+
+/// Derives the stable leg identity used when a TradeIntent has no explicit legs.
+pub fn single_leg_id(intent_id: &IntentId) -> LegId {
+    LegId::new(format!("leg:{}:0", intent_id.as_str()))
+}
