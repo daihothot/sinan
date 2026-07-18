@@ -331,6 +331,13 @@ string_enum! {
 }
 
 string_enum! {
+    pub enum RollbackMode {
+        CloseFilled => "close_filled",
+        None => "none"
+    }
+}
+
+string_enum! {
     pub enum ExecutionPlanStatus {
         Pending => "PENDING",
         Reconciling => "RECONCILING",

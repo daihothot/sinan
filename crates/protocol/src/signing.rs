@@ -182,7 +182,8 @@ fn validate_execution_command(
     validate_precision(format.volume_digits)?;
     validate_finite_numbers(command)?;
     validate_action_specific_fields(command)?;
-    validate_lots_alignment(command.lots, format)
+    validate_lots_alignment(command.lots, format)?;
+    validate_fixed_decimal_fields(command, format)
 }
 
 fn validate_finite_numbers(command: &ExecutionCommand) -> Result<(), SigningError> {
@@ -263,6 +264,41 @@ fn validate_lots_alignment(
             lots,
             volume_step: volume_step.value,
         });
+    }
+    Ok(())
+}
+
+fn validate_fixed_decimal_fields(
+    command: &ExecutionCommand,
+    format: CommandSigningFormat,
+) -> Result<(), SigningError> {
+    if let Some(lots) = command.lots {
+        validate_fixed_decimal_round_trip(lots, format.volume_digits, "lots")?;
+    }
+    for (field, value) in [
+        ("price", command.price),
+        ("sl", command.sl),
+        ("tp", command.tp),
+    ] {
+        if let Some(value) = value {
+            validate_fixed_decimal_round_trip(value, format.price_digits, field)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_fixed_decimal_round_trip(
+    value: f64,
+    digits: u32,
+    field: &'static str,
+) -> Result<(), SigningError> {
+    scaled_integer(value, digits, field)?;
+    let formatted = format_fixed_decimal(value, digits)?;
+    let round_trip = formatted
+        .parse::<f64>()
+        .map_err(|_| SigningError::FixedDecimalChangesValue(field))?;
+    if round_trip.to_bits() != value.to_bits() {
+        return Err(SigningError::FixedDecimalChangesValue(field));
     }
     Ok(())
 }
@@ -402,6 +438,9 @@ pub enum SigningError {
 
     #[error("{field} has more than {digits} decimal places")]
     DecimalPrecisionExceeded { field: &'static str, digits: u32 },
+
+    #[error("fixed decimal formatting changes execution command field {0}")]
+    FixedDecimalChangesValue(&'static str),
 
     #[error("fixed decimal value must be finite")]
     NonFiniteValue,

@@ -980,6 +980,13 @@ version = "0.1.0"
 [[package]]
 name = "sinan-execution"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sinan-protocol",
+ "sinan-risk",
+ "sinan-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sinan-gateway"

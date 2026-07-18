@@ -81,7 +81,7 @@ async fn insert_plan_leg_and_command(pool: &SqlitePool) {
 }
 
 #[tokio::test]
-async fn migration_creates_all_state_store_tables_at_version_two() {
+async fn migration_creates_all_state_store_tables_at_version_three() {
     let pool = migrated_pool().await;
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_schema \
@@ -100,11 +100,12 @@ async fn migration_creates_all_state_store_tables_at_version_two() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(tables.len(), 22);
+    assert_eq!(tables.len(), 23);
     assert_eq!(
         tables,
         [
             "account_snapshots_latest",
+            "circuit_breaker_snapshots",
             "command_delivery_attempts",
             "core_events",
             "deadletter_events",
@@ -128,8 +129,8 @@ async fn migration_creates_all_state_store_tables_at_version_two() {
             "wire_outbox",
         ]
     );
-    assert_eq!(migration_count, 2);
-    assert_eq!(user_version, 2);
+    assert_eq!(migration_count, 3);
+    assert_eq!(user_version, 3);
 }
 
 #[tokio::test]
@@ -147,6 +148,7 @@ async fn every_payload_json_column_has_a_payload_hash() {
         payload_tables,
         [
             "account_snapshots_latest",
+            "circuit_breaker_snapshots",
             "core_events",
             "event_stream_log",
             "execution_commands",
@@ -280,6 +282,17 @@ async fn status_action_mode_json_and_hash_checks_reject_invalid_values() {
     .await;
     assert!(invalid_hash.is_err());
 
+    let invalid_breaker_status = sqlx::query(
+        "INSERT INTO circuit_breaker_snapshots (\
+             scope, state_revision, schema_version, status, recovery_epoch, updated_at, \
+             payload_json, payload_hash\
+         ) VALUES ('GLOBAL', 1, 'circuit-breaker-state.v1', 'ACTIVE', 0, 1, '{}', ?)",
+    )
+    .bind(HASH)
+    .execute(&pool)
+    .await;
+    assert!(invalid_breaker_status.is_err());
+
     insert_intent_and_risk(&pool).await;
     let invalid_mode = sqlx::query(
         "INSERT INTO execution_plans (\
@@ -292,6 +305,50 @@ async fn status_action_mode_json_and_hash_checks_reject_invalid_values() {
     .execute(&pool)
     .await;
     assert!(invalid_mode.is_err());
+}
+
+#[tokio::test]
+async fn execution_definitions_are_immutable_but_status_projections_can_advance() {
+    let pool = migrated_pool().await;
+    insert_intent_and_risk(&pool).await;
+    insert_plan_leg_and_command(&pool).await;
+
+    sqlx::query(
+        "UPDATE execution_plans SET status = 'RECONCILING', updated_at = 4 \
+         WHERE plan_id = 'plan-1'",
+    )
+    .execute(&pool)
+    .await
+    .expect("plan materialized status should be mutable");
+    sqlx::query("UPDATE execution_legs SET status = 'SENT', updated_at = 4 WHERE leg_id = 'leg-1'")
+        .execute(&pool)
+        .await
+        .expect("leg materialized status should be mutable");
+
+    let plan_definition_update = sqlx::query(
+        "UPDATE execution_plans SET strategy_id = strategy_id WHERE plan_id = 'plan-1'",
+    )
+    .execute(&pool)
+    .await;
+    assert!(plan_definition_update.is_err());
+    let leg_definition_update =
+        sqlx::query("UPDATE execution_legs SET payload_json = payload_json WHERE leg_id = 'leg-1'")
+            .execute(&pool)
+            .await;
+    assert!(leg_definition_update.is_err());
+
+    assert!(
+        sqlx::query("DELETE FROM execution_legs WHERE leg_id = 'leg-1'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM execution_plans WHERE plan_id = 'plan-1'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -379,6 +436,17 @@ async fn append_only_facts_reject_mutation_while_replay_log_allows_retention() {
     insert_plan_leg_and_command(&pool).await;
 
     sqlx::query(
+        "INSERT INTO circuit_breaker_snapshots (\
+             scope, state_revision, schema_version, status, recovery_epoch, updated_at, \
+             payload_json, payload_hash\
+         ) VALUES ('GLOBAL', 1, 'circuit-breaker-state.v1', 'CLOSED', 0, 1, '{}', ?)",
+    )
+    .bind(HASH)
+    .execute(&pool)
+    .await
+    .expect("circuit-breaker snapshot fixture should insert");
+
+    sqlx::query(
         "INSERT INTO core_events (\
              event_id, event_type, aggregate_type, aggregate_id, schema_version, event_at,\
              received_at, created_at, source, payload_json, payload_hash\
@@ -426,6 +494,7 @@ async fn append_only_facts_reject_mutation_while_replay_log_allows_retention() {
 
     for table in [
         "core_events",
+        "circuit_breaker_snapshots",
         "deadletter_events",
         "system_events",
         "risk_results",

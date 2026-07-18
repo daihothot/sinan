@@ -1,3 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Execution planning and lifecycle behavior will be added in a later milestone.
+//! Pure execution planning and lifecycle projection.
+
+mod builder;
+mod projector;
+mod state;
+
+pub use builder::*;
+pub use projector::*;
+pub use state::*;

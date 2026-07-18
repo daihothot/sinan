@@ -2172,7 +2172,8 @@ fn best_effort_age(now: i64, observed_at: i64) -> i64 {
     now.saturating_sub(observed_at).max(0)
 }
 
-fn risk_request_hash(request: &RiskRequest) -> String {
+/// Returns the deterministic digest that binds a RiskResult to its immutable request.
+pub fn risk_request_hash(request: &RiskRequest) -> String {
     let bytes = serde_json::to_vec(request)
         .unwrap_or_else(|_| format!("NON_JSON_RISK_REQUEST:{request:?}").into_bytes());
     let mut hasher = Sha256::new();

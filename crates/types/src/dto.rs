@@ -1,13 +1,18 @@
 use crate::{
     AccountId, AdjustedRiskLegAction, BrokerDealId, BrokerOrderId, ClientId, CommandId,
     CorrelationId, DecisionId, ErrorCodeOrString, ExecutionAction, ExecutionCommandStatus,
-    ExecutionEventStatus, ExecutionId, FillingPolicy, IdempotencyKey, IntentId, LegId,
+    ExecutionEventStatus, ExecutionFailurePolicy, ExecutionId, ExecutionLegStatus,
+    ExecutionPlanMode, ExecutionPlanStatus, FillingPolicy, IdempotencyKey, IntentId, LegId,
     OrderSnapshotStatus, OrderType, PlanId, PositionId, PositionSide, PositionTicket, RequestId,
-    RiskId, StrategyId, SymbolCode, SymbolTradeMode, TerminalId, TimePolicy, TimeframeCode,
-    TradeIntentAction, TradeIntentLegAction,
+    RiskId, RollbackMode, StrategyId, SymbolCode, SymbolTradeMode, TerminalId, TimePolicy,
+    TimeframeCode, TradeIntentAction, TradeIntentLegAction,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, error::Error, fmt};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    error::Error,
+    fmt,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MarketBar {
@@ -666,6 +671,310 @@ pub struct ExecutionCommand {
     pub expires_at: i64,
     pub idempotency_key: IdempotencyKey,
     pub hmac: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackPolicy {
+    pub mode: RollbackMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_retry_attempts: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPolicy {
+    pub mode: ExecutionPlanMode,
+    pub failure_policy: ExecutionFailurePolicy,
+    pub timeout_ms: i64,
+    pub max_command_ttl_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_policy: Option<RollbackPolicy>,
+}
+
+/// Immutable fields of a plan leg. Runtime status is projected separately.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionLegDefinition {
+    pub leg_id: LegId,
+    pub symbol: SymbolCode,
+    pub action: ExecutionAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lots: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tp: Option<f64>,
+    pub ratio: f64,
+    pub dependency: Vec<LegId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionLegState {
+    pub status: ExecutionLegStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionLeg {
+    #[serde(flatten)]
+    pub definition: ExecutionLegDefinition,
+    #[serde(flatten)]
+    pub state: ExecutionLegState,
+}
+
+/// Immutable fields shared by every projection of an execution plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPlanDefinition {
+    pub plan_id: PlanId,
+    pub account_id: AccountId,
+    pub strategy_id: StrategyId,
+    pub mode: ExecutionPlanMode,
+    pub failure_policy: ExecutionFailurePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_policy: Option<RollbackPolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPlanState {
+    pub status: ExecutionPlanStatus,
+    pub filled_legs: Vec<LegId>,
+    pub failed_legs: Vec<LegId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionPlan {
+    #[serde(flatten)]
+    pub definition: ExecutionPlanDefinition,
+    pub legs: Vec<ExecutionLeg>,
+    #[serde(flatten)]
+    pub state: ExecutionPlanState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionPlanValidationError {
+    field: &'static str,
+    reason: String,
+}
+
+impl ExecutionPlanValidationError {
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    fn new(field: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            field,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for ExecutionPlanValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} {}", self.field, self.reason)
+    }
+}
+
+impl Error for ExecutionPlanValidationError {}
+
+impl ExecutionLeg {
+    pub fn validate(&self) -> Result<(), ExecutionPlanValidationError> {
+        validate_execution_non_empty("legs[].leg_id", self.definition.leg_id.as_str())?;
+        validate_execution_non_empty("legs[].symbol", self.definition.symbol.as_str())?;
+        validate_execution_positive("legs[].ratio", self.definition.ratio)?;
+        for (field, value) in [
+            ("legs[].lots", self.definition.lots),
+            ("legs[].sl", self.definition.sl),
+            ("legs[].tp", self.definition.tp),
+        ] {
+            if let Some(value) = value {
+                validate_execution_positive(field, value)?;
+            }
+        }
+        if matches!(
+            self.definition.action,
+            ExecutionAction::Buy | ExecutionAction::Sell
+        ) && self.definition.lots.is_none()
+        {
+            return Err(ExecutionPlanValidationError::new(
+                "legs[].lots",
+                "is required for BUY/SELL",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ExecutionPlan {
+    pub fn validate(&self) -> Result<(), ExecutionPlanValidationError> {
+        validate_execution_non_empty("plan_id", self.definition.plan_id.as_str())?;
+        validate_execution_non_empty("account_id", self.definition.account_id.as_str())?;
+        validate_execution_non_empty("strategy_id", self.definition.strategy_id.as_str())?;
+        if self.legs.is_empty() {
+            return Err(ExecutionPlanValidationError::new(
+                "legs",
+                "must not be empty",
+            ));
+        }
+        let mut ids = HashSet::with_capacity(self.legs.len());
+        for leg in &self.legs {
+            leg.validate()?;
+            if !ids.insert(leg.definition.leg_id.clone()) {
+                return Err(ExecutionPlanValidationError::new(
+                    "legs[].leg_id",
+                    format!("must be unique; duplicate {}", leg.definition.leg_id),
+                ));
+            }
+        }
+        if self.definition.mode == ExecutionPlanMode::Simultaneous
+            && self
+                .legs
+                .iter()
+                .any(|leg| !leg.definition.dependency.is_empty())
+        {
+            return Err(ExecutionPlanValidationError::new(
+                "legs[].dependency",
+                "must be empty for simultaneous plans",
+            ));
+        }
+        validate_execution_dependencies(&self.legs, &ids)?;
+        validate_execution_summary(
+            "filled_legs",
+            &self.state.filled_legs,
+            &self.legs,
+            |status| {
+                matches!(
+                    status,
+                    ExecutionLegStatus::PartiallyFilled | ExecutionLegStatus::Filled
+                )
+            },
+        )?;
+        validate_execution_summary(
+            "failed_legs",
+            &self.state.failed_legs,
+            &self.legs,
+            |status| {
+                matches!(
+                    status,
+                    ExecutionLegStatus::Rejected | ExecutionLegStatus::Failed
+                )
+            },
+        )?;
+        Ok(())
+    }
+}
+
+fn validate_execution_dependencies(
+    legs: &[ExecutionLeg],
+    ids: &HashSet<LegId>,
+) -> Result<(), ExecutionPlanValidationError> {
+    let mut indegree: HashMap<&LegId, usize> = ids.iter().map(|id| (id, 0)).collect();
+    let mut outgoing: HashMap<&LegId, Vec<&LegId>> = HashMap::new();
+    for leg in legs {
+        let mut dependencies = HashSet::new();
+        for dependency in &leg.definition.dependency {
+            if dependency == &leg.definition.leg_id
+                || !ids.contains(dependency)
+                || !dependencies.insert(dependency)
+            {
+                return Err(ExecutionPlanValidationError::new(
+                    "legs[].dependency",
+                    "must be unique, known, and not self-referential",
+                ));
+            }
+            *indegree
+                .get_mut(&leg.definition.leg_id)
+                .expect("leg id was indexed") += 1;
+            outgoing
+                .entry(dependency)
+                .or_default()
+                .push(&leg.definition.leg_id);
+        }
+    }
+    let mut queue: VecDeque<&LegId> = indegree
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(*id))
+        .collect();
+    let mut visited = 0;
+    while let Some(id) = queue.pop_front() {
+        visited += 1;
+        for target in outgoing.get(id).into_iter().flatten() {
+            let count = indegree
+                .get_mut(target)
+                .expect("dependency target was indexed");
+            *count -= 1;
+            if *count == 0 {
+                queue.push_back(target);
+            }
+        }
+    }
+    if visited != ids.len() {
+        return Err(ExecutionPlanValidationError::new(
+            "legs[].dependency",
+            "must form an acyclic graph",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_execution_summary(
+    field: &'static str,
+    summary: &[LegId],
+    legs: &[ExecutionLeg],
+    expected: fn(ExecutionLegStatus) -> bool,
+) -> Result<(), ExecutionPlanValidationError> {
+    let derived: Vec<&LegId> = legs
+        .iter()
+        .filter(|leg| expected(leg.state.status))
+        .map(|leg| &leg.definition.leg_id)
+        .collect();
+    if summary.len() != derived.len()
+        || summary
+            .iter()
+            .zip(derived)
+            .any(|(actual, expected)| actual != expected)
+    {
+        return Err(ExecutionPlanValidationError::new(
+            field,
+            "must exactly match projected legs in plan order",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_execution_non_empty(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ExecutionPlanValidationError> {
+    if value.trim().is_empty() {
+        Err(ExecutionPlanValidationError::new(
+            field,
+            "must not be empty",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_execution_positive(
+    field: &'static str,
+    value: f64,
+) -> Result<(), ExecutionPlanValidationError> {
+    if value.is_finite() && value > 0.0 {
+        Ok(())
+    } else {
+        Err(ExecutionPlanValidationError::new(
+            field,
+            "must be positive and finite",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

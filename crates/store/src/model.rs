@@ -1,11 +1,15 @@
 use sinan_types::{
     AccountId, CausationId, ClientId, ClockSyncStatus, CommandId, CorrelationId, ExecutionCommand,
-    ExecutionCommandState, ExecutionCommandStatus, ExecutionEvent, IdempotencyKey, IntentId, LegId,
-    MessageId, PlanId, RiskId, RiskResult, SessionId, SessionStatus, StrategyId, TerminalId,
-    TradeIntent, TradeIntentStatus, WireInboxStatus, WireOutboxStatus,
+    ExecutionCommandState, ExecutionCommandStatus, ExecutionEvent, ExecutionLeg,
+    ExecutionLegState, ExecutionLegStatus, ExecutionPlan, ExecutionPlanState, ExecutionPlanStatus,
+    IdempotencyKey, IntentId, LegId, MessageId, PlanId, RiskId, RiskResult, SessionId,
+    SessionStatus, StrategyId, TerminalId, TradeIntent, TradeIntentStatus, WireInboxStatus,
+    WireOutboxStatus,
 };
 
 use crate::json::CanonicalJson;
+
+pub const GLOBAL_CIRCUIT_BREAKER_SCOPE: &str = "GLOBAL";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WriteOutcome<T> {
@@ -29,6 +33,27 @@ impl<T> WriteOutcome<T> {
     pub const fn was_inserted(&self) -> bool {
         matches!(self, Self::Inserted(_))
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewCircuitBreakerSnapshot {
+    pub expected_head_revision: Option<u64>,
+    pub schema_version: String,
+    pub status: String,
+    pub recovery_epoch: u64,
+    pub updated_at: i64,
+    pub payload: CanonicalJson,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredCircuitBreakerSnapshot {
+    pub scope: String,
+    pub state_revision: u64,
+    pub schema_version: String,
+    pub status: String,
+    pub recovery_epoch: u64,
+    pub updated_at: i64,
+    pub payload: CanonicalJson,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +121,51 @@ pub struct StoredRiskResult {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct NewExecutionPlan {
+    pub plan: ExecutionPlan,
+    pub risk_id: RiskId,
+    pub intent_id: IntentId,
+    pub recorded_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredExecutionPlan {
+    pub plan: ExecutionPlan,
+    pub risk_id: RiskId,
+    pub intent_id: IntentId,
+    pub payload: CanonicalJson,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredExecutionLeg {
+    pub plan_id: PlanId,
+    pub leg: ExecutionLeg,
+    pub payload: CanonicalJson,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanStateUpdate {
+    pub plan_id: PlanId,
+    pub expected_status: ExecutionPlanStatus,
+    pub expected_updated_at: i64,
+    pub state: ExecutionPlanState,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegStateUpdate {
+    pub plan_id: PlanId,
+    pub leg_id: LegId,
+    pub expected_status: ExecutionLegStatus,
+    pub expected_updated_at: i64,
+    pub state: ExecutionLegState,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct NewExecutionCommand {
     pub command: ExecutionCommand,
     pub risk_id: RiskId,
@@ -108,6 +178,24 @@ pub struct StoredExecutionCommand {
     pub risk_id: RiskId,
     pub payload: CanonicalJson,
     pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewExecutionWorkflow {
+    pub intent: NewTradeIntent,
+    pub risk_result: NewRiskResult,
+    pub plan: NewExecutionPlan,
+    pub commands: Vec<NewExecutionCommand>,
+    pub command_states: Vec<ExecutionCommandState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredExecutionWorkflow {
+    pub intent: StoredTradeIntent,
+    pub risk_result: StoredRiskResult,
+    pub plan: StoredExecutionPlan,
+    pub commands: Vec<StoredExecutionCommand>,
+    pub command_states: Vec<ExecutionCommandState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

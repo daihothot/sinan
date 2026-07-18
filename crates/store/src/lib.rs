@@ -30,6 +30,11 @@ const EMBEDDED_MIGRATIONS: &[Migration] = &[
         "state_store_schema",
         include_str!("../migrations/V0002__state_store_schema.sql"),
     ),
+    Migration::new(
+        3,
+        "execution_durability",
+        include_str!("../migrations/V0003__execution_durability.sql"),
+    ),
 ];
 
 /// One immutable, forward-only database migration.

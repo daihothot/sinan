@@ -214,6 +214,27 @@ fn metadata_signing_format_rejects_unaligned_lots_without_rounding() {
 }
 
 #[test]
+fn signing_rejects_price_fields_that_fixed_formatting_would_change() {
+    let format = CommandSigningFormat::from_symbol_metadata(&symbol_metadata(0.01)).unwrap();
+    for field in ["price", "sl", "tp"] {
+        let mut command = golden_command();
+        match field {
+            "price" => command.price = Some(2320.501),
+            "sl" => command.sl = Some(2320.501),
+            "tp" => command.tp = Some(2365.501),
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            build_execution_command_signing_string(&command, format),
+            Err(SigningError::DecimalPrecisionExceeded {
+                field: actual,
+                digits: 2
+            }) if actual == field
+        ));
+    }
+}
+
+#[test]
 fn signing_precision_and_scaled_integer_overflow_fail_closed() {
     let command = golden_command();
     assert!(matches!(

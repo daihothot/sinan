@@ -5,6 +5,8 @@
 
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+
 /// A percentage expressed in basis points (`100 bps == 1%`).
 pub type BasisPoints = u32;
 
@@ -65,7 +67,8 @@ impl CircuitBreakerPolicy {
 }
 
 /// The status exposed by the global circuit breaker.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CircuitBreakerStatus {
     Closed,
     Open,
@@ -79,7 +82,8 @@ impl CircuitBreakerStatus {
 }
 
 /// Stable reason stored with a circuit-breaker incident.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CircuitBreakerReason {
     Ok,
     DailyRealizedLossLimit,
@@ -97,7 +101,8 @@ pub enum CircuitBreakerReason {
 }
 
 /// Component or operator that caused the current incident.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CircuitBreakerTriggerSource {
     RiskTelemetry,
     Broker,
@@ -114,6 +119,7 @@ pub enum CircuitBreakerTriggerSource {
 /// rather than defaulting to `CLOSED` after a process restart.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CircuitBreakerState {
+    recovery_epoch: u64,
     status: CircuitBreakerStatus,
     reason: CircuitBreakerReason,
     triggered_at_ms: Option<i64>,
@@ -131,6 +137,7 @@ pub struct CircuitBreakerState {
 impl Default for CircuitBreakerState {
     fn default() -> Self {
         Self {
+            recovery_epoch: 0,
             status: CircuitBreakerStatus::Closed,
             reason: CircuitBreakerReason::Ok,
             triggered_at_ms: None,
@@ -154,6 +161,11 @@ impl CircuitBreakerState {
 
     pub const fn status(&self) -> CircuitBreakerStatus {
         self.status
+    }
+
+    /// Monotonic identity of the current or most recently completed incident.
+    pub const fn recovery_epoch(&self) -> u64 {
+        self.recovery_epoch
     }
 
     pub const fn reason(&self) -> CircuitBreakerReason {
@@ -265,6 +277,8 @@ pub struct CircuitBreakerInput {
 /// Evidence that all snapshots and pending commands were refreshed/reconciled.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HalfOpenReadiness {
+    /// Incident identity captured when the refresh/reconciliation work began.
+    pub recovery_epoch: u64,
     pub account_refreshed_at_ms: Option<i64>,
     pub positions_refreshed_at_ms: Option<i64>,
     pub orders_refreshed_at_ms: Option<i64>,
@@ -369,10 +383,12 @@ pub enum CircuitBreakerViolation {
 /// Exact, collision-free identity for the hard-risk evidence behind an
 /// incident epoch. Time-sync evidence records the unhealthy start time rather
 /// than the growing duration so polling the same fault remains idempotent.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
 struct CircuitBreakerIncidentFingerprint(Vec<CircuitBreakerIncidentEvidence>);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "SCREAMING_SNAKE_CASE")]
 enum CircuitBreakerIncidentEvidence {
     DailyRealizedLoss {
         observed_bps: BasisPoints,
@@ -420,7 +436,7 @@ enum CircuitBreakerIncidentEvidence {
     },
     HardRiskViolationDuringRecovery,
     SafetyInvariantViolation,
-    SafetyInvariantError(CircuitBreakerError),
+    SafetyInvariantError(CircuitBreakerErrorFingerprint),
 }
 
 impl CircuitBreakerViolation {
@@ -576,7 +592,8 @@ fn incident_fingerprint(
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecoveryPrerequisite {
     AccountRefresh,
     PositionRefresh,
@@ -587,12 +604,73 @@ pub enum RecoveryPrerequisite {
     StateStoreHealth,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransitionRequestKind {
     Observe,
     EnterHalfOpen,
     Close,
     RecordBlockedIntentCount,
+}
+
+/// Timestamp fields validated against the server clock during durable restore.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CircuitBreakerSnapshotTimestamp {
+    TriggeredAt,
+    IncidentEvidenceClearedAt,
+    HalfOpenedAt,
+    ResetAt,
+}
+
+/// Stable invariant identifiers used by fail-closed durable restore.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CircuitBreakerSnapshotInvariant {
+    RecoveryEpochExhausted,
+    InitialStateHasIncidentData,
+    IncidentStateMissingTrigger,
+    TriggerPresentWithoutRecoveryEpoch,
+    StatusReasonMismatch,
+    ActiveStateHasResetData,
+    ClosedStateMissingResetData,
+    ResetIdentityIncomplete,
+    ResetByBlank,
+    HalfOpenRecoveryDataIncomplete,
+    HalfOpenRecoveryDataOutsideHalfOpen,
+    FingerprintEmpty,
+    FingerprintDuplicateEvidence,
+    FingerprintPrimaryReasonMismatch,
+    FingerprintPrimarySourceMismatch,
+    FingerprintAndEvidenceClearedCoexist,
+    ActiveStateMissingFingerprintOrClearEvidence,
+    TimestampNegative,
+    TimestampOrderInvalid,
+    TriggerSourceBlank,
+    FingerprintTextBlank,
+}
+
+/// A stable reason why a durable breaker snapshot could not be restored.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CircuitBreakerRestoreFailure {
+    MissingSnapshot,
+    CorruptPayload,
+    UnsupportedSchemaVersion {
+        found: String,
+    },
+    InvalidSnapshot {
+        invariant: CircuitBreakerSnapshotInvariant,
+    },
+    SnapshotTimestampInFuture {
+        field: CircuitBreakerSnapshotTimestamp,
+        timestamp_ms: i64,
+        server_now_ms: i64,
+    },
+    InvalidServerTime {
+        server_now_ms: i64,
+    },
+    StoreUnavailable,
 }
 
 /// A domain error is returned inside the outcome so the fail-closed state is
@@ -616,6 +694,10 @@ pub enum CircuitBreakerError {
         request: TransitionRequestKind,
     },
     RecoveryPrerequisitesMissing(Vec<RecoveryPrerequisite>),
+    RecoveryEpochMismatch {
+        expected: u64,
+        observed: u64,
+    },
     RecoveryBlockedByViolations(Vec<CircuitBreakerReason>),
     HalfOpenObservationNotComplete {
         remaining_ms: i64,
@@ -625,6 +707,104 @@ pub enum CircuitBreakerError {
         field: &'static str,
     },
     HalfOpenBaselineMissing,
+    RecoveryEpochOverflow,
+    DurableRestoreFailed {
+        failure: CircuitBreakerRestoreFailure,
+    },
+}
+
+/// Serializable identity retained inside a durable safety fingerprint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "SCREAMING_SNAKE_CASE")]
+enum CircuitBreakerErrorFingerprint {
+    InvalidPolicy {
+        field: String,
+        requirement: String,
+    },
+    InvalidInput {
+        field: String,
+        requirement: String,
+    },
+    ServerTimeRegressed {
+        latest_transition_at_ms: i64,
+        server_now_ms: i64,
+    },
+    InvalidTransition {
+        status: CircuitBreakerStatus,
+        request: TransitionRequestKind,
+    },
+    RecoveryPrerequisitesMissing(Vec<RecoveryPrerequisite>),
+    RecoveryEpochMismatch {
+        expected: u64,
+        observed: u64,
+    },
+    RecoveryBlockedByViolations(Vec<CircuitBreakerReason>),
+    HalfOpenObservationNotComplete {
+        remaining_ms: i64,
+    },
+    AutomaticResetDisabled,
+    ManualResetEvidenceMissing {
+        field: String,
+    },
+    HalfOpenBaselineMissing,
+    RecoveryEpochOverflow,
+    DurableRestoreFailed {
+        failure: CircuitBreakerRestoreFailure,
+    },
+}
+
+impl From<&CircuitBreakerError> for CircuitBreakerErrorFingerprint {
+    fn from(error: &CircuitBreakerError) -> Self {
+        match error {
+            CircuitBreakerError::InvalidPolicy { field, requirement } => Self::InvalidPolicy {
+                field: (*field).to_owned(),
+                requirement: (*requirement).to_owned(),
+            },
+            CircuitBreakerError::InvalidInput { field, requirement } => Self::InvalidInput {
+                field: (*field).to_owned(),
+                requirement: (*requirement).to_owned(),
+            },
+            CircuitBreakerError::ServerTimeRegressed {
+                latest_transition_at_ms,
+                server_now_ms,
+            } => Self::ServerTimeRegressed {
+                latest_transition_at_ms: *latest_transition_at_ms,
+                server_now_ms: *server_now_ms,
+            },
+            CircuitBreakerError::InvalidTransition { status, request } => Self::InvalidTransition {
+                status: *status,
+                request: *request,
+            },
+            CircuitBreakerError::RecoveryPrerequisitesMissing(prerequisites) => {
+                Self::RecoveryPrerequisitesMissing(prerequisites.clone())
+            }
+            CircuitBreakerError::RecoveryEpochMismatch { expected, observed } => {
+                Self::RecoveryEpochMismatch {
+                    expected: *expected,
+                    observed: *observed,
+                }
+            }
+            CircuitBreakerError::RecoveryBlockedByViolations(reasons) => {
+                Self::RecoveryBlockedByViolations(reasons.clone())
+            }
+            CircuitBreakerError::HalfOpenObservationNotComplete { remaining_ms } => {
+                Self::HalfOpenObservationNotComplete {
+                    remaining_ms: *remaining_ms,
+                }
+            }
+            CircuitBreakerError::AutomaticResetDisabled => Self::AutomaticResetDisabled,
+            CircuitBreakerError::ManualResetEvidenceMissing { field } => {
+                Self::ManualResetEvidenceMissing {
+                    field: (*field).to_owned(),
+                }
+            }
+            CircuitBreakerError::HalfOpenBaselineMissing => Self::HalfOpenBaselineMissing,
+            CircuitBreakerError::RecoveryEpochOverflow => Self::RecoveryEpochOverflow,
+            CircuitBreakerError::DurableRestoreFailed { failure } => Self::DurableRestoreFailed {
+                failure: failure.clone(),
+            },
+        }
+    }
 }
 
 impl fmt::Display for CircuitBreakerError {
@@ -658,6 +838,10 @@ impl fmt::Display for CircuitBreakerError {
                     "recovery prerequisites missing: {prerequisites:?}"
                 )
             }
+            Self::RecoveryEpochMismatch { expected, observed } => write!(
+                formatter,
+                "recovery evidence epoch {observed} does not match current epoch {expected}"
+            ),
             Self::RecoveryBlockedByViolations(reasons) => {
                 write!(formatter, "recovery blocked by violations: {reasons:?}")
             }
@@ -672,11 +856,508 @@ impl fmt::Display for CircuitBreakerError {
             Self::HalfOpenBaselineMissing => {
                 formatter.write_str("half-open risk baseline is missing")
             }
+            Self::RecoveryEpochOverflow => {
+                formatter.write_str("circuit-breaker recovery epoch is exhausted")
+            }
+            Self::DurableRestoreFailed { failure } => {
+                write!(
+                    formatter,
+                    "durable circuit-breaker restore failed: {failure:?}"
+                )
+            }
         }
     }
 }
 
 impl Error for CircuitBreakerError {}
+
+pub const CIRCUIT_BREAKER_SNAPSHOT_SCHEMA_VERSION_V1: &str = "circuit-breaker-state.v1";
+
+/// Complete, versioned persistence format for the circuit-breaker domain state.
+///
+/// This is deliberately distinct from the lossy read-only state summary. The
+/// fields remain private so only the domain can construct a semantically valid
+/// snapshot, while serde lets a storage adapter persist canonical JSON.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CircuitBreakerSnapshotV1 {
+    schema_version: String,
+    recovery_epoch: u64,
+    status: CircuitBreakerStatus,
+    reason: CircuitBreakerReason,
+    triggered_at_ms: Option<i64>,
+    triggered_by: Option<CircuitBreakerTriggerSource>,
+    last_incident_fingerprint: Option<CircuitBreakerIncidentFingerprint>,
+    incident_evidence_cleared_at_ms: Option<i64>,
+    half_opened_at_ms: Option<i64>,
+    half_open_daily_loss_baseline_bps: Option<BasisPoints>,
+    half_open_drawdown_baseline_bps: Option<BasisPoints>,
+    reset_at_ms: Option<i64>,
+    reset_by: Option<String>,
+    blocked_intent_count: u64,
+}
+
+impl CircuitBreakerSnapshotV1 {
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    pub const fn recovery_epoch(&self) -> u64 {
+        self.recovery_epoch
+    }
+
+    pub const fn status(&self) -> CircuitBreakerStatus {
+        self.status
+    }
+
+    pub const fn reason(&self) -> CircuitBreakerReason {
+        self.reason
+    }
+
+    pub const fn triggered_at_ms(&self) -> Option<i64> {
+        self.triggered_at_ms
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+impl CircuitBreakerState {
+    pub fn durable_snapshot_v1(&self) -> CircuitBreakerSnapshotV1 {
+        CircuitBreakerSnapshotV1 {
+            schema_version: CIRCUIT_BREAKER_SNAPSHOT_SCHEMA_VERSION_V1.to_owned(),
+            recovery_epoch: self.recovery_epoch,
+            status: self.status,
+            reason: self.reason,
+            triggered_at_ms: self.triggered_at_ms,
+            triggered_by: self.triggered_by.clone(),
+            last_incident_fingerprint: self.last_incident_fingerprint.clone(),
+            incident_evidence_cleared_at_ms: self.incident_evidence_cleared_at_ms,
+            half_opened_at_ms: self.half_opened_at_ms,
+            half_open_daily_loss_baseline_bps: self.half_open_daily_loss_baseline_bps,
+            half_open_drawdown_baseline_bps: self.half_open_drawdown_baseline_bps,
+            reset_at_ms: self.reset_at_ms,
+            reset_by: self.reset_by.clone(),
+            blocked_intent_count: self.blocked_intent_count,
+        }
+    }
+}
+
+/// Restores a complete durable snapshot, returning a fail-closed outcome for
+/// every missing, malformed, unsupported, or semantically invalid input.
+pub fn restore_circuit_breaker_snapshot(
+    snapshot_json: Option<&str>,
+    server_now_ms: i64,
+) -> CircuitBreakerOutcome {
+    if server_now_ms < 0 {
+        return fail_closed_circuit_breaker_restore(
+            CircuitBreakerRestoreFailure::InvalidServerTime { server_now_ms },
+            server_now_ms,
+        );
+    }
+
+    let Some(snapshot_json) = snapshot_json else {
+        return fail_closed_circuit_breaker_restore(
+            CircuitBreakerRestoreFailure::MissingSnapshot,
+            server_now_ms,
+        );
+    };
+    let snapshot: CircuitBreakerSnapshotV1 = match serde_json::from_str(snapshot_json) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return fail_closed_circuit_breaker_restore(
+                CircuitBreakerRestoreFailure::CorruptPayload,
+                server_now_ms,
+            )
+        }
+    };
+
+    restore_circuit_breaker_snapshot_v1(snapshot, server_now_ms)
+}
+
+pub fn restore_circuit_breaker_snapshot_v1(
+    snapshot: CircuitBreakerSnapshotV1,
+    server_now_ms: i64,
+) -> CircuitBreakerOutcome {
+    if server_now_ms < 0 {
+        return fail_closed_circuit_breaker_restore(
+            CircuitBreakerRestoreFailure::InvalidServerTime { server_now_ms },
+            server_now_ms,
+        );
+    }
+    if snapshot.schema_version != CIRCUIT_BREAKER_SNAPSHOT_SCHEMA_VERSION_V1 {
+        return fail_closed_circuit_breaker_restore(
+            CircuitBreakerRestoreFailure::UnsupportedSchemaVersion {
+                found: snapshot.schema_version,
+            },
+            server_now_ms,
+        );
+    }
+
+    let state = CircuitBreakerState {
+        recovery_epoch: snapshot.recovery_epoch,
+        status: snapshot.status,
+        reason: snapshot.reason,
+        triggered_at_ms: snapshot.triggered_at_ms,
+        triggered_by: snapshot.triggered_by,
+        last_incident_fingerprint: snapshot.last_incident_fingerprint,
+        incident_evidence_cleared_at_ms: snapshot.incident_evidence_cleared_at_ms,
+        half_opened_at_ms: snapshot.half_opened_at_ms,
+        half_open_daily_loss_baseline_bps: snapshot.half_open_daily_loss_baseline_bps,
+        half_open_drawdown_baseline_bps: snapshot.half_open_drawdown_baseline_bps,
+        reset_at_ms: snapshot.reset_at_ms,
+        reset_by: snapshot.reset_by,
+        blocked_intent_count: snapshot.blocked_intent_count,
+    };
+
+    if let Err(failure) = validate_restored_state(&state, server_now_ms) {
+        return fail_closed_circuit_breaker_restore(failure, server_now_ms);
+    }
+
+    CircuitBreakerOutcome::unchanged(&state)
+}
+
+/// Constructs the only allowed runtime fallback for a failed durable restore.
+pub fn fail_closed_circuit_breaker_restore(
+    failure: CircuitBreakerRestoreFailure,
+    server_now_ms: i64,
+) -> CircuitBreakerOutcome {
+    safety_fallback(
+        &CircuitBreakerState::new(),
+        server_now_ms,
+        CircuitBreakerError::DurableRestoreFailed { failure },
+    )
+}
+
+fn validate_restored_state(
+    state: &CircuitBreakerState,
+    server_now_ms: i64,
+) -> Result<(), CircuitBreakerRestoreFailure> {
+    let invalid = |invariant| CircuitBreakerRestoreFailure::InvalidSnapshot { invariant };
+
+    if state.recovery_epoch == u64::MAX {
+        return Err(invalid(
+            CircuitBreakerSnapshotInvariant::RecoveryEpochExhausted,
+        ));
+    }
+
+    for (field, timestamp) in [
+        (
+            CircuitBreakerSnapshotTimestamp::TriggeredAt,
+            state.triggered_at_ms,
+        ),
+        (
+            CircuitBreakerSnapshotTimestamp::IncidentEvidenceClearedAt,
+            state.incident_evidence_cleared_at_ms,
+        ),
+        (
+            CircuitBreakerSnapshotTimestamp::HalfOpenedAt,
+            state.half_opened_at_ms,
+        ),
+        (CircuitBreakerSnapshotTimestamp::ResetAt, state.reset_at_ms),
+    ] {
+        if let Some(timestamp_ms) = timestamp {
+            if timestamp_ms < 0 {
+                return Err(invalid(CircuitBreakerSnapshotInvariant::TimestampNegative));
+            }
+            if timestamp_ms > server_now_ms {
+                return Err(CircuitBreakerRestoreFailure::SnapshotTimestampInFuture {
+                    field,
+                    timestamp_ms,
+                    server_now_ms,
+                });
+            }
+        }
+    }
+
+    if state.triggered_at_ms.is_some() != state.triggered_by.is_some() {
+        return Err(invalid(
+            CircuitBreakerSnapshotInvariant::IncidentStateMissingTrigger,
+        ));
+    }
+    if state.recovery_epoch == 0 && state.triggered_at_ms.is_some() {
+        return Err(invalid(
+            CircuitBreakerSnapshotInvariant::TriggerPresentWithoutRecoveryEpoch,
+        ));
+    }
+    if state.recovery_epoch > 0 && state.triggered_at_ms.is_none() {
+        return Err(invalid(
+            CircuitBreakerSnapshotInvariant::IncidentStateMissingTrigger,
+        ));
+    }
+
+    let is_closed = state.status == CircuitBreakerStatus::Closed;
+    if is_closed != (state.reason == CircuitBreakerReason::Ok) {
+        return Err(invalid(
+            CircuitBreakerSnapshotInvariant::StatusReasonMismatch,
+        ));
+    }
+
+    let reset_pair_present = state.reset_at_ms.is_some() && state.reset_by.is_some();
+    if state.reset_at_ms.is_some() != state.reset_by.is_some() {
+        return Err(invalid(
+            CircuitBreakerSnapshotInvariant::ResetIdentityIncomplete,
+        ));
+    }
+    if state
+        .reset_by
+        .as_deref()
+        .is_some_and(|reset_by| reset_by.trim().is_empty())
+    {
+        return Err(invalid(CircuitBreakerSnapshotInvariant::ResetByBlank));
+    }
+
+    let half_open_fields = [
+        state.half_opened_at_ms.is_some(),
+        state.half_open_daily_loss_baseline_bps.is_some(),
+        state.half_open_drawdown_baseline_bps.is_some(),
+    ];
+    match state.status {
+        CircuitBreakerStatus::Closed => {
+            if half_open_fields.into_iter().any(|present| present) {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::HalfOpenRecoveryDataOutsideHalfOpen,
+                ));
+            }
+            if state.recovery_epoch == 0 {
+                if state.triggered_at_ms.is_some()
+                    || state.last_incident_fingerprint.is_some()
+                    || state.incident_evidence_cleared_at_ms.is_some()
+                    || reset_pair_present
+                {
+                    return Err(invalid(
+                        CircuitBreakerSnapshotInvariant::InitialStateHasIncidentData,
+                    ));
+                }
+            } else if !reset_pair_present {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::ClosedStateMissingResetData,
+                ));
+            }
+        }
+        CircuitBreakerStatus::Open => {
+            if reset_pair_present {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::ActiveStateHasResetData,
+                ));
+            }
+            if half_open_fields.into_iter().any(|present| present) {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::HalfOpenRecoveryDataOutsideHalfOpen,
+                ));
+            }
+        }
+        CircuitBreakerStatus::HalfOpen => {
+            if reset_pair_present {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::ActiveStateHasResetData,
+                ));
+            }
+            if half_open_fields.into_iter().any(|present| !present) {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::HalfOpenRecoveryDataIncomplete,
+                ));
+            }
+        }
+    }
+
+    if state.last_incident_fingerprint.is_some() && state.incident_evidence_cleared_at_ms.is_some()
+    {
+        return Err(invalid(
+            CircuitBreakerSnapshotInvariant::FingerprintAndEvidenceClearedCoexist,
+        ));
+    }
+    if state.status.is_active()
+        && state.last_incident_fingerprint.is_none()
+        && state.incident_evidence_cleared_at_ms.is_none()
+    {
+        return Err(invalid(
+            CircuitBreakerSnapshotInvariant::ActiveStateMissingFingerprintOrClearEvidence,
+        ));
+    }
+
+    if let Some(CircuitBreakerTriggerSource::Operator(operator_id)) = &state.triggered_by {
+        if operator_id.trim().is_empty() {
+            return Err(invalid(CircuitBreakerSnapshotInvariant::TriggerSourceBlank));
+        }
+    }
+
+    if let Some(fingerprint) = &state.last_incident_fingerprint {
+        if fingerprint.0.is_empty() {
+            return Err(invalid(CircuitBreakerSnapshotInvariant::FingerprintEmpty));
+        }
+        for (index, evidence) in fingerprint.0.iter().enumerate() {
+            if fingerprint.0[..index].contains(evidence) {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::FingerprintDuplicateEvidence,
+                ));
+            }
+            if incident_evidence_has_blank_text(evidence) {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::FingerprintTextBlank,
+                ));
+            }
+        }
+        if state.status.is_active() {
+            let primary = &fingerprint.0[0];
+            if incident_evidence_reason(primary) != state.reason {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::FingerprintPrimaryReasonMismatch,
+                ));
+            }
+            if state.triggered_by.as_ref() != Some(&incident_evidence_source(primary)) {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::FingerprintPrimarySourceMismatch,
+                ));
+            }
+        }
+    }
+
+    if let Some(triggered_at_ms) = state.triggered_at_ms {
+        for later in [
+            state.incident_evidence_cleared_at_ms,
+            state.half_opened_at_ms,
+            state.reset_at_ms,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if later < triggered_at_ms {
+                return Err(invalid(
+                    CircuitBreakerSnapshotInvariant::TimestampOrderInvalid,
+                ));
+            }
+        }
+    }
+    if let (Some(cleared_at_ms), Some(half_opened_at_ms)) = (
+        state.incident_evidence_cleared_at_ms,
+        state.half_opened_at_ms,
+    ) {
+        if half_opened_at_ms < cleared_at_ms {
+            return Err(invalid(
+                CircuitBreakerSnapshotInvariant::TimestampOrderInvalid,
+            ));
+        }
+    }
+    if let (Some(cleared_at_ms), Some(reset_at_ms)) =
+        (state.incident_evidence_cleared_at_ms, state.reset_at_ms)
+    {
+        if reset_at_ms < cleared_at_ms {
+            return Err(invalid(
+                CircuitBreakerSnapshotInvariant::TimestampOrderInvalid,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn incident_evidence_reason(evidence: &CircuitBreakerIncidentEvidence) -> CircuitBreakerReason {
+    match evidence {
+        CircuitBreakerIncidentEvidence::DailyRealizedLoss { .. }
+        | CircuitBreakerIncidentEvidence::DailyRealizedLossWorsened { .. } => {
+            CircuitBreakerReason::DailyRealizedLossLimit
+        }
+        CircuitBreakerIncidentEvidence::EquityDrawdown { .. }
+        | CircuitBreakerIncidentEvidence::EquityDrawdownWorsened { .. } => {
+            CircuitBreakerReason::EquityDrawdownLimit
+        }
+        CircuitBreakerIncidentEvidence::ConsecutiveBrokerRejections { .. } => {
+            CircuitBreakerReason::ConsecutiveBrokerRejections
+        }
+        CircuitBreakerIncidentEvidence::ConsecutiveCommandFailures { .. } => {
+            CircuitBreakerReason::ConsecutiveCommandFailures
+        }
+        CircuitBreakerIncidentEvidence::ManualReconciliationRequired { .. } => {
+            CircuitBreakerReason::ManualReconciliationRequired
+        }
+        CircuitBreakerIncidentEvidence::StoreRecoveryReconciliationPending => {
+            CircuitBreakerReason::StoreRecoveryReconciliationPending
+        }
+        CircuitBreakerIncidentEvidence::TimeSyncUnhealthy { .. } => {
+            CircuitBreakerReason::TimeSyncUnhealthy
+        }
+        CircuitBreakerIncidentEvidence::SnapshotStale { .. } => CircuitBreakerReason::SnapshotStale,
+        CircuitBreakerIncidentEvidence::SymbolMetadataStale { .. } => {
+            CircuitBreakerReason::SymbolMetadataStale
+        }
+        CircuitBreakerIncidentEvidence::ManualTrigger { .. } => CircuitBreakerReason::ManualTrigger,
+        CircuitBreakerIncidentEvidence::HardRiskViolationDuringRecovery => {
+            CircuitBreakerReason::HardRiskViolationDuringRecovery
+        }
+        CircuitBreakerIncidentEvidence::SafetyInvariantViolation
+        | CircuitBreakerIncidentEvidence::SafetyInvariantError(_) => {
+            CircuitBreakerReason::SafetyInvariantViolation
+        }
+    }
+}
+
+fn incident_evidence_source(
+    evidence: &CircuitBreakerIncidentEvidence,
+) -> CircuitBreakerTriggerSource {
+    match evidence {
+        CircuitBreakerIncidentEvidence::DailyRealizedLoss { .. }
+        | CircuitBreakerIncidentEvidence::DailyRealizedLossWorsened { .. }
+        | CircuitBreakerIncidentEvidence::EquityDrawdown { .. }
+        | CircuitBreakerIncidentEvidence::EquityDrawdownWorsened { .. } => {
+            CircuitBreakerTriggerSource::RiskTelemetry
+        }
+        CircuitBreakerIncidentEvidence::ConsecutiveBrokerRejections { .. } => {
+            CircuitBreakerTriggerSource::Broker
+        }
+        CircuitBreakerIncidentEvidence::ConsecutiveCommandFailures { .. }
+        | CircuitBreakerIncidentEvidence::HardRiskViolationDuringRecovery => {
+            CircuitBreakerTriggerSource::Execution
+        }
+        CircuitBreakerIncidentEvidence::ManualReconciliationRequired { .. } => {
+            CircuitBreakerTriggerSource::Reconciliation
+        }
+        CircuitBreakerIncidentEvidence::StoreRecoveryReconciliationPending => {
+            CircuitBreakerTriggerSource::StoreRecovery
+        }
+        CircuitBreakerIncidentEvidence::TimeSyncUnhealthy { .. } => {
+            CircuitBreakerTriggerSource::Clock
+        }
+        CircuitBreakerIncidentEvidence::SnapshotStale { .. }
+        | CircuitBreakerIncidentEvidence::SymbolMetadataStale { .. } => {
+            CircuitBreakerTriggerSource::SnapshotHealth
+        }
+        CircuitBreakerIncidentEvidence::ManualTrigger { operator_id, .. } => {
+            CircuitBreakerTriggerSource::Operator(operator_id.clone())
+        }
+        CircuitBreakerIncidentEvidence::SafetyInvariantViolation
+        | CircuitBreakerIncidentEvidence::SafetyInvariantError(_) => {
+            CircuitBreakerTriggerSource::SafetyInvariant
+        }
+    }
+}
+
+fn incident_evidence_has_blank_text(evidence: &CircuitBreakerIncidentEvidence) -> bool {
+    match evidence {
+        CircuitBreakerIncidentEvidence::ManualTrigger {
+            operator_id,
+            reason,
+        } => operator_id.trim().is_empty() || reason.trim().is_empty(),
+        CircuitBreakerIncidentEvidence::SafetyInvariantError(error) => {
+            error_fingerprint_has_blank_text(error)
+        }
+        _ => false,
+    }
+}
+
+fn error_fingerprint_has_blank_text(error: &CircuitBreakerErrorFingerprint) -> bool {
+    match error {
+        CircuitBreakerErrorFingerprint::InvalidPolicy { field, requirement }
+        | CircuitBreakerErrorFingerprint::InvalidInput { field, requirement } => {
+            field.trim().is_empty() || requirement.trim().is_empty()
+        }
+        CircuitBreakerErrorFingerprint::ManualResetEvidenceMissing { field } => {
+            field.trim().is_empty()
+        }
+        _ => false,
+    }
+}
 
 /// Audit payload that must be persisted atomically with a manual close.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -904,6 +1585,15 @@ fn enter_half_open(
             )
         }
     };
+    if readiness.recovery_epoch != state.recovery_epoch {
+        return CircuitBreakerOutcome::with_error(
+            state,
+            CircuitBreakerError::RecoveryEpochMismatch {
+                expected: state.recovery_epoch,
+                observed: readiness.recovery_epoch,
+            },
+        );
+    }
     let missing = match missing_half_open_prerequisites(readiness, triggered_at_ms, server_now_ms) {
         Ok(missing) => missing,
         Err(error) => return safety_fallback(state, server_now_ms, error),
@@ -1311,10 +2001,14 @@ fn open(
     server_now_ms: i64,
     reopened: bool,
 ) -> CircuitBreakerOutcome {
+    let Some(recovery_epoch) = state.recovery_epoch.checked_add(1) else {
+        return recovery_epoch_overflow(state, server_now_ms);
+    };
     let primary = violations
         .first()
         .expect("open requires at least one violation");
     let mut next = state.clone();
+    next.recovery_epoch = recovery_epoch;
     next.status = CircuitBreakerStatus::Open;
     next.reason = primary.reason();
     next.triggered_at_ms = Some(server_now_ms);
@@ -1340,6 +2034,41 @@ fn open(
     }
 }
 
+fn recovery_epoch_overflow(
+    state: &CircuitBreakerState,
+    server_now_ms: i64,
+) -> CircuitBreakerOutcome {
+    let error = CircuitBreakerError::RecoveryEpochOverflow;
+    let fingerprint = CircuitBreakerIncidentFingerprint(vec![
+        CircuitBreakerIncidentEvidence::SafetyInvariantError((&error).into()),
+    ]);
+    let fallback_at_ms = state
+        .latest_transition_at_ms()
+        .map_or(server_now_ms.max(0), |latest| {
+            latest.max(server_now_ms.max(0))
+        });
+    let mut next = state.clone();
+    next.status = CircuitBreakerStatus::Open;
+    next.reason = CircuitBreakerReason::SafetyInvariantViolation;
+    next.triggered_at_ms = Some(fallback_at_ms);
+    next.triggered_by = Some(CircuitBreakerTriggerSource::SafetyInvariant);
+    next.last_incident_fingerprint = Some(fingerprint);
+    next.incident_evidence_cleared_at_ms = None;
+    next.half_opened_at_ms = None;
+    next.half_open_daily_loss_baseline_bps = None;
+    next.half_open_drawdown_baseline_bps = None;
+    next.reset_at_ms = None;
+    next.reset_by = None;
+
+    CircuitBreakerOutcome {
+        state: next,
+        transition: CircuitBreakerTransition::SafetyFallbackOpened,
+        violations: vec![CircuitBreakerViolation::SafetyInvariantViolation],
+        error: Some(error),
+        manual_reset_audit: None,
+    }
+}
+
 fn safety_fallback(
     state: &CircuitBreakerState,
     server_now_ms: i64,
@@ -1347,7 +2076,7 @@ fn safety_fallback(
 ) -> CircuitBreakerOutcome {
     let violations = vec![CircuitBreakerViolation::SafetyInvariantViolation];
     let fingerprint = CircuitBreakerIncidentFingerprint(vec![
-        CircuitBreakerIncidentEvidence::SafetyInvariantError(error.clone()),
+        CircuitBreakerIncidentEvidence::SafetyInvariantError((&error).into()),
     ]);
     let fallback_at_ms = state
         .latest_transition_at_ms()
@@ -1357,6 +2086,12 @@ fn safety_fallback(
     if state.status == CircuitBreakerStatus::Open {
         if state.last_incident_fingerprint.as_ref() != Some(&fingerprint) {
             let mut outcome = open(state, violations, fingerprint, fallback_at_ms, true);
+            if matches!(
+                outcome.error,
+                Some(CircuitBreakerError::RecoveryEpochOverflow)
+            ) {
+                return outcome;
+            }
             outcome.transition = CircuitBreakerTransition::SafetyFallbackOpened;
             outcome.error = Some(error);
             return outcome;
@@ -1377,6 +2112,12 @@ fn safety_fallback(
         fallback_at_ms,
         state.status == CircuitBreakerStatus::HalfOpen,
     );
+    if matches!(
+        outcome.error,
+        Some(CircuitBreakerError::RecoveryEpochOverflow)
+    ) {
+        return outcome;
+    }
     outcome.transition = CircuitBreakerTransition::SafetyFallbackOpened;
     outcome.error = Some(error);
     outcome
@@ -1410,14 +2151,19 @@ mod tests {
         }
     }
 
-    fn readiness_at(completed_at_ms: i64) -> HalfOpenReadiness {
+    fn readiness_at_epoch(completed_at_ms: i64, recovery_epoch: u64) -> HalfOpenReadiness {
         HalfOpenReadiness {
+            recovery_epoch,
             account_refreshed_at_ms: Some(completed_at_ms),
             positions_refreshed_at_ms: Some(completed_at_ms),
             orders_refreshed_at_ms: Some(completed_at_ms),
             symbol_metadata_refreshed_at_ms: Some(completed_at_ms),
             pending_commands_reconciled_at_ms: Some(completed_at_ms),
         }
+    }
+
+    fn readiness_at(completed_at_ms: i64) -> HalfOpenReadiness {
+        readiness_at_epoch(completed_at_ms, 1)
     }
 
     fn readiness() -> HalfOpenReadiness {
@@ -1461,7 +2207,7 @@ mod tests {
             &policy(),
             &observed.state,
             &TransitionRequest::EnterHalfOpen {
-                readiness: readiness_at(NOW + 50),
+                readiness: readiness_at_epoch(NOW + 50, observed.state.recovery_epoch()),
                 input,
             },
             NOW + 100,
@@ -1831,11 +2577,13 @@ mod tests {
         );
 
         assert_eq!(recovery.state.status(), CircuitBreakerStatus::Open);
-        assert!(matches!(
+        assert_eq!(
             recovery.error,
-            Some(CircuitBreakerError::RecoveryPrerequisitesMissing(ref missing))
-                if missing.len() == 5
-        ));
+            Some(CircuitBreakerError::RecoveryEpochMismatch {
+                expected: 2,
+                observed: 1,
+            })
+        );
     }
 
     #[test]
@@ -1994,11 +2742,13 @@ mod tests {
             NOW + 300,
         );
         assert_eq!(recovery.state.status(), CircuitBreakerStatus::Open);
-        assert!(matches!(
+        assert_eq!(
             recovery.error,
-            Some(CircuitBreakerError::RecoveryPrerequisitesMissing(ref missing))
-                if missing.len() == 5
-        ));
+            Some(CircuitBreakerError::RecoveryEpochMismatch {
+                expected: 2,
+                observed: 1,
+            })
+        );
     }
 
     #[test]
@@ -2066,17 +2816,19 @@ mod tests {
                 },
                 NOW + 300,
             );
-            assert!(matches!(
+            assert_eq!(
                 stale_recovery.error,
-                Some(CircuitBreakerError::RecoveryPrerequisitesMissing(ref missing))
-                    if missing.len() == 5
-            ));
+                Some(CircuitBreakerError::RecoveryEpochMismatch {
+                    expected: 2,
+                    observed: 1,
+                })
+            );
 
             let refreshed_recovery = transition(
                 &policy(),
                 &stale_recovery.state,
                 &TransitionRequest::EnterHalfOpen {
-                    readiness: readiness_at(NOW + 200),
+                    readiness: readiness_at_epoch(NOW + 200, 2),
                     input: changed_financial_evidence,
                 },
                 NOW + 301,
@@ -2098,7 +2850,10 @@ mod tests {
             &policy(),
             &open,
             &TransitionRequest::EnterHalfOpen {
-                readiness: HalfOpenReadiness::default(),
+                readiness: HalfOpenReadiness {
+                    recovery_epoch: open.recovery_epoch(),
+                    ..HalfOpenReadiness::default()
+                },
                 input: CircuitBreakerInput {
                     daily_realized_loss_bps: 300,
                     ..healthy_input()
@@ -2134,7 +2889,7 @@ mod tests {
             &policy(),
             &still_unhealthy.state,
             &TransitionRequest::EnterHalfOpen {
-                readiness: readiness(),
+                readiness: readiness_at_epoch(NOW, still_unhealthy.state.recovery_epoch()),
                 input: CircuitBreakerInput {
                     manual_reconciliation_required_count: 1,
                     ..healthy_input()
@@ -2557,5 +3312,262 @@ mod tests {
             outcome.error,
             Some(CircuitBreakerError::ServerTimeRegressed { .. })
         ));
+    }
+
+    #[test]
+    fn different_incident_in_same_server_millisecond_advances_epoch() {
+        let first = transition(
+            &policy(),
+            &CircuitBreakerState::new(),
+            &TransitionRequest::Observe(CircuitBreakerInput {
+                consecutive_command_failures: 2,
+                ..healthy_input()
+            }),
+            NOW,
+        );
+        let second = transition(
+            &policy(),
+            &first.state,
+            &TransitionRequest::Observe(CircuitBreakerInput {
+                consecutive_broker_rejections: 3,
+                ..healthy_input()
+            }),
+            NOW,
+        );
+
+        assert_eq!(first.state.recovery_epoch(), 1);
+        assert_eq!(second.state.recovery_epoch(), 2);
+        assert_eq!(second.state.triggered_at_ms(), Some(NOW));
+        assert_eq!(second.transition, CircuitBreakerTransition::Reopened);
+
+        let stale_readiness = transition(
+            &policy(),
+            &second.state,
+            &TransitionRequest::EnterHalfOpen {
+                readiness: readiness_at_epoch(NOW, first.state.recovery_epoch()),
+                input: healthy_input(),
+            },
+            NOW,
+        );
+        assert_eq!(
+            stale_readiness.error,
+            Some(CircuitBreakerError::RecoveryEpochMismatch {
+                expected: 2,
+                observed: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn complete_open_half_open_and_closed_snapshots_round_trip() {
+        let open = opened(CircuitBreakerInput {
+            consecutive_command_failures: 2,
+            ..healthy_input()
+        });
+        let open = transition(
+            &policy(),
+            &open,
+            &TransitionRequest::RecordBlockedIntentCount { observed_total: 7 },
+            NOW,
+        )
+        .state;
+        let half_open = transition(
+            &policy(),
+            &open,
+            &TransitionRequest::EnterHalfOpen {
+                readiness: readiness_at_epoch(NOW, open.recovery_epoch()),
+                input: healthy_input(),
+            },
+            NOW + 100,
+        )
+        .state;
+        let closed = transition(
+            &policy(),
+            &half_open,
+            &TransitionRequest::Close {
+                health: RecoveryHealth {
+                    clock_healthy: true,
+                    state_store_healthy: true,
+                    new_hard_risk_violation: false,
+                    input: healthy_input(),
+                },
+                authorization: manual_reset(),
+            },
+            NOW + 1_100,
+        )
+        .state;
+
+        for (state, expected_status) in
+            [(open, "OPEN"), (half_open, "HALF_OPEN"), (closed, "CLOSED")]
+        {
+            let snapshot = state.durable_snapshot_v1();
+            let json = snapshot.to_json().expect("snapshot should serialize");
+            let value: serde_json::Value =
+                serde_json::from_str(&json).expect("snapshot should be JSON");
+            assert_eq!(
+                value
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_str),
+                Some(CIRCUIT_BREAKER_SNAPSHOT_SCHEMA_VERSION_V1)
+            );
+            assert_eq!(
+                value.get("status").and_then(serde_json::Value::as_str),
+                Some(expected_status)
+            );
+            assert_eq!(
+                value
+                    .get("recovery_epoch")
+                    .and_then(serde_json::Value::as_u64),
+                Some(state.recovery_epoch())
+            );
+
+            let restored = restore_circuit_breaker_snapshot(Some(&json), NOW + 2_000);
+            assert_eq!(restored.transition, CircuitBreakerTransition::NoChange);
+            assert!(restored.error.is_none());
+            assert_eq!(restored.state, state);
+        }
+    }
+
+    #[test]
+    fn restore_failures_are_specific_and_always_open() {
+        let open = opened(CircuitBreakerInput {
+            consecutive_command_failures: 2,
+            ..healthy_input()
+        });
+        let valid_json = open
+            .durable_snapshot_v1()
+            .to_json()
+            .expect("snapshot should serialize");
+
+        let mut unknown_version: serde_json::Value =
+            serde_json::from_str(&valid_json).expect("snapshot should be JSON");
+        unknown_version["schema_version"] = serde_json::json!("circuit-breaker-state.v2");
+
+        let mut future: serde_json::Value =
+            serde_json::from_str(&valid_json).expect("snapshot should be JSON");
+        future["triggered_at_ms"] = serde_json::json!(NOW + 1);
+
+        let mut invalid_semantics: serde_json::Value =
+            serde_json::from_str(&valid_json).expect("snapshot should be JSON");
+        invalid_semantics["status"] = serde_json::json!("CLOSED");
+
+        let mut unknown_field: serde_json::Value =
+            serde_json::from_str(&valid_json).expect("snapshot should be JSON");
+        unknown_field["unexpected"] = serde_json::json!(true);
+
+        let cases = [
+            (
+                restore_circuit_breaker_snapshot(None, NOW),
+                CircuitBreakerRestoreFailure::MissingSnapshot,
+            ),
+            (
+                restore_circuit_breaker_snapshot(Some("{"), NOW),
+                CircuitBreakerRestoreFailure::CorruptPayload,
+            ),
+            (
+                restore_circuit_breaker_snapshot(
+                    Some(
+                        &serde_json::to_string(&unknown_field)
+                            .expect("unknown-field fixture should serialize"),
+                    ),
+                    NOW,
+                ),
+                CircuitBreakerRestoreFailure::CorruptPayload,
+            ),
+            (
+                restore_circuit_breaker_snapshot(
+                    Some(
+                        &serde_json::to_string(&unknown_version)
+                            .expect("unknown-version fixture should serialize"),
+                    ),
+                    NOW,
+                ),
+                CircuitBreakerRestoreFailure::UnsupportedSchemaVersion {
+                    found: "circuit-breaker-state.v2".to_owned(),
+                },
+            ),
+            (
+                restore_circuit_breaker_snapshot(
+                    Some(
+                        &serde_json::to_string(&future)
+                            .expect("future timestamp fixture should serialize"),
+                    ),
+                    NOW,
+                ),
+                CircuitBreakerRestoreFailure::SnapshotTimestampInFuture {
+                    field: CircuitBreakerSnapshotTimestamp::TriggeredAt,
+                    timestamp_ms: NOW + 1,
+                    server_now_ms: NOW,
+                },
+            ),
+            (
+                restore_circuit_breaker_snapshot(
+                    Some(
+                        &serde_json::to_string(&invalid_semantics)
+                            .expect("invalid semantic fixture should serialize"),
+                    ),
+                    NOW,
+                ),
+                CircuitBreakerRestoreFailure::InvalidSnapshot {
+                    invariant: CircuitBreakerSnapshotInvariant::StatusReasonMismatch,
+                },
+            ),
+        ];
+
+        for (outcome, expected_failure) in cases {
+            assert_eq!(outcome.state.status(), CircuitBreakerStatus::Open);
+            assert_eq!(
+                outcome.state.reason(),
+                CircuitBreakerReason::SafetyInvariantViolation
+            );
+            assert_eq!(outcome.state.recovery_epoch(), 1);
+            assert_eq!(
+                outcome.transition,
+                CircuitBreakerTransition::SafetyFallbackOpened
+            );
+            assert_eq!(
+                outcome.error,
+                Some(CircuitBreakerError::DurableRestoreFailed {
+                    failure: expected_failure.clone(),
+                })
+            );
+            assert!(matches!(
+                outcome.state.last_incident_fingerprint.as_ref().map(|value| value.0.as_slice()),
+                Some([CircuitBreakerIncidentEvidence::SafetyInvariantError(
+                    CircuitBreakerErrorFingerprint::DurableRestoreFailed { failure }
+                )]) if failure == &expected_failure
+            ));
+        }
+    }
+
+    #[test]
+    fn restored_safety_error_fingerprint_preserves_idempotency() {
+        let bad_policy = CircuitBreakerPolicy {
+            max_daily_realized_loss_bps: 0,
+            ..policy()
+        };
+        let first = transition(
+            &bad_policy,
+            &CircuitBreakerState::new(),
+            &TransitionRequest::Observe(healthy_input()),
+            NOW,
+        );
+        let json = first
+            .state
+            .durable_snapshot_v1()
+            .to_json()
+            .expect("snapshot should serialize");
+        let restored = restore_circuit_breaker_snapshot(Some(&json), NOW + 1);
+        let repeated = transition(
+            &bad_policy,
+            &restored.state,
+            &TransitionRequest::Observe(healthy_input()),
+            NOW + 1,
+        );
+
+        assert!(restored.error.is_none());
+        assert_eq!(repeated.transition, CircuitBreakerTransition::NoChange);
+        assert_eq!(repeated.state.recovery_epoch(), 1);
+        assert_eq!(repeated.state, restored.state);
     }
 }
