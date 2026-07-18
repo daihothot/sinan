@@ -867,7 +867,63 @@ impl ExecutionPlan {
                 )
             },
         )?;
+        let expected_status = derive_execution_plan_status(&self.legs);
+        if self.state.status != expected_status {
+            return Err(ExecutionPlanValidationError::new(
+                "status",
+                format!(
+                    "must be {} for the current leg projections",
+                    expected_status.as_str()
+                ),
+            ));
+        }
         Ok(())
+    }
+}
+
+/// Derives the documented plan projection from already-projected leg states.
+pub fn derive_execution_plan_status(legs: &[ExecutionLeg]) -> ExecutionPlanStatus {
+    if legs.is_empty() {
+        return ExecutionPlanStatus::Pending;
+    }
+    let all = |status| legs.iter().all(|leg| leg.state.status == status);
+    let any = |predicate: fn(ExecutionLegStatus) -> bool| {
+        legs.iter().any(|leg| predicate(leg.state.status))
+    };
+    let all_terminal = legs.iter().all(|leg| {
+        matches!(
+            leg.state.status,
+            ExecutionLegStatus::Rejected
+                | ExecutionLegStatus::Filled
+                | ExecutionLegStatus::Failed
+                | ExecutionLegStatus::Expired
+                | ExecutionLegStatus::Cancelled
+        )
+    });
+    let any_filled = any(|status| status == ExecutionLegStatus::Filled);
+    let any_partial = any(|status| status == ExecutionLegStatus::PartiallyFilled);
+
+    if all(ExecutionLegStatus::Filled) {
+        ExecutionPlanStatus::Completed
+    } else if all(ExecutionLegStatus::Cancelled) {
+        ExecutionPlanStatus::Cancelled
+    } else if all(ExecutionLegStatus::Expired) {
+        ExecutionPlanStatus::Expired
+    } else if any(|status| status == ExecutionLegStatus::ManualReconciliationRequired) {
+        ExecutionPlanStatus::ManualReconciliationRequired
+    } else if any_partial || (any_filled && !all(ExecutionLegStatus::Filled)) {
+        ExecutionPlanStatus::Partial
+    } else if all_terminal {
+        ExecutionPlanStatus::Failed
+    } else if any(|status| {
+        matches!(
+            status,
+            ExecutionLegStatus::DeliveryUnconfirmed | ExecutionLegStatus::Reconciling
+        )
+    }) {
+        ExecutionPlanStatus::Reconciling
+    } else {
+        ExecutionPlanStatus::Pending
     }
 }
 

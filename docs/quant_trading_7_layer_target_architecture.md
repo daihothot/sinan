@@ -1899,7 +1899,9 @@ export interface CircuitBreakerSummary {
 
 `CircuitBreakerReason` 是领域内详细触发原因，例如 daily loss、drawdown、broker failure、store recovery 或 safety invariant；它不同于对外拒绝响应使用的通用 `ErrorCode=RISK_ENGINE_CIRCUIT_BREAKER_TRIGGERED`。`GET /state.risk.circuit_breaker_active` 等价于 `CircuitBreakerSummary.status != "CLOSED"`。推荐同时返回 `circuit_breaker: CircuitBreakerSummary`，避免只有 boolean 无法判断原因。
 
-`sinan-risk` 第三里程碑只提供 pure state transition，不依赖 State Store，也尚未定义可直接反序列化的 durable breaker snapshot。Application integration 必须在启用 live execution 前补充带 schema version 和不变量校验的持久化 / restore adapter，完整恢复 `OPEN / HALF_OPEN`、recovery epoch、具体 incident / safety-error fingerprint、`incident_evidence_cleared_at`、`half_opened_at`、两项 financial baseline 和 blocked count。进程重启、snapshot 缺失或恢复校验失败时必须保持 / 创建 `OPEN` safety state，绝不能以默认 `CLOSED` 启动。该 durable restore 是下一里程碑的硬前置，不得把面向 `GET /state` 的简化 `CircuitBreakerSummary` 当作持久化格式。
+`sinan-risk` 继续只提供 pure state transition，不依赖 State Store；它同时定义带 schema version 和完整不变量校验的 durable snapshot codec。`sinan-store` V0003 使用 append-only revision 持久化完整 `OPEN / HALF_OPEN`、recovery epoch、具体 incident / safety-error fingerprint、`incident_evidence_cleared_at`、`half_opened_at`、两项 financial baseline 和 blocked count，`sinan-core` application adapter 负责启动恢复。
+
+恢复时必须先读取可信的 denormalized head metadata，再解析 payload。snapshot 缺失、损坏或版本未知时，adapter 必须从已知最高 recovery epoch 的下一 epoch 创建新的 `OPEN` safety incident，并以 revision CAS 持久化后才能返回；损坏 payload 不能把 epoch 重置为 1。并发 stale revision 可以有界重读。State Store 不可用或 recovery epoch 溢出时必须向调用方返回可检查的 fail-closed `OPEN` outcome，live flow 不得继续。不得把面向 `GET /state` 的简化 `CircuitBreakerSummary` 当作持久化格式。
 
 ---
 
@@ -1984,6 +1986,8 @@ risk.approved
 Execution Layer 不负责策略判断、LLM / Agent 判断或真实 broker 执行。`execution.command.expires_at` 由 Execution Layer 写入 command payload，但它是从上游有效期和执行约束派生出来的字段，不是 Execution Layer 自己拥有的业务有效期。Execution Layer 拥有拒绝执行的权利和责任，但不得延长上游有效期。
 
 Execution Layer 不拥有 position sizing。对风险增加 leg，缺失 `RiskResult.adjusted_legs`、leg_id 不匹配、审批过期，或已批准 lots 无法在当前 price / SL / metadata / margin 下原样执行时，Execution Layer 必须停止 plan / command 生成并重新进入 Risk Layer，不得本地修正 lots。
+
+当前 Execution 领域与持久化里程碑已经实现 pure builder、typed command state machine、leg / plan projector、recovery decision、V0003 immutable plan / leg journal、原子 workflow commit 和 lifecycle CAS。Workflow commit 在同一 transaction 中写入 TradeIntent、RiskResult、plan / legs、commands 和 pristine command states；任一父图、identity、approved lots 或 payload 漂移都必须冲突并整体回滚。command state 使用 immutable identity + expected status + expected `updated_at` CAS，leg / plan 状态作为一致 bundle CAS，不能暴露部分 projection。Gateway session、wire outbox 和真实投递不属于该已完成范围。
 
 ---
 
@@ -2097,8 +2101,13 @@ Trading Gateway 写 system.event: COMMAND_DELIVERY_TIMEOUT
 Trading Gateway 标记该 session delivery attempt unconfirmed
 Execution Layer 将 command lifecycle state 更新为 DELIVERY_UNCONFIRMED
 Execution Layer 触发 account / position / order reconciliation
-Execution Layer 根据 reconciliation 结果决定 EXPIRED / FAILED / retry / manual_review
+Reconciliation result 评估只返回 Completed / PendingEvidence
+独立的显式 evidence 升级才返回 ManualRequired
+缺少权威 execution evidence 时保持 PendingEvidence，不自动 retry
+只有 typed dispatch / delivery / reconciliation evidence、command.received、ExecutionEvent 或显式时间 / 人工证据可以按 Execution 状态机推进 lifecycle；snapshot / result 不属于这些 evidence
 ```
+
+`reconciliation.result` 及其中的 account / position / order snapshots 只是 broker 状态观测，不是执行事实。即使 snapshot 显示订单已提交、已成交或不存在，也不得单独把 command 推进到 `ORDER_SENT / FILLED / FAILED / EXPIRED`，不得据此创建新的 command 或授权自动 retry。`FAILED` 等 broker 结果由 `ExecutionEvent` 表达；expiry 必须由服务器时间域的显式到期证据按状态机处理；人工状态必须有可审计的显式人工 / 超时证据。
 
 ### 4.4 Execution Client 断开时的 pending command 处理
 
@@ -2127,6 +2136,8 @@ Execution Layer 必须：
 不得在 reconciliation 完成前使用新 command 盲目重试
 ```
 
+Reconciliation 完成也不等于 retry authorization。任何未来的重新投递或新 command 都必须由独立 Execution policy 基于权威 lifecycle evidence、idempotency contract、服务器时间和有效期作出显式决定；当前 Reconciliation 里程碑不实现该决策。
+
 ### 4.5 设计原则
 
 ```text
@@ -2151,7 +2162,8 @@ Execution Layer
   → Execution Client
   → reconciliation.result
   → Trading Gateway
-  → Execution Layer state projection
+  → Reconciliation evaluation + State Store full-set projection
+  → command.received / ExecutionEvent 等权威证据另行进入 Execution state machine
   → WS / Redis fanout to Strategy & Decision Control Plane / UI
 ```
 
@@ -2186,18 +2198,62 @@ export interface ReconciliationResult {
 }
 ```
 
+对账协议的可选字段有严格语义：`command_ids` 缺省表示账户 / route 全量 scope；存在时必须是非空、唯一、稳定排序的 targeted scope。`positions` 和 `orders` 是 `observed_at` 时刻的账户完整集合，数组为空也表示“完整集合为空”，每个元素的 `observed_at` 必须精确等于 result 的 `observed_at`。`account` 缺省表示本次没有 account refresh evidence；`symbol_metadata` 没有声明完整 symbol 范围，因此非空数组本身不能证明 metadata full refresh。
+
 `ReconciliationRequest / ReconciliationResult` 以 23.1 的 payload 定义为权威规格。
+
+Request scope 规则：
+
+```text
+command_ids = None
+  → 目标 account_id + terminal_id/client_id route 内的全量 command scope
+  → 只定义请求范围；不自行证明 application 传给 evaluator 的 command 集合完整
+  → terminal_id 或 client_id 存在时，None 仍只覆盖该 route，不代表账户所有 session
+  → 完整请求范围必须来自同一可信 Store read snapshot，并以 command_scope_complete=true 显式持久化
+  → 只有 terminal_id=None 且 client_id=None 的无路由限制 scope 才有资格推进账户级 pending-command watermark
+
+command_ids = Some([...])
+  → targeted command scope
+  → 数组必须非空、command_id 唯一，并在持久化前按 command_id 稳定排序
+  → Some([]) 非法；不能把它解释成全量 scope
+```
+
+`CONNECTION_RESTORED` 和 `STATE_STORE_RESTORED` 每次都必须创建新的 `request_id` 和独立 reconciliation run。无 route 限制时它们可以覆盖账户级全量 scope；指定 `terminal_id` 或 `client_id` 时只覆盖该 route。两种情况都不能把已经由 `command.received` / `ExecutionEvent` 推进的 command 倒退到 `RECONCILING`，也不能复用旧 run 来覆盖旧证据。
+
+Result snapshot 规则：
+
+```text
+request_id / account_id / terminal_id / client_id 必须与 request route 一致
+observed_at 必须位于 request 之后、Core 接收时间之前的服务器时间域窗口
+positions / orders 表示 observed_at 时刻该账户的完整集合；空数组也是有效完整集合
+每个 position / order 行必须属于 result.account_id，且行 observed_at == result.observed_at
+position_id / broker_order_id 不得在同一 result 中重复
+positions / orders / symbol_metadata / unresolved_command_ids 在持久化前必须按各自业务键稳定排序
+account 可缺省；存在时 account_id / observed_at 必须与 result 一致，缺省时不能推进 account refresh evidence
+每个 symbol_metadata 行的 account_id / observed_at 必须与 result 一致，broker_symbol 不得重复
+symbol_metadata 数组不是已声明范围的完整集合；仅凭非空数组不能推进完整 metadata readiness
+```
 
 规则：
 
 ```text
-Execution Layer owns reconciliation state
+Reconciliation service owns reconciliation run / result evaluation / disposition
+Execution Layer alone owns command lifecycle；Reconciliation 只返回可选 CAS target，持久化 run 不表示 target 已应用
 Gateway only routes reconciliation.request / result
 Execution Client reads broker terminal state and returns snapshots
 reconciliation.result 不是执行事实来源
 如果 result 与 ExecutionEvent 冲突，以 ExecutionEvent 为事实来源，并写 audit.event
-如果 result 缺失，或 unresolved_command_ids 不为空且无法通过后续 snapshot / ExecutionEvent 收敛，相关 command 进入 manual_review 或 MANUAL_RECONCILIATION_REQUIRED
+Completed 只表示该 scope 的投递不确定性已被权威 execution lifecycle evidence 覆盖，且客户端未报告 unresolved、没有既有 manual command finding；它不表示订单 terminal，也不单独证明账户级 command scope 已完整读取
+缺少权威 execution evidence 或 unresolved_command_ids 尚未收敛时保持 PendingEvidence
+客户端报告 unresolved 时，即使 Core 已有权威 command state 也不能自动覆盖该差异，必须保持 PendingEvidence + finding
+本 run 观察到 command 已是 MANUAL_RECONCILIATION_REQUIRED 时先保持 PendingEvidence + finding，不从 result 自动产出 ManualRequired
+ManualRequired 必须由调用方提交带服务器时间和非空 reason 的显式人工 / 超时证据
+result 缺失本身不触发隐式 timer；调用方可以用显式 missing-result evidence 升级 ManualRequired
+durable result commit 只接受 Completed / PendingEvidence；ManualRequired 必须走独立 explicit escalation API
+snapshot / result 不决定 FAILED / EXPIRED，不授权自动 retry
 ```
+
+当前 Reconciliation 里程碑只实现 pure request planning / result evaluation 和 V0004 durable run / checkpoint / full-set projection。它持久化 transport-neutral request，不创建 `WireMessage` 或 `wire_outbox`，不选择 active session，也不实现 Gateway。后续 Gateway outbound adapter 只能绑定 route、写 wire outbox 并报告 delivery outcome，不能拥有上述评估和 lifecycle 决策。
 
 ---
 
@@ -2774,7 +2830,7 @@ export interface OrderSnapshot {
 }
 ```
 
-`OrderSnapshot` 用于 `DELIVERY_UNCONFIRMED`、Saga 恢复和人工 reconciliation。它不是执行事实来源；执行事实仍然来自 `ExecutionEvent`。`OrderSnapshot` 是当前 broker 订单状态的观测快照，用于判断是否需要重试、回滚或人工处理。
+`OrderSnapshot` 用于 `DELIVERY_UNCONFIRMED`、Saga 恢复和人工 reconciliation。它不是执行事实来源；执行事实仍然来自 `ExecutionEvent`。`OrderSnapshot` 只能产生差异 finding、刷新 full-set projection 或要求继续等待 / 人工核对，不能单独授权 retry / rollback，也不能推进 execution lifecycle。
 
 ### 7.12 RiskRequest
 
@@ -2839,7 +2895,7 @@ export interface RiskRequest {
 
 `RiskRequest` 是 Trading Core 内部不可变风控评估对象，不是 Strategy & Decision Control Plane 的外部提交 payload。外部只提交 `TradeIntent`；Trading Core 内可信 assembler 必须通过本地 State Store 的单一一致性读快照组装完整 `RiskRequest`，固定 `risk_id` 和服务器时间域的 `evaluated_at` 后再交给 pure evaluator。Risk Layer 不得在评估过程中补读状态、调用 Compute Service 或依赖网络服务。
 
-`positions` 和 `orders` 必须分别表示目标账户的完整集合；`state_watermarks.positions_observed_at` 和 `orders_observed_at` 是账户级 full-set 水位，即使数组为空也必须存在。每个 position / order 行的 `observed_at` 必须精确等于对应 full-set 水位。`pending_commands_reconciled_at` 证明 command lifecycle 与 broker order 集合已经完成对账；account、position full-set 和 order full-set 证据不得早于该水位，`capacity.observed_at` 不得早于这四项依赖证据中的任一项。逐行 latest observation 不能证明未出现的 position / order 已不存在，因此 assembler 在尚无新鲜且因果一致的 full-set / reconciliation 证据时必须 fail closed。`account`、capacity、所有 position / order / metadata / pending command 以及 `RiskMarketSnapshot.account_id` 必须与 `intent.account_id` 一致。
+`positions` 和 `orders` 必须分别表示目标账户的完整集合；`state_watermarks.positions_observed_at` 和 `orders_observed_at` 是账户级 full-set 水位，即使数组为空也必须存在。每个 position / order 行的 `observed_at` 必须精确等于对应 full-set 水位。`pending_commands_reconciled_at` 证明全账户、所有 session 的 command lifecycle 与 broker order 集合已经完成对账，因此只能由无 `terminal_id / client_id` route 限制且 scope 完整的账户级 reconciliation 推进；account、position full-set 和 order full-set 证据不得早于该水位，`capacity.observed_at` 不得早于这四项依赖证据中的任一项。逐行 latest observation 不能证明未出现的 position / order 已不存在，因此 assembler 在尚无新鲜且因果一致的 full-set / reconciliation 证据时必须 fail closed。`account`、capacity、所有 position / order / metadata / pending command 以及 `RiskMarketSnapshot.account_id` 必须与 `intent.account_id` 一致。
 
 Trading Core 必须在 hard risk 前从 `TradeIntent`、同账户最新 market snapshot 和本地 execution policy 派生 `sizing_candidates`。`worst_entry_price` 必须包含对 spread 和允许滑点的保守估计；pending order 必须使用候选入场价再叠加不利执行 buffer。没有显式 `proposed_legs` 的单腿 BUY / SELL 必须使用稳定合成 ID `leg:{intent_id}:0` 且 ratio 必须为 `1`；多腿必须按唯一 `leg_id` 将 intent leg、candidate、metadata 和 account-scoped market 一一匹配，并同时校验 symbol / action 一致。任一缺失、重复或错配都必须 fail closed。
 
@@ -3296,7 +3352,7 @@ Terminal states:
   REJECTED / FILLED / FAILED / EXPIRED / CANCELLED
 ```
 
-`MANUAL_RECONCILIATION_REQUIRED` 是自动流程阻塞状态，不是执行事实来源。人工处理只能基于 broker 证据和 `ExecutionEvent` / `OrderSnapshot` 恢复投影状态，不能伪造执行事实。
+`MANUAL_RECONCILIATION_REQUIRED` 是自动流程阻塞状态，不是执行事实来源。人工处理可以提交可审计的显式 evidence 维持或解除人工工作流，但 `ORDER_SENT / PARTIALLY_FILLED / FILLED / FAILED` 等 broker 执行状态仍必须由 `ExecutionEvent` 推进；`OrderSnapshot` 单独不能恢复这些投影，也不能伪造执行事实。
 
 Leg 与 Plan 状态不是事实来源，只能由 `ExecutionCommandState` 与 `ExecutionEvent` 投影：
 
@@ -4158,7 +4214,7 @@ Agent 输出不得直接交易；任何由 Agent 影响的 TradeIntent 必须再
 绕过 RiskResult 批准交易
 修改 ExecutionEvent 事实记录
 删除 Redis / spool 中的执行事实
-在 reconciliation 未完成时强制 retry command
+在 reconciliation 前后仅凭 snapshot / result 强制 retry command
 ```
 
 人工处理结果必须写 `audit.event`，并保留 operator、reason、evidence、timestamp。
@@ -4541,7 +4597,8 @@ Reconciliation Engine
   → reconciliation.request
   → reconciliation.result
   → order.snapshot / position.snapshot / account.snapshot / symbol.metadata
-  → update Trading Core execution state or MANUAL_RECONCILIATION_REQUIRED
+  → evaluate Completed / PendingEvidence / ManualRequired
+  → only typed dispatch / delivery / reconciliation evidence, command.received, ExecutionEvent, or explicit time/manual evidence may drive Execution state machine
 ```
 
 ---
@@ -5462,7 +5519,7 @@ CREATE TABLE schema_migrations (
 规则：
 
 ```text
-migration 文件命名：V0001__init.sql、V0002__state_store_schema.sql
+migration 文件命名：V0001__init.sql、V0002__state_store_schema.sql、V0003__execution_durability.sql、V0004__reconciliation_durability.sql
 version 必须单调递增，不允许跳号复用。
 checksum 使用 migration 文件内容 SHA-256 hex。
 启动时必须校验已应用 migration 的 checksum；不一致则拒绝启动。
@@ -5478,13 +5535,20 @@ SQLite PRAGMA user_version 可以同步写入当前最高 migration version，sc
 
 `event_stream_log` 是 bounded summary replay log，不是执行事实来源。单条 entry 插入后禁止 `UPDATE`，但允许 Event Stream Manager 按 retention policy 批量 `DELETE`；删除时 `outbound_spool.event_id` 按外键规则置空。durable execution facts 的保留不受 event cursor window 影响。
 
-Projection rebuild 分为两个有明确 owner 的阶段：
+Projection rebuild 分为有明确 owner 的阶段：
 
 ```text
 state-ingest rebuild（State Store owner）
   → 从 core_events 重放 account / symbol / position / order / market.bar
   → 重建 latest-state tables 与 market_bars
+  → V0004 后公开的 rebuild_ingest_projections 在同一 transaction 中继续执行下述 reconciliation rebuild；返回 report 仍只统计 ingest 阶段，避免 standalone 调用丢失 full-set-only 成员
   → 不重建 tick-only market_snapshots
+
+reconciliation projection rebuild（State Store owner，V0004）
+  → 从 core_events 按 received_at / created_at / event_id 重放 account / symbol / position / order / reconciliation.result
+  → reconciliation.result 使用与在线写入相同的账户级 full-set replacement / watermark 规则
+  → 重建 account / symbol / position / order latest tables、set-membership 和 account checkpoint
+  → 不修改 market tables 或 execution lifecycle tables
 
 execution lifecycle rebuild（Execution owner）
   → 保留 execution_commands、plan definition 和 leg definition
@@ -5494,6 +5558,8 @@ execution lifecycle rebuild（Execution owner）
 ```
 
 `execution_plans` / `execution_legs` 的 definition 和 payload 属于 workflow journal，不通过删除 definition row 来重建；可重建的是其中的 materialized status 以及 `execution_command_states`。definition 缺失或损坏时必须 fail closed，不能从不完整的 execution event 猜测计划结构。
+
+`reconciliation_runs` 的 request definition 也属于 workflow journal，不通过 projection rebuild 删除或重造。可重建的是由 durable `reconciliation.result` facts 派生的 account checkpoint 和 position / order full sets；rebuild 必须保持 empty-set deletion、集合 hash 和旧逐行事实防复活语义。
 
 #### SQLite Status Enum Registry
 
@@ -5535,6 +5601,9 @@ command_delivery_attempts.status
 
 execution_events.status
   → ACCEPTED / ORDER_SENT / REJECTED / FILLED / PARTIALLY_FILLED / FAILED / EXPIRED / CANCELLED
+
+reconciliation_runs.status
+  → REQUESTED / PENDING_EVIDENCE / COMPLETED / MANUAL_RECONCILIATION_REQUIRED
 
 system_events.severity
   → INFO / WARNING / ERROR / CRITICAL
@@ -5816,13 +5885,33 @@ CREATE TABLE execution_events (
 );
 ```
 
+V0003 同时增加全局 Circuit Breaker 的 append-only durable journal：
+
+```sql
+CREATE TABLE circuit_breaker_snapshots (
+  scope TEXT NOT NULL CHECK (scope = 'GLOBAL'),
+  state_revision INTEGER NOT NULL CHECK (state_revision > 0),
+  schema_version TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('CLOSED', 'OPEN', 'HALF_OPEN')),
+  recovery_epoch INTEGER NOT NULL CHECK (recovery_epoch >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+  payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  PRIMARY KEY (scope, state_revision)
+);
+```
+
+表级 trigger 必须禁止 snapshot `UPDATE / DELETE`。Writer 接收 `expected_head_revision`，只允许写下一 revision；空 journal 的第一版是 revision 1。完全相同的已成功写入可以幂等重放，其他 head mismatch 返回 stale write。Typed read 校验 canonical JSON/hash 和 denormalized `schema_version / status / recovery_epoch / updated_at`；独立 head-metadata query 只读取可信 `state_revision / recovery_epoch`，使 payload 损坏时的 fail-closed restore 仍能保持 epoch 单调。
+
 `execution_command_states` 的 compare-and-swap 必须同时匹配 immutable identity、预期 `status` 和预期 `updated_at`。目标 `updated_at` 必须严格大于预期值，防止 status 不变的并发 delivery update 同时成功；已经成功写入的完全相同目标状态允许幂等重试。
 
 初始 command-state insert 重放时，如果数据库已有相同 immutable identity 且 `updated_at` 更高的 projection，必须保留现值并返回 `Duplicate`，不得用初始状态覆盖；相同版本但内容不同，或试图通过 insert 而非 CAS 提交更高版本，必须返回 conflict。
 
+V0003 的 plan / leg definition 和 canonical payload 不可变。Leg / plan lifecycle update 必须作为一个 bundle：同时匹配 plan 与每个目标 leg 的 expected status + expected `updated_at`，验证更新后的完整 `ExecutionPlan` 及派生状态一致，再在 savepoint 内提交；任一 stale writer、缺失 leg、跨 plan identity 或最终状态不一致都必须回滚整个 bundle。已经成功提交的完全相同 bundle 允许幂等重放。
+
 `risk_results.payload_json` 必须保留完整 `RiskResult`，包括 request / intent identity、`risk_request_hash`、`sizing_version`、risk base / budget、sizing candidate provenance、market / metadata / capacity age 和最终 `adjusted_legs`。typed repository 必须以 canonical JSON/hash 写入和读取，执行 `RiskResult` 语义校验，并校验 payload 与 denormalized 列以及父 `TradeIntent` 的 account / decision identity 一致。repository 还必须把父 intent 的 `action / requested_at / signal_expires_at` 和完整腿 shape 纳入契约：BUY / SELL approval 必须携带完整 actionable sizing；单腿 candidate 必须恰好一个，使用 `leg:{intent_id}:0` 并匹配父 intent 的 symbol / action / ratio=1 / proposed_sl；多腿按 `leg_id` 一一匹配 symbol / action / ratio / proposed_sl，不得缺腿或增加额外腿。ratio / proposed_sl 属于 provenance identity，使用原始 `f64` 位模式精确比较，不使用算术容差。HOLD 不得携带 sizing，但允许 approved no-op；第一版 CLOSE 不得 approved 且不得携带 sizing。approved 结果必须满足 `evaluated_at >= requested_at`、`evaluated_at < signal_expires_at` 且 `valid_until <= signal_expires_at`。typed read 必须从父 canonical payload 重建并重新验证上述契约，任何父行或 shape 漂移均报告损坏数据。相同 `risk_id`、父 intent 和完整 payload 的重放返回 Duplicate；相同 `risk_id` 的任意 identity / payload 漂移返回 conflict。同一 intent 可以使用不同 `risk_id` 追加多次独立评估，既有 `risk_results` 不得更新或删除。
 
-对风险增加 intent，`RiskResult` 必须先于 execution plan / command 持久化。Execution 里程碑必须在 repository 的同一 transaction boundary 内组合 intent / risk result / plan / command creation，保证每个 command lots 都能追溯到唯一风控审批；Risk 领域模块本身不得依赖 store。
+对风险增加 intent，`RiskResult` 必须先于 execution plan / command 持久化。V0003 typed repository 已在同一 transaction boundary 内组合 intent / risk result / plan / leg / command / pristine command-state creation，保证每个 command lots 都能追溯到唯一风控审批；完整重放幂等，父图或 payload 漂移冲突，任一晚期失败整体回滚。Risk 领域模块本身不得依赖 store。
 
 #### SQLite Foreign-key Registry
 
@@ -5926,6 +6015,75 @@ CREATE TABLE order_snapshots_latest (
 );
 ```
 
+#### Reconciliation Durable State（V0004）
+
+V0004 增加 transport-neutral reconciliation run、账户级完整集合 checkpoint 和当前 set-membership projection。`request_id` 直接作为 run identity，不再引入第二个 `run_id`。物理字段注册表如下：
+
+```text
+reconciliation_runs
+  → request_id PRIMARY KEY
+  → request_event_id UNIQUE FK core_events
+  → account_id / terminal_id? / client_id? / reason
+  → scope = ACCOUNT | TARGETED
+  → command_ids_json? / command_ids_hash?
+  → since_server_time? / requested_at
+  → status = REQUESTED | PENDING_EVIDENCE | COMPLETED | MANUAL_RECONCILIATION_REQUIRED
+  → request_payload_json / request_payload_hash
+  → result_event_id? UNIQUE FK core_events
+  → result_observed_at? / result_payload_json? / result_payload_hash?
+  → result_evaluation_json? / result_evaluation_hash?
+  → completeness_json? / completeness_hash?
+  → symbol_metadata_complete? / command_scope_complete?
+  → manual_evidence_json? / manual_evidence_hash?
+  → manual_evaluation_json? / manual_evaluation_hash?
+  → created_at / updated_at
+
+account_reconciliation_checkpoints
+  → account_id PRIMARY KEY
+  → source_request_id FK reconciliation_runs
+  → result_observed_at
+  → account_refreshed_at?
+  → positions_observed_at / positions_set_hash
+  → orders_observed_at / orders_set_hash
+  → symbol_metadata_refreshed_at?
+  → pending_commands_reconciled_at?
+  → updated_at
+
+reconciliation_position_set_members
+  → PRIMARY KEY(account_id, position_id)
+  → set_observed_at / payload_json / payload_hash
+
+reconciliation_order_set_members
+  → PRIMARY KEY(account_id, broker_order_id)
+  → set_observed_at / payload_json / payload_hash
+```
+
+`scope=ACCOUNT` 必须配套 `command_ids_json/hash = NULL`；`scope=TARGETED` 必须配套非空、唯一、稳定排序的 command IDs 及 canonical hash。Result identity、payload、evaluation、completeness、`symbol_metadata_complete` 和 `command_scope_complete` 必须作为一组同时存在或同时缺失；两个 completeness alias 都必须与 canonical completeness payload 一致。manual evidence 和 manual evaluation 也必须成组存在。所有 JSON 使用 canonical JSON/hash 并在 typed read 时复核。
+
+Set-membership 的 `payload_json` 保存对应 position / order snapshot 的 canonical payload，不只保存 digest。Typed checkpoint read 必须重新解析 payload，校验 account / member key / `set_observed_at` alias，重算完整集合 hash，并与同水位 latest projection 对照；`positions_observed_at / orders_observed_at` 必须等于 checkpoint 的 result 水位，两个集合 hash 还必须同时锚定到同一个 durable `reconciliation.result` canonical fact。任一缺行、额外行、自洽但脱离 result fact 的 payload/hash 漂移都报告持久化损坏。
+
+`request_id / request_event_id / account_id / route / reason / scope / command IDs / since_server_time / requested_at / request_payload_* / created_at` 是 immutable request definition，必须由 trigger 禁止更新，run 也不得删除。Run transition 以当前 status 及对应 result / manual payload 尚不存在为条件；首个写入胜出，`updated_at` 单调推进。完全相同的已成功提交允许幂等重放，identity、result 或 evaluation 漂移必须冲突。
+
+Result commit 必须在同一 transaction 中完成以下操作：
+
+```text
+追加 reconciliation.result durable fact
+更新 reconciliation_runs 的 result / disposition
+按 account_id 原子替换 position_snapshots_latest 完整集合
+按 account_id 原子替换 order_snapshots_latest 完整集合
+同步替换 reconciliation_position_set_members / reconciliation_order_set_members
+更新 account_reconciliation_checkpoints 的 full-set 水位和集合 hash
+account 存在时才更新 account_snapshots_latest / account_refreshed_at
+```
+
+`commit_reconciliation_result` 只接受 `Completed` 或 `PendingEvidence` evaluation。`Completed` 当且仅当 attention command 集合为空，`PendingEvidence` 必须至少保留一个 attention command；result 的每个 `unresolved_command_id` 都必须出现在该 attention 集合中，因此 unresolved 非空的 result 不能伪装为 `Completed`。`ManualRequired` 不能借 result payload 隐式落库，必须调用独立 manual escalation API，并持久化 `request_id / escalated_at / non-empty reason` 以及对应 manual evaluation；缺失 result 的升级保持 `result_observed_at = NULL`。Completed run 不能再升级为 manual。
+
+Position / order full-set replacement 使用 `result.observed_at` 作为两个账户级水位。空数组必须删除该账户此前集合并记录 empty-set hash；不能解释成“本次没有提供”。只有更新的 result 水位可以覆盖当前 full set；相同水位 / 相同集合 hash是幂等重复，相同水位 / 不同集合 hash是 observation conflict，更旧 result 只能保留为事实，不能回退 projection。
+
+账户级 full-set watermark 同时承担 tombstone 防线：之后到达的单行 position / order fact 若 `observed_at <` 对应 full-set watermark，不得插入或复活已被完整集合删除的业务键。同一账户、业务键和 `observed_at` 同时存在 single-row fact 与 full-set 时，只有 full-set 包含该键且 canonical payload 完全相同才相容；缺键或 payload 不同都是 `ObservationConflict`，第二个写入必须连同 durable fact 一起回滚。在线写入和 rebuild 都必须从 durable facts 做这项顺序无关校验，不能依赖 latest row 或同毫秒内的到达顺序。单行 fact 若新于水位，可以按 latest-row 规则写入，但此时所有行不再共享 checkpoint 水位，trusted Risk assembler 必须认为 full-set evidence 不一致并 fail closed，直到更新的完整 reconciliation result 收敛。
+
+只有 `command_ids=None`、`terminal_id=None`、`client_id=None`、disposition 为 `Completed` 且 `command_scope_complete=true` 的无 route 限制账户级 run 可以把 `pending_commands_reconciled_at` 推进到 result 水位。`None` 只表达 request route 内的全量范围；当 `terminal_id` 或 `client_id` 存在时，scope 仍被限制在对应 session route，不能代表全账户。`command_scope_complete` 另行证明 evaluator 使用了同一可信 Store read snapshot 中该请求 scope 的完整 command 集合；targeted `Some` 不得声明该字段为 true。它是 trusted Core application assembler 的内部 attestation，不是 Execution Client 或 Gateway 可提交的 wire 字段。route-restricted completion 或 `command_scope_complete=false` 均不得推进账户级 command watermark。`Completed` 只证明所评估 scope 的投递不确定性已有权威 command lifecycle evidence 覆盖，并且本次没有 unresolved / manual finding，不表示订单 terminal。`PendingEvidence` 和 `ManualRequired` 都不得推进该 watermark。`account` 缺失时不推进 `account_refreshed_at`；第一版协议没有内建 metadata 完整范围，不能仅因 `symbol_metadata` 非空推进 `symbol_metadata_refreshed_at`。只有上层显式提供并持久化 `symbol_metadata_complete=true` 的完整性证据时才可推进。
+
 #### Spool / Event Stream Tables
 
 ```sql
@@ -5971,8 +6129,8 @@ CREATE TABLE outbound_spool (
 | `execution.command` | `core_events` once per command creation | insert `execution_commands`, upsert `execution_command_states`, insert `command_delivery_attempts` per dispatch |
 | `command.received` | `core_events` | update `execution_command_states.command_received_at/status` |
 | `execution.event` | `core_events`, `execution_events` | project command / leg / plan state |
-| `reconciliation.request` | `core_events` | insert `wire_outbox`, mark commands RECONCILING |
-| `reconciliation.result` | `core_events` | update latest snapshots and reconciliation state |
+| `reconciliation.request` | `core_events`, `reconciliation_runs` request journal | persist transport-neutral run; pure domain separately returns eligible Execution-state CAS targets for the application layer; later Gateway binding may add `wire_outbox` |
+| `reconciliation.result` | `core_events` | atomically update run / checkpoint and replace position / order full sets; snapshot alone does not change execution lifecycle |
 | invalid schema/type | `deadletter_events` | no business projection |
 
 Latest-state projection 的统一写入规则：
@@ -5990,7 +6148,7 @@ payload_json 中存在的 account_id / symbol / position_id / broker_order_id / 
 state-ingest replay 顺序固定为 received_at、created_at、event_id 升序，不依赖 SQLite rowid。
 ```
 
-第一版 `PositionSnapshot` 是单仓位 observation，没有 tombstone 或账户级 generation。缺失某个 position 不表示删除；在 reconciliation 里程碑落地完整账户仓位集替换事实前，projection 和 rebuild 都只保留每个 `position_id` 的最新已知 observation，不得凭“本批未出现”删除仓位。需要当前开放仓位集合的流程必须等待新鲜 reconciliation full snapshot，否则 fail closed。
+V0002 的普通 `position.snapshot` / `order.snapshot` 仍是单行业务键 observation，单批缺失某行不表示删除。V0004 的 `reconciliation.result.positions / orders` 则是显式账户完整集合：在线 projection 和 rebuild 都按 result 水位原子替换，并用账户级 watermark / empty-set hash 作为 tombstone 防线。普通单行事实不得凭空删除其他行，也不得以旧于或等于 full-set 水位的 observation 复活已删除行。需要当前开放集合的流程必须同时验证所有行与新鲜 checkpoint 水位一致，否则 fail closed。
 
 ### 23.3 Rust Crate Boundary
 
@@ -6107,9 +6265,11 @@ sinan-execution
 
 sinan-reconciliation
   → delivery unconfirmed recovery
-  → reconciliation.request generation
-  → reconciliation.result evaluation
-  → manual reconciliation state
+  → transport-neutral reconciliation.request generation and deterministic scope normalization
+  → reconciliation.result validation / finding evaluation
+  → Completed / PendingEvidence / ManualRequired disposition
+  → explicit manual / missing-result escalation evidence
+  → 不创建 WireMessage / wire_outbox，不选择 session，不从 snapshot 制造 execution fact 或 retry decision
 
 sinan-events
   → event stream manager
@@ -6152,6 +6312,7 @@ sinan-execution → sinan-store
 sinan-execution → sinan-domain
 sinan-execution → sinan-protocol for signing / protocol payloads
 sinan-execution → outbound delivery port trait defined in execution or domain
+sinan-reconciliation → sinan-protocol / sinan-types / sinan-execution
 sinan-gateway → sinan-protocol
 sinan-gateway → sinan-store for session / wire inbox only
 sinan-gateway → outbound delivery port implementation
@@ -6169,6 +6330,7 @@ sinan-gateway router → direct SQL for execution state
 sinan-risk → sinan-gateway
 sinan-risk → sinan-store / HTTP client / Compute Service client
 sinan-execution → Compute Service client / live position sizing HTTP
+sinan-reconciliation → sinan-gateway / sinan-http
 sinan-store → sinan-gateway / sinan-http / sinan-execution
 sinan-http → sinan-gateway session internals
 sinan-events → mutate execution_command_states
@@ -6187,8 +6349,8 @@ sinan-events → mutate execution_command_states
 | `command.received` | execution service | core_events, execution_command_states |
 | `execution.event` | execution projection service | core_events, execution_events, command/leg/plan projection |
 | `execution.command` | execution service + gateway outbound port | execution_commands, execution_command_states, command_delivery_attempts, wire_outbox |
-| `reconciliation.request` | reconciliation service + gateway outbound port | core_events, wire_outbox, command state |
-| `reconciliation.result` | reconciliation service | core_events, latest snapshots, command state |
+| `reconciliation.request` | reconciliation service; later gateway outbound adapter | core_events and reconciliation_runs; pure domain returns optional command-state CAS targets but run persistence does not imply they were applied; Gateway stage later adds wire_outbox only |
+| `reconciliation.result` | reconciliation service | core_events, reconciliation_runs, account checkpoint, atomic position / order full sets; no snapshot-driven command transition |
 | `POST /trade-intents` | execution application service | trade_intents, risk_results, plans, commands |
 | `GET /state` | HTTP query service | read-only projections |
 | `WS /events` | event stream manager | read-only event_stream_log / projection |
@@ -6608,6 +6770,9 @@ circuit breaker different incident evidence while OPEN → advance recovery epoc
 circuit breaker healthy observation while OPEN → IncidentEvidenceCleared; same violation recurring starts a new epoch
 circuit breaker HALF_OPEN financial value above baseline → reopen, even when below policy threshold
 circuit breaker same safety error is idempotent; different CircuitBreakerError starts a new epoch
+circuit breaker durable restore round-trips complete OPEN / HALF_OPEN state and append-only revision
+circuit breaker missing / corrupt / unknown snapshot → persist OPEN before live flow; corrupt high epoch → known epoch + 1
+circuit breaker Store unavailable / recovery epoch overflow → return inspectable fail-closed outcome; no live flow
 RiskResult repository enforces parent intent action / requested_at / signal_expires_at and complete single/multi-leg shape on write and typed read
 single-leg RiskResult leg_id != leg:{intent_id}:0, or parent ratio / SL differs by one f64 ULP → reject as invalid
 approved risk-increasing RiskResult missing adjusted_legs or leg_id mismatch → no execution plan
@@ -6621,6 +6786,8 @@ GatewayInboundRouter / GatewayOutboundRouter stage tests: no risk / execution st
 Execution Client message registry rejects unknown type before business handler
 transport.ack does not advance ExecutionCommandState
 execution.command creation is stored once; delivery retry only adds command_delivery_attempts
+intent / risk / plan / legs / commands / pristine states commit atomically; late conflict rolls back the complete workflow
+command CAS and leg / plan lifecycle bundle CAS reject stale writers and never expose partial projection
 SQLite migrations create unique idempotency indexes
 SQLite migrations create CHECK constraints for all status / enum TEXT fields
 trade_intents.action CHECK accepts BUY / SELL / CLOSE / HOLD and rejects unknown values
@@ -6652,6 +6819,23 @@ CANCEL command requires broker_order_id and may omit lots / order_type
 max_inflight_commands 超限 → COMMAND_DISPATCH_BACKPRESSURE
 command.received ACK 正常路径
 command.received 丢失 → DELIVERY_UNCONFIRMED → reconciliation
+reconciliation request command_ids=None retains full account/route scope; Some([]) / duplicate IDs fail; Some IDs are stably sorted
+command_ids=None with terminal_id/client_id still covers only that route; route-restricted completion never advances account pending-command watermark
+account-wide Completed advances pending-command watermark only when terminal_id/client_id are absent and command_scope_complete=true from one trusted Store read snapshot
+CONNECTION_RESTORED / STATE_STORE_RESTORED create independent runs and do not regress advanced command lifecycle
+reconciliation positions / orders are full sets; empty sets advance watermarks and remove prior rows atomically
+reconciliation position / order row account or observed_at mismatch, or duplicate business key → reject result atomically
+old single-row observation at or before full-set watermark cannot revive a removed position / order
+new single-row observation after full-set watermark invalidates uniform full-set readiness until the next complete result
+snapshot showing ORDER_SENT / FILLED / missing order does not advance command state or authorize retry
+reconciliation result without authoritative command evidence → PendingEvidence, not FAILED / EXPIRED / retry
+client unresolved despite authoritative Core state → PendingEvidence + finding; no automatic override
+command already in MANUAL_RECONCILIATION_REQUIRED during result evaluation → PendingEvidence until explicit escalation evidence
+Completed only means scoped delivery uncertainty is covered; targeted completion does not advance account pending-command watermark
+missing result / unresolved result enters ManualRequired only with explicit timestamped evidence and non-empty reason
+result commit with ManualRequired disposition is rejected; explicit manual API persists evidence and evaluation atomically
+account missing from result does not advance account refresh; non-empty metadata alone does not prove full metadata refresh
+reconciliation result / checkpoint / full-set replacement commit and rebuild are atomic and deterministic
 重复 command_id / idempotency_key 不重复下单
 idempotency_key conflict → execution.event FAILED
 断线重连后重发 command.received / execution.event

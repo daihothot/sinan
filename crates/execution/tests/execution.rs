@@ -1,7 +1,8 @@
 use sinan_execution::{
     build_execution, decide_recovery, project_leg, project_plan, transition_command,
-    CommandEvidence, CommandTransitionError, ExecutionBuildError, ExecutionBuildOutcome,
-    ExecutionBuildRequest, RecoveryDecision, ResolvedLegExecution,
+    validate_command_state, CommandEvidence, CommandTransitionError, ExecutionBuildError,
+    ExecutionBuildOutcome, ExecutionBuildRequest, ProjectionError, RecoveryDecision,
+    ResolvedLegExecution,
 };
 use sinan_protocol::{
     verify_execution_command_hmac, CommandInboxStatus, CommandReceived, CommandSigningFormat,
@@ -222,11 +223,17 @@ fn builder_exactly_maps_approval_and_signs_command() {
     let approved = &result.adjusted_legs.as_ref().unwrap()[0];
     let command = &bundle.commands[0];
     assert_eq!(command.lots.unwrap().to_bits(), approved.lots.to_bits());
-    assert_eq!(command.sl.unwrap().to_bits(), approved.approved_sl.to_bits());
+    assert_eq!(
+        command.sl.unwrap().to_bits(),
+        approved.approved_sl.to_bits()
+    );
     assert_eq!(command.tp, request.intent.proposed_tp);
     assert_eq!(command.broker_symbol.as_deref(), Some(SYMBOL));
     assert_eq!(command.expires_at, NOW + 2_100);
-    assert_eq!(bundle.command_states[0].status, ExecutionCommandStatus::Created);
+    assert_eq!(
+        bundle.command_states[0].status,
+        ExecutionCommandStatus::Created
+    );
     assert_eq!(bundle.command_states[0].created_at, NOW + 100);
     bundle.plan.validate().unwrap();
     verify_execution_command_hmac(
@@ -238,7 +245,10 @@ fn builder_exactly_maps_approval_and_signs_command() {
 
     let json = serde_json::to_value(&bundle.plan).unwrap();
     assert_eq!(json["plan_id"], "plan-1");
-    assert_eq!(json["legs"][0]["leg_id"], single_leg_id(&request.intent.intent_id).as_str());
+    assert_eq!(
+        json["legs"][0]["leg_id"],
+        single_leg_id(&request.intent.intent_id).as_str()
+    );
     assert_eq!(json["status"], "PENDING");
     let round_trip: ExecutionPlan = serde_json::from_value(json).unwrap();
     assert_eq!(round_trip, bundle.plan);
@@ -312,11 +322,7 @@ fn receipt(command: &ExecutionCommand, status: CommandInboxStatus, at: i64) -> C
     }
 }
 
-fn event(
-    command: &ExecutionCommand,
-    status: ExecutionEventStatus,
-    at: i64,
-) -> ExecutionEvent {
+fn event(command: &ExecutionCommand, status: ExecutionEventStatus, at: i64) -> ExecutionEvent {
     let fill = matches!(
         status,
         ExecutionEventStatus::PartiallyFilled | ExecutionEventStatus::Filled
@@ -364,7 +370,11 @@ fn command_state_advances_only_from_business_evidence() {
 
     let duplicate = receipt(command, CommandInboxStatus::Duplicate, NOW + 300);
     assert!(matches!(
-        transition_command(command, &state, CommandEvidence::ReceivedRecorded(&duplicate)),
+        transition_command(
+            command,
+            &state,
+            CommandEvidence::ReceivedRecorded(&duplicate)
+        ),
         Err(CommandTransitionError::InvalidEvidence(_))
     ));
     state = transition_command(
@@ -375,6 +385,15 @@ fn command_state_advances_only_from_business_evidence() {
     .unwrap()
     .into_state();
     assert_eq!(state.status, ExecutionCommandStatus::CommandReceived);
+    let regressed_duplicate = receipt(command, CommandInboxStatus::Recorded, NOW + 250);
+    assert!(matches!(
+        transition_command(
+            command,
+            &state,
+            CommandEvidence::ReceivedRecorded(&regressed_duplicate)
+        ),
+        Err(CommandTransitionError::InvalidTimestamp(_))
+    ));
 
     for (index, status) in [
         ExecutionEventStatus::Accepted,
@@ -397,7 +416,7 @@ fn command_state_advances_only_from_business_evidence() {
     assert_eq!(state.completed_at, Some(NOW + 403));
     assert!(matches!(
         transition_command(command, &state, CommandEvidence::Cancel { at: NOW + 500 }),
-        Err(CommandTransitionError::InvalidTransition { .. })
+        Err(CommandTransitionError::InvalidEvidence(_))
     ));
 }
 
@@ -423,13 +442,9 @@ fn projector_derives_leg_plan_and_recovery_without_mutating_definitions() {
     .unwrap()
     .into_state();
     let accepted = event(command, ExecutionEventStatus::Accepted, NOW + 400);
-    state = transition_command(
-        command,
-        &state,
-        CommandEvidence::ExecutionEvent(&accepted),
-    )
-    .unwrap()
-    .into_state();
+    state = transition_command(command, &state, CommandEvidence::ExecutionEvent(&accepted))
+        .unwrap()
+        .into_state();
     events.push(accepted);
     let order_sent = event(command, ExecutionEventStatus::OrderSent, NOW + 500);
     state = transition_command(
@@ -441,26 +456,28 @@ fn projector_derives_leg_plan_and_recovery_without_mutating_definitions() {
     .into_state();
     events.push(order_sent);
     let partial = event(command, ExecutionEventStatus::PartiallyFilled, NOW + 600);
-    state = transition_command(
-        command,
-        &state,
-        CommandEvidence::ExecutionEvent(&partial),
-    )
-    .unwrap()
-    .into_state();
+    state = transition_command(command, &state, CommandEvidence::ExecutionEvent(&partial))
+        .unwrap()
+        .into_state();
     events.push(partial);
     let failed = event(command, ExecutionEventStatus::Failed, NOW + 700);
-    state = transition_command(
-        command,
-        &state,
-        CommandEvidence::ExecutionEvent(&failed),
-    )
-    .unwrap()
-    .into_state();
+    state = transition_command(command, &state, CommandEvidence::ExecutionEvent(&failed))
+        .unwrap()
+        .into_state();
     events.push(failed);
 
-    let projected_leg = project_leg(&bundle.plan.legs[0], &[state.clone()], &events).unwrap();
-    assert_eq!(projected_leg.state.status, ExecutionLegStatus::PartiallyFilled);
+    let projected_leg = project_leg(
+        &bundle.plan.definition.plan_id,
+        &bundle.plan.definition.account_id,
+        &bundle.plan.legs[0],
+        &[state.clone()],
+        &events,
+    )
+    .unwrap();
+    assert_eq!(
+        projected_leg.state.status,
+        ExecutionLegStatus::PartiallyFilled
+    );
     bundle.plan = project_plan(&bundle.plan, &[state], &events).unwrap();
     assert_eq!(bundle.plan.state.status, ExecutionPlanStatus::Partial);
     assert_eq!(bundle.plan.state.filled_legs.len(), 1);
@@ -502,6 +519,24 @@ fn transitions_reject_out_of_order_and_invalid_expiry_boundaries() {
     )
     .unwrap()
     .into_state();
+    assert!(matches!(
+        transition_command(
+            command,
+            &dispatched,
+            CommandEvidence::Expire {
+                at: command.expires_at
+            }
+        ),
+        Err(CommandTransitionError::InvalidEvidence(_))
+    ));
+    assert!(matches!(
+        transition_command(
+            command,
+            &dispatched,
+            CommandEvidence::Cancel { at: NOW + 600 }
+        ),
+        Err(CommandTransitionError::InvalidEvidence(_))
+    ));
     let recorded = receipt(command, CommandInboxStatus::Recorded, NOW + 400);
     assert!(matches!(
         transition_command(
@@ -510,6 +545,76 @@ fn transitions_reject_out_of_order_and_invalid_expiry_boundaries() {
             CommandEvidence::ReceivedRecorded(&recorded)
         ),
         Err(CommandTransitionError::InvalidTimestamp(_))
+    ));
+
+    let mut malformed = created.clone();
+    malformed.delivery_attempts = 1;
+    assert!(matches!(
+        validate_command_state(command, &malformed),
+        Err(CommandTransitionError::InvalidTimestamp(_))
+    ));
+}
+
+#[test]
+fn same_millisecond_evidence_and_projection_identity_are_validated() {
+    let (_, _, bundle) = bundle();
+    let command = &bundle.commands[0];
+    let dispatched = transition_command(
+        command,
+        &bundle.command_states[0],
+        CommandEvidence::Dispatched { at: NOW + 200 },
+    )
+    .unwrap()
+    .into_state();
+    let recorded = receipt(command, CommandInboxStatus::Recorded, NOW + 200);
+    let received = transition_command(
+        command,
+        &dispatched,
+        CommandEvidence::ReceivedRecorded(&recorded),
+    )
+    .unwrap()
+    .into_state();
+    assert_eq!(received.command_received_at, Some(NOW + 200));
+
+    let accepted_event = event(command, ExecutionEventStatus::Accepted, NOW + 200);
+    let accepted = transition_command(
+        command,
+        &received,
+        CommandEvidence::ExecutionEvent(&accepted_event),
+    )
+    .unwrap()
+    .into_state();
+    let order_sent_event = event(command, ExecutionEventStatus::OrderSent, NOW + 200);
+    let order_sent = transition_command(
+        command,
+        &accepted,
+        CommandEvidence::ExecutionEvent(&order_sent_event),
+    )
+    .unwrap()
+    .into_state();
+    let mut invalid_fill = event(command, ExecutionEventStatus::Filled, NOW + 300);
+    invalid_fill.filled_at = Some(NOW);
+    assert!(matches!(
+        transition_command(
+            command,
+            &order_sent,
+            CommandEvidence::ExecutionEvent(&invalid_fill)
+        ),
+        Err(CommandTransitionError::InvalidTimestamp(_))
+    ));
+
+    let mut wrong_account = bundle.command_states[0].clone();
+    wrong_account.account_id = AccountId::new("other-account");
+    assert!(matches!(
+        project_plan(&bundle.plan, &[wrong_account], &[]),
+        Err(ProjectionError::IdentityMismatch(_))
+    ));
+
+    let mut wrong_plan = bundle.command_states[0].clone();
+    wrong_plan.plan_id = Some(PlanId::new("other-plan"));
+    assert!(matches!(
+        project_plan(&bundle.plan, &[wrong_plan], &[]),
+        Err(ProjectionError::IdentityMismatch(_))
     ));
 }
 
@@ -522,6 +627,8 @@ fn plan_summary_validation_requires_the_exact_derived_sets() {
     bundle.plan.state.filled_legs = vec![leg_id.clone(), leg_id.clone()];
     assert!(bundle.plan.validate().is_err());
     bundle.plan.state.filled_legs = vec![leg_id];
+    assert!(bundle.plan.validate().is_err());
+    bundle.plan.state.status = ExecutionPlanStatus::Completed;
     bundle.plan.validate().unwrap();
     bundle.plan.state.failed_legs = vec![LegId::new("unknown")];
     assert!(bundle.plan.validate().is_err());

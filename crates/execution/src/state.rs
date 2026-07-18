@@ -105,8 +105,38 @@ pub fn transition_command(
 ) -> Result<CommandTransitionOutcome, CommandTransitionError> {
     validate_command_state(command, state)?;
     let (target, evidence_at) = evidence_target(command, evidence)?;
+    if matches!(
+        evidence,
+        CommandEvidence::ExecutionEvent(event)
+            if event
+                .filled_at
+                .is_some_and(|filled_at| filled_at < state.created_at)
+    ) {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "filled_at predates command creation",
+        ));
+    }
+    if evidence_at < state.created_at {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "evidence predates command creation",
+        ));
+    }
+    if evidence_at < latest_lifecycle_evidence_at(state) {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "advancing evidence predates existing lifecycle evidence",
+        ));
+    }
     if target == state.status {
         return Ok(CommandTransitionOutcome::Duplicate(state.clone()));
+    }
+    if matches!(
+        evidence,
+        CommandEvidence::Expire { .. } | CommandEvidence::Cancel { .. }
+    ) && state.status != ExecutionCommandStatus::Created
+    {
+        return Err(CommandTransitionError::InvalidEvidence(
+            "local expiry/cancellation is only valid before dispatch",
+        ));
     }
     if !transition_is_allowed(state.status, target) {
         return Err(CommandTransitionError::InvalidTransition {
@@ -114,17 +144,6 @@ pub fn transition_command(
             to: target,
         });
     }
-    if evidence_at < state.created_at {
-        return Err(CommandTransitionError::InvalidTimestamp(
-            "evidence predates command creation",
-        ));
-    }
-    if evidence_at < state.updated_at {
-        return Err(CommandTransitionError::InvalidTimestamp(
-            "advancing evidence predates the current state version",
-        ));
-    }
-
     let mut next = state.clone();
     next.status = target;
     next.updated_at = state
@@ -187,6 +206,11 @@ pub fn validate_command_state(
             "created_at/updated_at are inconsistent",
         ));
     }
+    if command.expires_at <= state.created_at {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "command expiry must follow state creation",
+        ));
+    }
     if command_status_is_terminal(state.status) != state.completed_at.is_some() {
         return Err(CommandTransitionError::InvalidTimestamp(
             "completed_at must exactly match terminal status",
@@ -217,7 +241,75 @@ pub fn validate_command_state(
             "CREATED state cannot contain later lifecycle evidence",
         ));
     }
+    if state.dispatched_at.is_some() != (state.delivery_attempts > 0) {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "delivery_attempts and dispatched_at must be present together",
+        ));
+    }
+    let requires_dispatch = matches!(
+        state.status,
+        ExecutionCommandStatus::Dispatched
+            | ExecutionCommandStatus::DeliveryUnconfirmed
+            | ExecutionCommandStatus::Reconciling
+            | ExecutionCommandStatus::ManualReconciliationRequired
+            | ExecutionCommandStatus::CommandReceived
+            | ExecutionCommandStatus::Accepted
+            | ExecutionCommandStatus::Rejected
+            | ExecutionCommandStatus::OrderSent
+            | ExecutionCommandStatus::PartiallyFilled
+            | ExecutionCommandStatus::Filled
+            | ExecutionCommandStatus::Failed
+    );
+    if requires_dispatch && state.dispatched_at.is_none() {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "command status requires dispatch evidence",
+        ));
+    }
+    if matches!(state.status, ExecutionCommandStatus::DeliveryUnconfirmed)
+        && state
+            .last_delivery_error
+            .as_deref()
+            .is_none_or(|error| error.trim().is_empty())
+    {
+        return Err(CommandTransitionError::InvalidEvidence(
+            "DELIVERY_UNCONFIRMED requires a delivery error",
+        ));
+    }
+    if matches!(
+        state.status,
+        ExecutionCommandStatus::Reconciling | ExecutionCommandStatus::ManualReconciliationRequired
+    ) && state.reconciling_at.is_none()
+    {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "reconciliation status requires reconciling_at",
+        ));
+    }
+    if matches!(
+        state.status,
+        ExecutionCommandStatus::CommandReceived
+            | ExecutionCommandStatus::Accepted
+            | ExecutionCommandStatus::Rejected
+    ) && state.command_received_at.is_none()
+    {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "command status requires command_received_at",
+        ));
+    }
     Ok(())
+}
+
+fn latest_lifecycle_evidence_at(state: &ExecutionCommandState) -> i64 {
+    [
+        Some(state.created_at),
+        state.dispatched_at,
+        state.command_received_at,
+        state.reconciling_at,
+        state.completed_at,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(state.created_at)
 }
 
 pub fn command_status_is_terminal(status: ExecutionCommandStatus) -> bool {
@@ -345,11 +437,14 @@ fn validate_receipt(
     Ok(())
 }
 
-fn validate_execution_event(
+/// Validates an execution event against its immutable command identity and
+/// protocol-level quantity semantics without applying a lifecycle transition.
+pub fn validate_execution_event(
     command: &ExecutionCommand,
     event: &ExecutionEvent,
 ) -> Result<(), CommandTransitionError> {
     if event.execution_id.as_str().trim().is_empty()
+        || event.event_at < 0
         || event.command_id != command.command_id
         || event.plan_id != command.plan_id
         || event.leg_id != command.leg_id

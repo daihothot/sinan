@@ -1023,11 +1023,44 @@ pub fn fail_closed_circuit_breaker_restore(
     failure: CircuitBreakerRestoreFailure,
     server_now_ms: i64,
 ) -> CircuitBreakerOutcome {
-    safety_fallback(
-        &CircuitBreakerState::new(),
+    match fail_closed_circuit_breaker_restore_after_epoch(failure, server_now_ms, 0) {
+        Ok(outcome) => outcome,
+        Err(_) => unreachable!("recovery epoch zero always has a successor"),
+    }
+}
+
+/// Constructs a durable-restore safety incident after a known persisted epoch.
+///
+/// Storage adapters must use this form when a snapshot row exists but its
+/// payload cannot be restored. This prevents a corrupt high-epoch snapshot
+/// from resetting recovery identity back to epoch one.
+pub fn fail_closed_circuit_breaker_restore_after_epoch(
+    failure: CircuitBreakerRestoreFailure,
+    server_now_ms: i64,
+    last_recovery_epoch: u64,
+) -> Result<CircuitBreakerOutcome, CircuitBreakerRecoveryEpochExhausted> {
+    let Some(next_recovery_epoch) = last_recovery_epoch.checked_add(1) else {
+        let mut exhausted = CircuitBreakerState::new();
+        exhausted.recovery_epoch = last_recovery_epoch;
+        return Err(CircuitBreakerRecoveryEpochExhausted {
+            last_recovery_epoch,
+            restore_failure: failure,
+            outcome: recovery_epoch_overflow(&exhausted, server_now_ms),
+        });
+    };
+
+    let mut previous = CircuitBreakerState::new();
+    previous.recovery_epoch = last_recovery_epoch;
+    let outcome = safety_fallback(
+        &previous,
         server_now_ms,
         CircuitBreakerError::DurableRestoreFailed { failure },
-    )
+    );
+    debug_assert_eq!(
+        outcome.state.recovery_epoch, next_recovery_epoch,
+        "a durable-restore fallback must advance the known epoch exactly once"
+    );
+    Ok(outcome)
 }
 
 fn validate_restored_state(
@@ -1393,6 +1426,47 @@ pub struct CircuitBreakerOutcome {
     pub error: Option<CircuitBreakerError>,
     pub manual_reset_audit: Option<ManualResetAuditRecord>,
 }
+
+/// The persisted recovery epoch has no representable successor.
+///
+/// The embedded outcome remains `OPEN`, so callers retain a fail-closed state
+/// even though no strictly newer durable recovery identity can be created.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerRecoveryEpochExhausted {
+    last_recovery_epoch: u64,
+    restore_failure: CircuitBreakerRestoreFailure,
+    outcome: CircuitBreakerOutcome,
+}
+
+impl CircuitBreakerRecoveryEpochExhausted {
+    pub const fn last_recovery_epoch(&self) -> u64 {
+        self.last_recovery_epoch
+    }
+
+    pub const fn restore_failure(&self) -> &CircuitBreakerRestoreFailure {
+        &self.restore_failure
+    }
+
+    pub const fn outcome(&self) -> &CircuitBreakerOutcome {
+        &self.outcome
+    }
+
+    pub fn into_outcome(self) -> CircuitBreakerOutcome {
+        self.outcome
+    }
+}
+
+impl fmt::Display for CircuitBreakerRecoveryEpochExhausted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot advance durable circuit-breaker recovery epoch beyond {}",
+            self.last_recovery_epoch
+        )
+    }
+}
+
+impl Error for CircuitBreakerRecoveryEpochExhausted {}
 
 impl CircuitBreakerOutcome {
     fn unchanged(state: &CircuitBreakerState) -> Self {
@@ -3538,6 +3612,48 @@ mod tests {
                 )]) if failure == &expected_failure
             ));
         }
+    }
+
+    #[test]
+    fn durable_restore_fallback_advances_the_known_epoch() {
+        let outcome = fail_closed_circuit_breaker_restore_after_epoch(
+            CircuitBreakerRestoreFailure::CorruptPayload,
+            NOW,
+            41,
+        )
+        .expect("a non-exhausted recovery epoch must advance");
+
+        assert_eq!(outcome.state.status(), CircuitBreakerStatus::Open);
+        assert_eq!(outcome.state.recovery_epoch(), 42);
+        assert_eq!(outcome.state.triggered_at_ms(), Some(NOW));
+        assert_eq!(
+            outcome.error,
+            Some(CircuitBreakerError::DurableRestoreFailed {
+                failure: CircuitBreakerRestoreFailure::CorruptPayload,
+            })
+        );
+    }
+
+    #[test]
+    fn durable_restore_epoch_exhaustion_keeps_an_open_state() {
+        let error = fail_closed_circuit_breaker_restore_after_epoch(
+            CircuitBreakerRestoreFailure::CorruptPayload,
+            NOW,
+            u64::MAX,
+        )
+        .expect_err("an exhausted recovery epoch cannot wrap");
+
+        assert_eq!(error.last_recovery_epoch(), u64::MAX);
+        assert_eq!(
+            error.restore_failure(),
+            &CircuitBreakerRestoreFailure::CorruptPayload
+        );
+        assert_eq!(error.outcome().state.status(), CircuitBreakerStatus::Open);
+        assert_eq!(error.outcome().state.recovery_epoch(), u64::MAX);
+        assert_eq!(
+            error.outcome().error,
+            Some(CircuitBreakerError::RecoveryEpochOverflow)
+        );
     }
 
     #[test]

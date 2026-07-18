@@ -10,9 +10,9 @@ use sinan_types::{
     CommandId, CorrelationId, ExecutionAction, ExecutionCommand, ExecutionCommandState,
     ExecutionCommandStatus, ExecutionEvent, ExecutionId, ExecutionLeg, ExecutionLegDefinition,
     ExecutionLegState, ExecutionLegStatus, ExecutionPlan, ExecutionPlanDefinition,
-    ExecutionPlanState, ExecutionPlanStatus, IdempotencyKey, IntentId, LegId, MessageId, OrderType,
-    PlanId, RiskId, RiskResult, SessionId, StrategyId, TerminalId, TradeIntent,
-    TradeIntentAction, TradeIntentLegAction, TradeIntentStatus,
+    ExecutionPlanState, ExecutionPlanStatus, IdempotencyKey, IntentId, LegId, MessageId, PlanId,
+    RiskId, RiskResult, SessionId, StrategyId, TerminalId, TradeIntent, TradeIntentAction,
+    TradeIntentLegAction, TradeIntentStatus,
 };
 use sqlx::{Row, SqliteConnection};
 
@@ -21,13 +21,14 @@ use crate::{
     error::StoreError,
     json::CanonicalJson,
     model::{
-        CommandStateUpdate, CoreEventMetadata, LegStateUpdate, NewCircuitBreakerSnapshot,
-        NewCoreEvent, NewExecutionCommand, NewExecutionEvent, NewExecutionPlan,
-        NewExecutionWorkflow, NewRiskResult, NewSessionRecord, NewTradeIntent, NewWireInbox,
-        NewWireOutbox, PlanStateUpdate, StoredCircuitBreakerSnapshot, StoredCoreEvent,
-        StoredExecutionCommand, StoredExecutionEvent, StoredExecutionLeg, StoredExecutionPlan,
-        StoredExecutionWorkflow, StoredRiskResult, StoredSessionRecord, StoredTradeIntent,
-        StoredWireInbox, StoredWireOutbox, WriteOutcome, GLOBAL_CIRCUIT_BREAKER_SCOPE,
+        CircuitBreakerHeadMetadata, CommandStateUpdate, CoreEventMetadata,
+        ExecutionLifecycleUpdate, LegStateUpdate, NewCircuitBreakerSnapshot, NewCoreEvent,
+        NewExecutionCommand, NewExecutionEvent, NewExecutionPlan, NewExecutionWorkflow,
+        NewRiskResult, NewSessionRecord, NewTradeIntent, NewWireInbox, NewWireOutbox,
+        PlanStateUpdate, StoredCircuitBreakerSnapshot, StoredCoreEvent, StoredExecutionCommand,
+        StoredExecutionEvent, StoredExecutionLeg, StoredExecutionPlan, StoredExecutionWorkflow,
+        StoredRiskResult, StoredSessionRecord, StoredTradeIntent, StoredWireInbox,
+        StoredWireOutbox, WriteOutcome, GLOBAL_CIRCUIT_BREAKER_SCOPE,
     },
 };
 
@@ -65,6 +66,13 @@ impl SqliteStateStore {
 
     pub async fn get_circuit_breaker_head_revision(&self) -> Result<Option<u64>, StoreError> {
         fetch_circuit_breaker_head_revision(self.pool()).await
+    }
+
+    /// Reads recovery ordering metadata without parsing or hashing the snapshot payload.
+    pub async fn get_circuit_breaker_head_metadata(
+        &self,
+    ) -> Result<Option<CircuitBreakerHeadMetadata>, StoreError> {
+        fetch_circuit_breaker_head_metadata(self.pool()).await
     }
 
     pub async fn append_core_event(
@@ -125,6 +133,16 @@ impl SqliteStateStore {
         let leg = transaction.update_execution_leg_state(update).await?;
         transaction.commit().await?;
         Ok(leg)
+    }
+
+    pub async fn update_execution_lifecycle(
+        &self,
+        update: ExecutionLifecycleUpdate,
+    ) -> Result<StoredExecutionPlan, StoreError> {
+        let mut transaction = self.begin_write().await?;
+        let plan = transaction.update_execution_lifecycle(update).await?;
+        transaction.commit().await?;
+        Ok(plan)
     }
 
     pub async fn commit_execution_workflow(
@@ -313,6 +331,13 @@ impl WriteTransaction {
         fetch_circuit_breaker_head_revision(self.connection()).await
     }
 
+    /// Reads recovery ordering metadata without parsing or hashing the snapshot payload.
+    pub async fn get_circuit_breaker_head_metadata(
+        &mut self,
+    ) -> Result<Option<CircuitBreakerHeadMetadata>, StoreError> {
+        fetch_circuit_breaker_head_metadata(self.connection()).await
+    }
+
     pub async fn append_core_event(
         &mut self,
         event: NewCoreEvent,
@@ -367,6 +392,13 @@ impl WriteTransaction {
         update: LegStateUpdate,
     ) -> Result<StoredExecutionLeg, StoreError> {
         update_execution_leg_state_on(self.connection(), update).await
+    }
+
+    pub async fn update_execution_lifecycle(
+        &mut self,
+        update: ExecutionLifecycleUpdate,
+    ) -> Result<StoredExecutionPlan, StoreError> {
+        update_execution_lifecycle_on(self.connection(), update).await
     }
 
     pub async fn commit_execution_workflow(
@@ -580,6 +612,38 @@ where
     revision
         .map(|revision| circuit_breaker_revision_from_i64("head", revision))
         .transpose()
+}
+
+async fn fetch_circuit_breaker_head_metadata<'e, E>(
+    executor: E,
+) -> Result<Option<CircuitBreakerHeadMetadata>, StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row = sqlx::query(
+        "SELECT state_revision, recovery_epoch FROM circuit_breaker_snapshots \
+         WHERE scope = ? ORDER BY state_revision DESC LIMIT 1",
+    )
+    .bind(GLOBAL_CIRCUIT_BREAKER_SCOPE)
+    .fetch_optional(executor)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let revision_i64: i64 = row.try_get("state_revision")?;
+    let state_revision = circuit_breaker_revision_from_i64("head", revision_i64)?;
+    let recovery_epoch_i64: i64 = row.try_get("recovery_epoch")?;
+    let recovery_epoch = u64::try_from(recovery_epoch_i64).map_err(|_| {
+        StoreError::corrupt(
+            "circuit_breaker_snapshot",
+            circuit_breaker_snapshot_key(state_revision),
+            "recovery_epoch must be non-negative",
+        )
+    })?;
+    Ok(Some(CircuitBreakerHeadMetadata {
+        state_revision,
+        recovery_epoch,
+    }))
 }
 
 fn circuit_breaker_snapshot_from_row(
@@ -797,6 +861,8 @@ fn non_negative_u64_to_i64(field: &'static str, value: u64) -> Result<i64, Store
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionPlanJournal {
+    risk_id: RiskId,
+    intent_id: IntentId,
     definition: ExecutionPlanDefinition,
     legs: Vec<ExecutionLegDefinition>,
 }
@@ -807,6 +873,8 @@ pub(crate) async fn insert_execution_plan_on(
 ) -> Result<WriteOutcome<StoredExecutionPlan>, StoreError> {
     validate_new_execution_plan(connection, &new_plan).await?;
     let journal = ExecutionPlanJournal {
+        risk_id: new_plan.risk_id.clone(),
+        intent_id: new_plan.intent_id.clone(),
         definition: new_plan.plan.definition.clone(),
         legs: new_plan
             .plan
@@ -847,11 +915,8 @@ pub(crate) async fn insert_execution_plan_on(
     .await?;
 
     if insert.rows_affected() == 0 {
-        return match fetch_execution_plan_by_id(
-            &mut *connection,
-            &new_plan.plan.definition.plan_id,
-        )
-        .await?
+        return match fetch_execution_plan_by_id(&mut *connection, &new_plan.plan.definition.plan_id)
+            .await?
         {
             Some(existing) => resolve_execution_plan_replay(existing, &new_plan, &payload),
             None => Err(StoreError::conflict(
@@ -1014,6 +1079,20 @@ async fn execution_plan_from_row(
     validate_column(
         "execution_plan",
         &key,
+        "risk_id",
+        &row.try_get::<String, _>("risk_id")?,
+        journal.risk_id.as_str(),
+    )?;
+    validate_column(
+        "execution_plan",
+        &key,
+        "intent_id",
+        &row.try_get::<String, _>("intent_id")?,
+        journal.intent_id.as_str(),
+    )?;
+    validate_column(
+        "execution_plan",
+        &key,
         "plan_id",
         &key,
         journal.definition.plan_id.as_str(),
@@ -1056,12 +1135,8 @@ async fn execution_plan_from_row(
             "created_at/updated_at lifecycle is invalid",
         ));
     }
-    let status: ExecutionPlanStatus = parse_enum_column(
-        "execution_plan",
-        &key,
-        "status",
-        row.try_get("status")?,
-    )?;
+    let status: ExecutionPlanStatus =
+        parse_enum_column("execution_plan", &key, "status", row.try_get("status")?)?;
 
     let leg_rows = sqlx::query(
         "SELECT leg_id, plan_id, symbol, action, status, payload_json, payload_hash, updated_at \
@@ -1157,8 +1232,8 @@ async fn execution_plan_from_row(
         )
     })?;
 
-    let risk_id = RiskId::from(row.try_get::<String, _>("risk_id")?);
-    let intent_id = IntentId::from(row.try_get::<String, _>("intent_id")?);
+    let risk_id = journal.risk_id;
+    let intent_id = journal.intent_id;
     let risk = fetch_risk_result_by_id(&mut *connection, &risk_id)
         .await?
         .ok_or_else(|| {
@@ -1177,10 +1252,8 @@ async fn execution_plan_from_row(
                 format!("parent trade intent {intent_id} is missing"),
             )
         })?;
-    validate_execution_plan_graph(
-        &plan, &risk_id, &intent_id, created_at, &risk, &intent,
-    )
-    .map_err(|reason| StoreError::corrupt("execution_plan", &key, reason))?;
+    validate_execution_plan_graph(&plan, &risk_id, &intent_id, created_at, &risk, &intent)
+        .map_err(|reason| StoreError::corrupt("execution_plan", &key, reason))?;
 
     Ok(StoredExecutionPlan {
         plan,
@@ -1192,9 +1265,7 @@ async fn execution_plan_from_row(
     })
 }
 
-fn execution_leg_from_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> Result<StoredExecutionLeg, StoreError> {
+fn execution_leg_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredExecutionLeg, StoreError> {
     let key: String = row.try_get("leg_id")?;
     let payload = CanonicalJson::from_stored(
         "execution_leg",
@@ -1202,8 +1273,7 @@ fn execution_leg_from_row(
         row.try_get("payload_json")?,
         row.try_get("payload_hash")?,
     )?;
-    let definition: ExecutionLegDefinition =
-        deserialize_payload("execution_leg", &key, &payload)?;
+    let definition: ExecutionLegDefinition = deserialize_payload("execution_leg", &key, &payload)?;
     validate_column(
         "execution_leg",
         &key,
@@ -1236,12 +1306,7 @@ fn execution_leg_from_row(
     let leg = ExecutionLeg {
         definition,
         state: ExecutionLegState {
-            status: parse_enum_column(
-                "execution_leg",
-                &key,
-                "status",
-                row.try_get("status")?,
-            )?,
+            status: parse_enum_column("execution_leg", &key, "status", row.try_get("status")?)?,
         },
     };
     leg.validate().map_err(|error| {
@@ -1283,12 +1348,7 @@ async fn fetch_execution_leg_by_id(
                 "parent execution plan is missing",
             )
         })?;
-    if !plan
-        .plan
-        .legs
-        .iter()
-        .any(|candidate| candidate == &leg.leg)
-    {
+    if !plan.plan.legs.iter().any(|candidate| candidate == &leg.leg) {
         return Err(StoreError::corrupt(
             "execution_leg",
             leg_id.as_str(),
@@ -1310,11 +1370,13 @@ pub(crate) async fn update_execution_plan_state_on(
         })?;
     let mut proposed = current.plan.clone();
     proposed.state = update.state.clone();
-    proposed.validate().map_err(|error| StoreError::InvalidRecord {
-        entity: "execution_plan_state",
-        key: format!("plan_id={}", update.plan_id),
-        reason: error.to_string(),
-    })?;
+    proposed
+        .validate()
+        .map_err(|error| StoreError::InvalidRecord {
+            entity: "execution_plan_state",
+            key: format!("plan_id={}", update.plan_id),
+            reason: error.to_string(),
+        })?;
     if update.state.filled_legs != current.plan.state.filled_legs
         || update.state.failed_legs != current.plan.state.failed_legs
     {
@@ -1380,11 +1442,41 @@ pub(crate) async fn update_execution_leg_state_on(
     }
     let mut proposed = current.leg.clone();
     proposed.state = update.state.clone();
-    proposed.validate().map_err(|error| StoreError::InvalidRecord {
-        entity: "execution_leg_state",
-        key: format!("leg_id={}", update.leg_id),
-        reason: error.to_string(),
-    })?;
+    proposed
+        .validate()
+        .map_err(|error| StoreError::InvalidRecord {
+            entity: "execution_leg_state",
+            key: format!("leg_id={}", update.leg_id),
+            reason: error.to_string(),
+        })?;
+    let current_plan = fetch_execution_plan_by_id(&mut *connection, &update.plan_id)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "execution_plan",
+            key: format!("plan_id={}", update.plan_id),
+        })?;
+    let mut projected_plan = current_plan.plan;
+    let projected_leg = projected_plan
+        .legs
+        .iter_mut()
+        .find(|leg| leg.definition.leg_id == update.leg_id)
+        .ok_or_else(|| {
+            StoreError::corrupt(
+                "execution_plan",
+                update.plan_id.as_str(),
+                format!("plan journal is missing leg {}", update.leg_id),
+            )
+        })?;
+    projected_leg.state = update.state.clone();
+    projected_plan
+        .validate()
+        .map_err(|error| StoreError::InvalidRecord {
+            entity: "execution_leg_state",
+            key: format!("leg_id={}", update.leg_id),
+            reason: format!(
+                "standalone leg update would make the plan projection inconsistent; use update_execution_lifecycle: {error}"
+            ),
+        })?;
 
     let result = sqlx::query(
         "UPDATE execution_legs SET status = ?, updated_at = ? \
@@ -1426,6 +1518,229 @@ pub(crate) async fn update_execution_leg_state_on(
             key: format!("leg_id={}", update.leg_id),
         }),
     }
+}
+
+pub(crate) async fn update_execution_lifecycle_on(
+    connection: &mut SqliteConnection,
+    update: ExecutionLifecycleUpdate,
+) -> Result<StoredExecutionPlan, StoreError> {
+    validate_execution_lifecycle_update_shape(&update)?;
+    sqlx::query("SAVEPOINT execution_lifecycle_bundle")
+        .execute(&mut *connection)
+        .await?;
+    let result = update_execution_lifecycle_in_savepoint(connection, &update).await;
+    match result {
+        Ok(plan) => {
+            sqlx::query("RELEASE SAVEPOINT execution_lifecycle_bundle")
+                .execute(&mut *connection)
+                .await?;
+            Ok(plan)
+        }
+        Err(error) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT execution_lifecycle_bundle")
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT execution_lifecycle_bundle")
+                .execute(&mut *connection)
+                .await?;
+            Err(error)
+        }
+    }
+}
+
+fn validate_execution_lifecycle_update_shape(
+    update: &ExecutionLifecycleUpdate,
+) -> Result<(), StoreError> {
+    let key = format!("plan_id={}", update.plan.plan_id);
+    if update.legs.is_empty() {
+        return Err(StoreError::InvalidRecord {
+            entity: "execution_lifecycle",
+            key,
+            reason: "at least one leg update is required".to_owned(),
+        });
+    }
+    let mut leg_ids = HashSet::with_capacity(update.legs.len());
+    for leg in &update.legs {
+        if leg.plan_id != update.plan.plan_id {
+            return Err(StoreError::InvalidRecord {
+                entity: "execution_lifecycle",
+                key,
+                reason: format!("leg {} belongs to another plan", leg.leg_id),
+            });
+        }
+        if !leg_ids.insert(leg.leg_id.clone()) {
+            return Err(StoreError::InvalidRecord {
+                entity: "execution_lifecycle",
+                key,
+                reason: format!("duplicate leg update for {}", leg.leg_id),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn update_execution_lifecycle_in_savepoint(
+    connection: &mut SqliteConnection,
+    update: &ExecutionLifecycleUpdate,
+) -> Result<StoredExecutionPlan, StoreError> {
+    let plan_id = &update.plan.plan_id;
+    let current = fetch_execution_plan_by_id(&mut *connection, plan_id)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "execution_plan",
+            key: format!("plan_id={plan_id}"),
+        })?;
+
+    let leg_rows = sqlx::query(
+        "SELECT leg_id, plan_id, symbol, action, status, payload_json, payload_hash, updated_at \
+         FROM execution_legs WHERE plan_id = ?",
+    )
+    .bind(plan_id.as_str())
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut stored_legs = HashMap::with_capacity(leg_rows.len());
+    for row in leg_rows {
+        let leg = execution_leg_from_row(row)?;
+        stored_legs.insert(leg.leg.definition.leg_id.clone(), leg);
+    }
+
+    let exact_plan_replay =
+        current.plan.state == update.plan.state && current.updated_at == update.plan.updated_at;
+    let exact_leg_replay = update.legs.iter().all(|leg| {
+        stored_legs.get(&leg.leg_id).is_some_and(|stored| {
+            stored.plan_id == leg.plan_id
+                && stored.leg.state == leg.state
+                && stored.updated_at == leg.updated_at
+        })
+    });
+    if exact_plan_replay && exact_leg_replay {
+        return Ok(current);
+    }
+
+    if current.plan.state.status != update.plan.expected_status
+        || current.updated_at != update.plan.expected_updated_at
+        || update.plan.updated_at <= update.plan.expected_updated_at
+    {
+        return Err(StoreError::StaleWrite {
+            entity: "execution_lifecycle",
+            key: format!("plan_id={plan_id}"),
+        });
+    }
+    for leg in &update.legs {
+        let Some(stored) = stored_legs.get(&leg.leg_id) else {
+            return Err(StoreError::NotFound {
+                entity: "execution_leg",
+                key: format!("leg_id={}", leg.leg_id),
+            });
+        };
+        if stored.plan_id != leg.plan_id {
+            return Err(StoreError::conflict(
+                "execution_lifecycle",
+                format!("leg_id={}", leg.leg_id),
+            ));
+        }
+        if stored.leg.state.status != leg.expected_status
+            || stored.updated_at != leg.expected_updated_at
+            || leg.updated_at <= leg.expected_updated_at
+        {
+            return Err(StoreError::StaleWrite {
+                entity: "execution_lifecycle",
+                key: format!("leg_id={}", leg.leg_id),
+            });
+        }
+    }
+
+    let mut final_plan = current.plan.clone();
+    for leg_update in &update.legs {
+        let leg = final_plan
+            .legs
+            .iter_mut()
+            .find(|leg| leg.definition.leg_id == leg_update.leg_id)
+            .ok_or_else(|| {
+                StoreError::corrupt(
+                    "execution_plan",
+                    plan_id.as_str(),
+                    format!("plan journal is missing leg {}", leg_update.leg_id),
+                )
+            })?;
+        leg.state = leg_update.state.clone();
+    }
+    final_plan.state = update.plan.state.clone();
+    final_plan
+        .validate()
+        .map_err(|error| StoreError::InvalidRecord {
+            entity: "execution_lifecycle",
+            key: format!("plan_id={plan_id}"),
+            reason: error.to_string(),
+        })?;
+    let updated_leg_ids: HashSet<_> = update.legs.iter().map(|leg| &leg.leg_id).collect();
+    let latest_leg_update = update
+        .legs
+        .iter()
+        .map(|leg| leg.updated_at)
+        .chain(
+            stored_legs
+                .values()
+                .filter(|stored| !updated_leg_ids.contains(&stored.leg.definition.leg_id))
+                .map(|stored| stored.updated_at),
+        )
+        .max()
+        .unwrap_or(current.created_at);
+    if update.plan.updated_at < latest_leg_update {
+        return Err(StoreError::InvalidRecord {
+            entity: "execution_lifecycle",
+            key: format!("plan_id={plan_id}"),
+            reason: "plan updated_at must not precede any final leg projection".to_owned(),
+        });
+    }
+
+    for leg in &update.legs {
+        let result = sqlx::query(
+            "UPDATE execution_legs SET status = ?, updated_at = ? \
+             WHERE plan_id = ? AND leg_id = ? AND status = ? AND updated_at = ? \
+               AND updated_at < ?",
+        )
+        .bind(leg.state.status.as_str())
+        .bind(leg.updated_at)
+        .bind(leg.plan_id.as_str())
+        .bind(leg.leg_id.as_str())
+        .bind(leg.expected_status.as_str())
+        .bind(leg.expected_updated_at)
+        .bind(leg.updated_at)
+        .execute(&mut *connection)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::StaleWrite {
+                entity: "execution_lifecycle",
+                key: format!("leg_id={}", leg.leg_id),
+            });
+        }
+    }
+    let result = sqlx::query(
+        "UPDATE execution_plans SET status = ?, updated_at = ? \
+         WHERE plan_id = ? AND status = ? AND updated_at = ? AND updated_at < ?",
+    )
+    .bind(update.plan.state.status.as_str())
+    .bind(update.plan.updated_at)
+    .bind(plan_id.as_str())
+    .bind(update.plan.expected_status.as_str())
+    .bind(update.plan.expected_updated_at)
+    .bind(update.plan.updated_at)
+    .execute(&mut *connection)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(StoreError::StaleWrite {
+            entity: "execution_lifecycle",
+            key: format!("plan_id={plan_id}"),
+        });
+    }
+
+    fetch_execution_plan_by_id(&mut *connection, plan_id)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "execution_plan",
+            key: format!("plan_id={plan_id}"),
+        })
 }
 
 fn validate_execution_plan_graph(
@@ -1502,7 +1817,10 @@ fn validate_execution_plan_graph(
         if leg.definition.symbol != approved.symbol
             || leg.definition.symbol != candidate.symbol
             || leg.definition.action != expected_action
-            || leg.definition.lots.is_none_or(|lots| !same_f64_bits(lots, approved.lots))
+            || leg
+                .definition
+                .lots
+                .is_none_or(|lots| !same_f64_bits(lots, approved.lots))
             || leg
                 .definition
                 .sl
@@ -1547,6 +1865,543 @@ fn same_optional_f64_bits(left: Option<f64>, right: Option<f64>) -> bool {
 
 fn same_f64_bits(left: f64, right: f64) -> bool {
     left.is_finite() && right.is_finite() && left.to_bits() == right.to_bits()
+}
+
+pub(crate) async fn commit_execution_workflow_on(
+    connection: &mut SqliteConnection,
+    workflow: NewExecutionWorkflow,
+) -> Result<WriteOutcome<StoredExecutionWorkflow>, StoreError> {
+    validate_new_execution_workflow(&workflow)?;
+    sqlx::query("SAVEPOINT execution_workflow_bundle")
+        .execute(&mut *connection)
+        .await?;
+    let result = commit_execution_workflow_in_savepoint(connection, &workflow).await;
+    match result {
+        Ok(outcome) => {
+            sqlx::query("RELEASE SAVEPOINT execution_workflow_bundle")
+                .execute(&mut *connection)
+                .await?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT execution_workflow_bundle")
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT execution_workflow_bundle")
+                .execute(&mut *connection)
+                .await?;
+            Err(error)
+        }
+    }
+}
+
+async fn commit_execution_workflow_in_savepoint(
+    connection: &mut SqliteConnection,
+    workflow: &NewExecutionWorkflow,
+) -> Result<WriteOutcome<StoredExecutionWorkflow>, StoreError> {
+    let mut inserted_any = false;
+    inserted_any |= insert_trade_intent_on(connection, workflow.intent.clone())
+        .await?
+        .was_inserted();
+    inserted_any |= insert_risk_result_on(connection, workflow.risk_result.clone())
+        .await?
+        .was_inserted();
+    inserted_any |= insert_execution_plan_on(connection, workflow.plan.clone())
+        .await?
+        .was_inserted();
+    for command in workflow.commands.iter().cloned() {
+        inserted_any |= insert_execution_command_on(connection, command)
+            .await?
+            .was_inserted();
+    }
+    for state in workflow.command_states.iter().cloned() {
+        inserted_any |= insert_execution_command_state_on(connection, state)
+            .await?
+            .was_inserted();
+    }
+
+    let plan_id = &workflow.plan.plan.definition.plan_id;
+    let stored = fetch_execution_workflow_by_plan_id(connection, plan_id)
+        .await?
+        .ok_or_else(|| {
+            StoreError::corrupt(
+                "execution_workflow",
+                plan_id.as_str(),
+                "committed workflow could not be read back",
+            )
+        })?;
+    validate_execution_workflow_replay(&stored, &workflow)?;
+
+    Ok(if inserted_any {
+        WriteOutcome::Inserted(stored)
+    } else {
+        WriteOutcome::Duplicate(stored)
+    })
+}
+
+async fn fetch_execution_workflow_by_plan_id(
+    connection: &mut SqliteConnection,
+    plan_id: &PlanId,
+) -> Result<Option<StoredExecutionWorkflow>, StoreError> {
+    let Some(plan) = fetch_execution_plan_by_id(&mut *connection, plan_id).await? else {
+        return Ok(None);
+    };
+    let risk_result = fetch_risk_result_by_id(&mut *connection, &plan.risk_id)
+        .await?
+        .ok_or_else(|| {
+            StoreError::corrupt(
+                "execution_workflow",
+                plan_id.as_str(),
+                format!("parent risk result {} is missing", plan.risk_id),
+            )
+        })?;
+    let intent = fetch_trade_intent_by_id(&mut *connection, &plan.intent_id)
+        .await?
+        .ok_or_else(|| {
+            StoreError::corrupt(
+                "execution_workflow",
+                plan_id.as_str(),
+                format!("parent trade intent {} is missing", plan.intent_id),
+            )
+        })?;
+
+    let command_rows = sqlx::query(
+        "SELECT command_id, risk_id, plan_id, leg_id, account_id, client_id, terminal_id, \
+                symbol, action, expires_at, idempotency_key, payload_json, payload_hash, hmac, \
+                created_at \
+         FROM execution_commands WHERE plan_id = ?",
+    )
+    .bind(plan_id.as_str())
+    .fetch_all(&mut *connection)
+    .await?;
+    let mut commands_by_leg = HashMap::with_capacity(command_rows.len());
+    for row in command_rows {
+        let command = execution_command_from_row(row)?;
+        validate_stored_execution_command_graph(&command, &plan, &risk_result, &intent).map_err(
+            |reason| {
+                StoreError::corrupt(
+                    "execution_command",
+                    command.command.command_id.as_str(),
+                    reason,
+                )
+            },
+        )?;
+        let leg_id = command.command.leg_id.clone().ok_or_else(|| {
+            StoreError::corrupt(
+                "execution_workflow",
+                plan_id.as_str(),
+                format!("command {} has no leg_id", command.command.command_id),
+            )
+        })?;
+        if commands_by_leg.insert(leg_id, command).is_some() {
+            return Err(StoreError::corrupt(
+                "execution_workflow",
+                plan_id.as_str(),
+                "multiple commands reference the same plan leg",
+            ));
+        }
+    }
+    if commands_by_leg.len() != plan.plan.legs.len() {
+        return Err(StoreError::corrupt(
+            "execution_workflow",
+            plan_id.as_str(),
+            "commands do not correspond one-to-one with plan legs",
+        ));
+    }
+
+    let mut commands = Vec::with_capacity(plan.plan.legs.len());
+    let mut command_states = Vec::with_capacity(plan.plan.legs.len());
+    for leg in &plan.plan.legs {
+        let command = commands_by_leg
+            .remove(&leg.definition.leg_id)
+            .ok_or_else(|| {
+                StoreError::corrupt(
+                    "execution_workflow",
+                    plan_id.as_str(),
+                    format!("plan leg {} has no command", leg.definition.leg_id),
+                )
+            })?;
+        let state =
+            fetch_execution_command_state_by_id(&mut *connection, &command.command.command_id)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::corrupt(
+                        "execution_workflow",
+                        plan_id.as_str(),
+                        format!(
+                            "command {} has no lifecycle state",
+                            command.command.command_id
+                        ),
+                    )
+                })?;
+        validate_persisted_command_state(&state, &command).map_err(|reason| {
+            StoreError::corrupt(
+                "execution_command_state",
+                command.command.command_id.as_str(),
+                reason,
+            )
+        })?;
+        commands.push(command);
+        command_states.push(state);
+    }
+
+    Ok(Some(StoredExecutionWorkflow {
+        intent,
+        risk_result,
+        plan,
+        commands,
+        command_states,
+    }))
+}
+
+fn validate_new_execution_workflow(workflow: &NewExecutionWorkflow) -> Result<(), StoreError> {
+    let plan_id = &workflow.plan.plan.definition.plan_id;
+    let invalid = |reason: String| StoreError::InvalidRecord {
+        entity: "execution_workflow",
+        key: format!("plan_id={plan_id}"),
+        reason,
+    };
+
+    if workflow.intent.initial_status != TradeIntentStatus::Accepted {
+        return Err(invalid(
+            "workflow intent must have initial status ACCEPTED".to_owned(),
+        ));
+    }
+    if workflow.intent.recorded_at < 0 {
+        return Err(invalid(
+            "intent recorded_at must be non-negative".to_owned(),
+        ));
+    }
+    if workflow.plan.intent_id != workflow.intent.intent.intent_id
+        || workflow.plan.risk_id != workflow.risk_result.result.risk_id
+        || workflow.risk_result.result.intent_id != workflow.intent.intent.intent_id
+    {
+        return Err(invalid(
+            "intent, risk result, and plan identities do not form one graph".to_owned(),
+        ));
+    }
+
+    let mut commands_by_leg = HashMap::with_capacity(workflow.commands.len());
+    let mut command_ids = HashSet::with_capacity(workflow.commands.len());
+    let mut idempotency_keys = HashSet::with_capacity(workflow.commands.len());
+    for command in &workflow.commands {
+        validate_new_execution_command_graph(
+            command,
+            &workflow.plan,
+            &workflow.risk_result,
+            &workflow.intent,
+        )
+        .map_err(&invalid)?;
+        if !command_ids.insert(command.command.command_id.clone()) {
+            return Err(invalid(format!(
+                "duplicate command_id {}",
+                command.command.command_id
+            )));
+        }
+        if !idempotency_keys.insert(command.command.idempotency_key.clone()) {
+            return Err(invalid(format!(
+                "duplicate command idempotency_key {}",
+                command.command.idempotency_key
+            )));
+        }
+        let leg_id = command
+            .command
+            .leg_id
+            .clone()
+            .expect("graph validation requires leg_id");
+        if commands_by_leg.insert(leg_id.clone(), command).is_some() {
+            return Err(invalid(format!(
+                "multiple commands reference plan leg {leg_id}"
+            )));
+        }
+    }
+    if commands_by_leg.len() != workflow.plan.plan.legs.len()
+        || workflow
+            .plan
+            .plan
+            .legs
+            .iter()
+            .any(|leg| !commands_by_leg.contains_key(&leg.definition.leg_id))
+    {
+        return Err(invalid(
+            "commands must correspond one-to-one with plan legs".to_owned(),
+        ));
+    }
+
+    let mut states_by_command = HashMap::with_capacity(workflow.command_states.len());
+    for state in &workflow.command_states {
+        if states_by_command
+            .insert(state.command_id.clone(), state)
+            .is_some()
+        {
+            return Err(invalid(format!(
+                "duplicate command state for {}",
+                state.command_id
+            )));
+        }
+    }
+    if states_by_command.len() != workflow.commands.len() {
+        return Err(invalid(
+            "every command must have exactly one initial state".to_owned(),
+        ));
+    }
+    for command in &workflow.commands {
+        let state = states_by_command
+            .get(&command.command.command_id)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "command {} has no initial state",
+                    command.command.command_id
+                ))
+            })?;
+        validate_initial_command_state(state, command).map_err(&invalid)?;
+    }
+    Ok(())
+}
+
+fn validate_new_execution_command_graph(
+    command: &NewExecutionCommand,
+    plan: &NewExecutionPlan,
+    risk: &NewRiskResult,
+    intent: &NewTradeIntent,
+) -> Result<(), String> {
+    validate_execution_command_graph(
+        &command.command,
+        &command.risk_id,
+        command.created_at,
+        &plan.plan,
+        &plan.risk_id,
+        plan.recorded_at,
+        &risk.result,
+        &intent.intent,
+    )
+}
+
+fn validate_stored_execution_command_graph(
+    command: &StoredExecutionCommand,
+    plan: &StoredExecutionPlan,
+    risk: &StoredRiskResult,
+    intent: &StoredTradeIntent,
+) -> Result<(), String> {
+    validate_execution_command_graph(
+        &command.command,
+        &command.risk_id,
+        command.created_at,
+        &plan.plan,
+        &plan.risk_id,
+        plan.created_at,
+        &risk.result,
+        &intent.intent,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_execution_command_graph(
+    command: &ExecutionCommand,
+    command_risk_id: &RiskId,
+    command_created_at: i64,
+    plan: &ExecutionPlan,
+    plan_risk_id: &RiskId,
+    plan_created_at: i64,
+    risk: &RiskResult,
+    intent: &TradeIntent,
+) -> Result<(), String> {
+    let plan_id = command
+        .plan_id
+        .as_ref()
+        .ok_or_else(|| "workflow command has no plan_id".to_owned())?;
+    let leg_id = command
+        .leg_id
+        .as_ref()
+        .ok_or_else(|| "workflow command has no leg_id".to_owned())?;
+    let leg = plan
+        .legs
+        .iter()
+        .find(|leg| leg.definition.leg_id == *leg_id)
+        .ok_or_else(|| format!("command references unknown plan leg {leg_id}"))?;
+
+    if *plan_id != plan.definition.plan_id
+        || *command_risk_id != *plan_risk_id
+        || *plan_risk_id != risk.risk_id
+        || command.account_id != plan.definition.account_id
+        || command.account_id != risk.account_id
+        || command.account_id != intent.account_id
+        || command.strategy_id != plan.definition.strategy_id
+        || command.strategy_id != intent.strategy_id
+    {
+        return Err("command identity differs from its plan or approval".to_owned());
+    }
+    if command.symbol != leg.definition.symbol
+        || command.action != leg.definition.action
+        || !same_optional_f64_bits(command.lots, leg.definition.lots)
+        || !same_optional_f64_bits(command.sl, leg.definition.sl)
+        || !same_optional_f64_bits(command.tp, leg.definition.tp)
+    {
+        return Err(format!(
+            "command {} drifts from approved plan leg {leg_id}",
+            command.command_id
+        ));
+    }
+    if command_created_at < plan_created_at
+        || command_created_at < risk.evaluated_at
+        || command_created_at < 0
+        || command.expires_at <= command_created_at
+        || command.expires_at > risk.valid_until
+        || command.expires_at > intent.signal_expires_at
+    {
+        return Err("command lifecycle is outside the approved execution window".to_owned());
+    }
+    if !is_lower_hex_64(&command.hmac) {
+        return Err("command hmac must be lowercase 64-character hex".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_initial_command_state(
+    state: &ExecutionCommandState,
+    command: &NewExecutionCommand,
+) -> Result<(), String> {
+    if state.command_id != command.command.command_id
+        || state.account_id != command.command.account_id
+        || state.plan_id != command.command.plan_id
+        || state.leg_id != command.command.leg_id
+        || state.created_at != command.created_at
+        || state.updated_at != command.created_at
+    {
+        return Err(format!(
+            "initial state identity differs from command {}",
+            command.command.command_id
+        ));
+    }
+    if state.status != ExecutionCommandStatus::Created
+        || state.delivery_attempts != 0
+        || state.last_delivery_error.is_some()
+        || state.dispatched_at.is_some()
+        || state.command_received_at.is_some()
+        || state.reconciling_at.is_some()
+        || state.completed_at.is_some()
+    {
+        return Err(format!(
+            "command {} must start in a pristine CREATED state",
+            command.command.command_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_persisted_command_state(
+    state: &ExecutionCommandState,
+    command: &StoredExecutionCommand,
+) -> Result<(), String> {
+    if state.command_id != command.command.command_id
+        || state.account_id != command.command.account_id
+        || state.plan_id != command.command.plan_id
+        || state.leg_id != command.command.leg_id
+        || state.created_at != command.created_at
+    {
+        return Err("state identity differs from its command".to_owned());
+    }
+    if state.created_at < 0 || state.updated_at < state.created_at {
+        return Err("created_at/updated_at lifecycle is invalid".to_owned());
+    }
+    for (field, timestamp) in [
+        ("dispatched_at", state.dispatched_at),
+        ("command_received_at", state.command_received_at),
+        ("reconciling_at", state.reconciling_at),
+        ("completed_at", state.completed_at),
+    ] {
+        if timestamp
+            .is_some_and(|timestamp| timestamp < state.created_at || timestamp > state.updated_at)
+        {
+            return Err(format!("{field} is outside the persisted lifecycle window"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_execution_workflow_replay(
+    stored: &StoredExecutionWorkflow,
+    incoming: &NewExecutionWorkflow,
+) -> Result<(), StoreError> {
+    let plan_id = &incoming.plan.plan.definition.plan_id;
+    let conflict = || StoreError::conflict("execution_workflow", format!("plan_id={plan_id}"));
+    let intent_payload = CanonicalJson::from_serializable(&incoming.intent.intent)?;
+    let risk_payload = CanonicalJson::from_serializable(&incoming.risk_result.result)?;
+    let plan_payload = execution_plan_journal_payload(&incoming.plan)?;
+    if stored.intent.payload != intent_payload
+        || stored.intent.status != incoming.intent.initial_status
+        || stored.intent.created_at != incoming.intent.recorded_at
+        || stored.intent.updated_at != incoming.intent.recorded_at
+        || stored.risk_result.payload != risk_payload
+        || stored.plan.payload != plan_payload
+        || stored.plan.risk_id != incoming.plan.risk_id
+        || stored.plan.intent_id != incoming.plan.intent_id
+        || stored.plan.created_at != incoming.plan.recorded_at
+    {
+        return Err(conflict());
+    }
+
+    let stored_commands: HashMap<_, _> = stored
+        .commands
+        .iter()
+        .map(|command| (command.command.command_id.clone(), command))
+        .collect();
+    if stored_commands.len() != incoming.commands.len() {
+        return Err(conflict());
+    }
+    for command in &incoming.commands {
+        let payload = CanonicalJson::from_serializable(&command.command)?;
+        let Some(existing) = stored_commands.get(&command.command.command_id) else {
+            return Err(conflict());
+        };
+        if existing.risk_id != command.risk_id
+            || existing.payload != payload
+            || existing.created_at != command.created_at
+        {
+            return Err(conflict());
+        }
+    }
+
+    let stored_states: HashMap<_, _> = stored
+        .command_states
+        .iter()
+        .map(|state| (state.command_id.clone(), state))
+        .collect();
+    if stored_states.len() != incoming.command_states.len() {
+        return Err(conflict());
+    }
+    for state in &incoming.command_states {
+        let Some(existing) = stored_states.get(&state.command_id) else {
+            return Err(conflict());
+        };
+        if !same_command_state_identity(existing, state) || existing.updated_at < state.updated_at {
+            return Err(conflict());
+        }
+    }
+    Ok(())
+}
+
+fn execution_plan_journal_payload(
+    new_plan: &NewExecutionPlan,
+) -> Result<CanonicalJson, StoreError> {
+    CanonicalJson::from_serializable(&ExecutionPlanJournal {
+        risk_id: new_plan.risk_id.clone(),
+        intent_id: new_plan.intent_id.clone(),
+        definition: new_plan.plan.definition.clone(),
+        legs: new_plan
+            .plan
+            .legs
+            .iter()
+            .map(|leg| leg.definition.clone())
+            .collect(),
+    })
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(crate) async fn append_core_event_on(
@@ -1624,7 +2479,7 @@ pub(crate) async fn append_core_event_on(
     }
 }
 
-async fn fetch_core_event_by_id<'e, E>(
+pub(crate) async fn fetch_core_event_by_id<'e, E>(
     executor: E,
     event_id: &str,
 ) -> Result<Option<StoredCoreEvent>, StoreError>

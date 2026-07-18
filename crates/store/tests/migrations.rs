@@ -5,12 +5,19 @@ const INIT_SQL: &str = include_str!("../migrations/V0001__init.sql");
 const STATE_STORE_SQL: &str = include_str!("../migrations/V0002__state_store_schema.sql");
 const EXECUTION_DURABILITY_SQL: &str =
     include_str!("../migrations/V0003__execution_durability.sql");
+const RECONCILIATION_DURABILITY_SQL: &str =
+    include_str!("../migrations/V0004__reconciliation_durability.sql");
 
-fn embedded_migrations() -> [Migration; 3] {
+fn embedded_migrations() -> [Migration; 4] {
     [
         Migration::new(1, "init", INIT_SQL),
         Migration::new(2, "state_store_schema", STATE_STORE_SQL),
         Migration::new(3, "execution_durability", EXECUTION_DURABILITY_SQL),
+        Migration::new(
+            4,
+            "reconciliation_durability",
+            RECONCILIATION_DURABILITY_SQL,
+        ),
     ]
 }
 
@@ -39,7 +46,7 @@ async fn first_run_applies_all_embedded_migrations() {
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 4);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "init");
     assert_eq!(rows[0].2, Migration::new(1, "init", INIT_SQL).checksum());
@@ -58,7 +65,19 @@ async fn first_run_applies_all_embedded_migrations() {
         Migration::new(3, "execution_durability", EXECUTION_DURABILITY_SQL).checksum()
     );
     assert!(rows[2].3 > 0);
-    assert_eq!(user_version, 3);
+    assert_eq!(rows[3].0, 4);
+    assert_eq!(rows[3].1, "reconciliation_durability");
+    assert_eq!(
+        rows[3].2,
+        Migration::new(
+            4,
+            "reconciliation_durability",
+            RECONCILIATION_DURABILITY_SQL
+        )
+        .checksum()
+    );
+    assert!(rows[3].3 > 0);
+    assert_eq!(user_version, 4);
 }
 
 #[tokio::test]
@@ -73,7 +92,7 @@ async fn repeated_run_is_idempotent() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(count, 3);
+    assert_eq!(count, 4);
 }
 
 #[tokio::test]
@@ -99,8 +118,8 @@ async fn version_one_database_upgrades_to_latest_schema() {
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(versions, vec![1, 2, 3]);
-    assert_eq!(user_version, 3);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(user_version, 4);
 }
 
 #[tokio::test]
@@ -115,14 +134,16 @@ async fn version_two_database_upgrades_to_execution_durability_schema() {
     .await
     .expect("version two should apply");
 
-    migrate(&pool).await.expect("version three should apply");
+    migrate(&pool)
+        .await
+        .expect("remaining migrations should apply");
 
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .expect("migration versions should be readable");
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
 }
 
 #[tokio::test]
@@ -232,7 +253,7 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
         .expect("initial migration should succeed");
     sqlx::query(
         "INSERT INTO schema_migrations (version, name, checksum, applied_at) \
-         VALUES (4, 'unknown', 'unknown', 1)",
+         VALUES (5, 'unknown', 'unknown', 1)",
     )
     .execute(&pool)
     .await
@@ -245,8 +266,8 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
     assert!(matches!(
         error,
         MigrationError::DatabaseAhead {
-            applied: 4,
-            available: 3
+            applied: 5,
+            available: 4
         }
     ));
 }
@@ -269,7 +290,7 @@ async fn lower_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 3,
+            expected: 4,
             actual: 0
         }
     ));
@@ -281,7 +302,7 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     migrate(&pool)
         .await
         .expect("initial migration should succeed");
-    sqlx::query("PRAGMA user_version = 4")
+    sqlx::query("PRAGMA user_version = 5")
         .execute(&pool)
         .await
         .expect("test fixture should raise user_version");
@@ -293,8 +314,8 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 3,
-            actual: 4
+            expected: 4,
+            actual: 5
         }
     ));
 }
@@ -309,8 +330,9 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         embedded_migrations()[0],
         embedded_migrations()[1],
         embedded_migrations()[2],
+        embedded_migrations()[3],
         Migration::new(
-            4,
+            5,
             "broken",
             "CREATE TABLE rollback_probe (id INTEGER PRIMARY KEY);\
              INSERT INTO missing_table DEFAULT VALUES;",
@@ -342,8 +364,8 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         .expect("user_version should be readable");
 
     assert!(!probe_exists);
-    assert_eq!(migration_count, 3);
-    assert_eq!(user_version, 3);
+    assert_eq!(migration_count, 4);
+    assert_eq!(user_version, 4);
 }
 
 #[test]

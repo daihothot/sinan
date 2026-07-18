@@ -19,11 +19,13 @@ docs/quant_trading_7_layer_target_architecture.md
 ## 当前状态
 
 - 架构和实现规格已经完成记录，并与当前代码保持同步。
-- 第一、第二、第三里程碑的 Rust 工作区已经实现。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
+- 第一至第四里程碑已经完成；第五个 Reconciliation 里程碑的纯领域与 V0004 State Store 范围也已完成。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
 - `sinan-types`、`sinan-protocol`、三个协议黄金样例、SQLite migration、repository 和 state-ingest projection 均已实现并通过测试。
-- `sinan-store` 已有 22 张业务表的 V0002 schema、canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 ingest projection rebuild。
+- `sinan-store` 当前共有 27 张业务表：V0002 的 22 张基础表、V0003 的 Circuit Breaker journal，以及 V0004 的 4 张 Reconciliation run / checkpoint / set-membership 表；canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 projection rebuild 均已实现。
 - `sinan-risk` 已实现不可变 `RiskRequest` / policy / capacity / full-set watermark 领域模型、确定性 Decimal position sizing evaluator 和纯 circuit breaker 状态机。
-- `sinan-types` 已增加带语义校验的共享 `RiskResult` / `AdjustedRiskLeg` DTO，`sinan-store` 已增加不可变 `risk_results` typed insert/get、幂等和损坏检测；Execution、Reconciliation、Gateway、HTTP 等仍是后续里程碑范围。
+- `sinan-execution` 已实现从 approved `RiskResult` 构建 plan / command、精确 lots 映射、command 状态机、leg / plan projector 和 recovery decision；`sinan-store` 已实现 intent / risk / plan / leg / command / initial state 的原子 workflow commit，以及 command、leg、plan projection 的 CAS 持久化边界。
+- Circuit breaker 已有完整、带版本的 durable snapshot 和启动恢复 adapter；缺失、损坏或未知 snapshot 会创建并持久化新的 `OPEN` safety incident，已知 `recovery_epoch` 不会回退。
+- `sinan-reconciliation` 已实现 transport-neutral request 生成、result 校验、`Completed / PendingEvidence` 评估和显式 evidence 驱动的 `ManualRequired` 升级；V0004 已实现 reconciliation run、checkpoint、position / order full-set 原子替换及旧逐行事实防复活。Gateway session、wire outbox、Native TCP / Execution WebSocket 和 HTTP 仍是后续里程碑范围。
 - 现有 MQL5 EA 仍位于 MetaTrader 工作区，不属于此 Rust 仓库。
 - 当前工作区已通过 `cargo fmt --all --check`、`cargo check --workspace`、`cargo test --workspace` 和 `git diff --check`。
 
@@ -50,6 +52,8 @@ docs/quant_trading_7_layer_target_architecture.md
 19. `RiskRequest` 由 Trading Core 内可信本地 assembler 从同一一致性读快照组装后作为不可变完整输入交给 `sinan-risk`；Risk evaluator 不得自行补读 store 或调用网络服务。
 20. position / order 必须携带账户级 full-set 水位，即使集合为空也不能省略；market 必须显式携带 `account_id`，所有风控输入必须与 intent 账户一致。
 21. sizing 的 tick ceil、volume-step floor、预算、敞口和保证金比较必须在 Decimal 域完成；第一版不允许多空、相关性或对冲抵消 hard-risk budget。
+22. Reconciliation snapshot / result 是 broker 状态观测，不是执行事实；不得据此推进 `ORDER_SENT / FILLED / FAILED / EXPIRED` 或自动 retry。执行状态只能由 typed dispatch / delivery / reconciliation evidence、`command.received`、`ExecutionEvent`、显式时间证据或显式人工证据通过 Execution 状态机推进。
+23. `ReconciliationRequest.command_ids=None` 表示该账户及可选 `terminal_id / client_id` route 内的全量 command；`Some` 必须非空、唯一并稳定排序。账户级 `Completed` 只有 request route 完全不受限（`terminal_id=None && client_id=None`），并同时持久化 `command_scope_complete=true`，证明评估使用了同一可信 Store read snapshot 的全账户 command scope，才可推进 pending-command 水位。`positions / orders` 是账户完整集合，空集合也形成水位，且每行 `observed_at` 必须等于 result 的 `observed_at`。
 
 ## Rust 工作区目标
 
@@ -181,7 +185,7 @@ cargo test --workspace
    - 重复 core fact 仍基于数据库中的原始事实幂等执行 projection apply，可修复缺失 projection，最终返回 `Duplicate`。
 6. latest projection 只允许更大的 `observed_at` 覆盖；更旧事实只追加；相同业务键和时间、不同 payload 返回 `ObservationConflict`。
 7. `AuthorizedAccountScope` 必须显式传入；空 scope 返回空集合。多表状态通过同一 SQLite read transaction 读取并稳定排序，market row 通过 `AccountMarketSnapshot` 保留账户归属。
-8. `rebuild_ingest_projections` 在单一 write transaction 中重放 account / symbol / position / order / market bar；失败整体回滚，不修改 tick-only `market_snapshots`。
+8. `rebuild_ingest_projections` 在单一 write transaction 中重放 account / symbol / position / order / market bar；V0004 落地后，该入口会在保留原 ingest report 计数口径的同时继续执行 reconciliation projection rebuild，保证 full-set-only 成员、membership 和 checkpoint 不会被 standalone ingest rebuild 丢失。失败整体回滚，不修改 tick-only `market_snapshots`。
 
 第二里程碑明确不包含：
 
@@ -202,7 +206,7 @@ cargo test --workspace
 git diff --check
 ```
 
-当前共 85 项测试，其中 `sinan-store` 43 项，覆盖 migration 升级和校验、22 表 schema、FK / CHECK / trigger、生产连接初始化、canonical JSON、双键幂等、多连接并发 CAS、command-state 创建重放、重复事实补投影、事务回滚、授权查询、latest 冲突、冗余列损坏检测以及原子 rebuild 回滚。
+相关测试覆盖 migration 升级和校验、22 表 schema、FK / CHECK / trigger、生产连接初始化、canonical JSON、双键幂等、多连接并发 CAS、command-state 创建重放、重复事实补投影、事务回滚、授权查询、latest 冲突、冗余列损坏检测以及原子 rebuild 回滚。
 
 ## 第三里程碑（已完成）
 
@@ -247,7 +251,7 @@ git diff --check
 
 第三里程碑的 trusted assembler 契约已经确定，但从 State Store 单一一致性读快照加载并组装 `RiskRequest` 的 application service 属于后续 Execution 集成范围，本里程碑不为 `sinan-risk` 增加 store 依赖。
 
-Pure circuit breaker 当前同样不依赖 Store，尚无 stable durable snapshot / restore adapter。下一里程碑必须先补充并验证完整 breaker state 的持久化恢复（含 recovery epoch / fingerprint、`incident_evidence_cleared_at`、HALF_OPEN 时间与财务 baseline、blocked count）；重启、缺失或损坏时必须 fail closed，禁止默认回到 `CLOSED`。如果该里程碑只实现纯 Execution domain，可以暂不接 Risk→Execution live flow；一旦接入，trusted assembler 和 intent / risk / plan / command 原子 transaction boundary 也必须同时落地。
+Pure circuit breaker 仍不依赖 Store。完整 breaker state 的持久化格式和 application restore adapter 已在第四里程碑落地，见下节；面向 `GET /state` 的摘要 DTO 仍不得作为 durable snapshot。
 
 第三里程碑验收已经通过：
 
@@ -258,7 +262,58 @@ cargo test --workspace
 git diff --check
 ```
 
-当前共 175 项测试，其中 `sinan-risk` 69 项（28 项 circuit breaker、41 项 evaluator），覆盖单腿 / 多腿、cost buffer、volume-step floor、volume / exposure / margin 全局缩放、风险预算单调性、freshness、跨账户输入、pending command、HOLD / CLOSE、breaker gate 和 recovery epoch；`sinan-store` 共 56 项，其中 13 项 `risk_results` 集成测试；`sinan-types` 共 17 项，覆盖 RiskResult serde 与语义校验。
+相关测试覆盖单腿 / 多腿、cost buffer、volume-step floor、volume / exposure / margin 全局缩放、风险预算单调性、freshness、跨账户输入、pending command、HOLD / CLOSE、breaker gate、recovery epoch、`RiskResult` repository 集成以及共享 DTO 语义校验。
+
+## 第四里程碑（已完成）
+
+第四里程碑完成 Circuit Breaker durable restore 和 Execution 领域 / 持久化边界，不实现 Gateway transport 或真实投递：
+
+1. `sinan-execution` 已实现 pure execution builder：
+   - 只接受仍在有效期内、语义合法的 approved `RiskResult`；
+   - `ExecutionLeg.lots` 和 `ExecutionCommand.lots` 按 `leg_id` 精确复制已批准 lots，不做 sizing 重算或隐式修正；
+   - command expiry 取 signal、risk approval 和 execution TTL 的最小值；identity、route、订单参数或审批 provenance 漂移时拒绝构建；
+   - HOLD approved no-op 不生成 plan / command，第一版 CLOSE 仍按 Risk 的 fail-closed 口径处理。
+2. 已实现 command lifecycle 和 leg / plan projection：
+   - delivery outcome、`command.received`、`ExecutionEvent`、显式 reconciliation / manual evidence 各自通过 typed state machine 推进；
+   - snapshot、transport ack 和到达顺序都不能制造执行事实；
+   - identity、时间单调性、terminal lifecycle、plan / leg 派生状态和跨账户 / 跨计划关系均在领域边界校验。
+3. `sinan-store` V0003 已实现 Execution durability：
+   - plan / leg definition 不可变；typed read 会校验 canonical payload、冗余列和父图关系；
+   - `commit_execution_workflow` 在同一 write transaction 中原子写入 TradeIntent、RiskResult、plan / legs、commands 和 pristine command states，完整重放幂等，任一父图或 payload 漂移冲突，失败整体回滚；
+   - command state 使用 identity + expected status + expected `updated_at` CAS；leg / plan lifecycle 作为一致 bundle 使用 CAS，不能留下部分 projection。
+4. 已实现 Circuit Breaker durable restore：
+   - V0003 使用 append-only、revisioned snapshot，持久化完整 `OPEN / HALF_OPEN` 状态、fingerprint、recovery epoch、clear / half-open 时间、financial baseline 和 blocked count；
+   - 启动时先读可信的 denormalized head metadata，再校验版本化 snapshot；缺失、损坏或未知版本会生成并持久化 `OPEN` safety state；
+   - 损坏 payload 仍从已知最高 `recovery_epoch + 1` 开启新 incident，不会重置为 1；revision CAS 冲突会有界重读；Store 不可用或 epoch 溢出时返回 fail-closed outcome，调用方不得继续 live flow。
+
+第四里程碑没有接入 live Risk→Execution application flow。后续 HTTP / Core 组合层接入时，仍必须从 State Store 单一一致性读快照组装 `RiskRequest`，并复用原子 workflow commit；不能在 `sinan-risk` 内增加 Store、HTTP 或 Compute 依赖。
+
+## 第五里程碑（当前；领域与持久化范围已完成）
+
+第五里程碑完成 Reconciliation 的 pure domain 和 V0004 State Store，不实现 Gateway、socket、wire session 或真实 `reconciliation.request` 投递：
+
+1. `sinan-reconciliation` 已实现 request planning：
+   - `command_ids=None` 是账户及可选 `terminal_id / client_id` route 内的全量 scope；`Some` 是 targeted scope，必须非空、唯一并按 command ID 稳定排序；
+   - `None` 只定义请求范围，不自行证明 application 提供了完整 command 集合；只有 route 完全不受限的账户级评估才能以同一可信 Store read snapshot 组装全账户 command scope，并通过 `command_scope_complete` 显式记录该证据；
+   - `CONNECTION_RESTORED` 和 `STATE_STORE_RESTORED` 每次创建独立 `request_id` / run；已进入更后生命周期的 command 不会为对账而倒退。
+2. 已实现严格 result 校验与纯评估：
+   - request、账户、terminal / client route 和服务器时间必须一致；
+   - `positions / orders` 是 `result.observed_at` 时刻的账户完整集合，空数组也合法；每行必须属于该账户且 `observed_at == result.observed_at`，positions / orders / metadata / unresolved IDs 必须按业务键唯一并稳定排序；
+   - snapshot / `unresolved_command_ids` 只产生 finding，不产生 `ORDER_SENT / FILLED / FAILED / EXPIRED` 事实，也不授权 retry；与 `ExecutionEvent` 冲突时以 event 为执行事实，但客户端 unresolved 差异仍保持 `PendingEvidence`，不能被 Core 的权威状态自动覆盖。
+3. Reconciliation workflow disposition 只有 `Completed / PendingEvidence / ManualRequired`；普通 result evaluation 只产生前两者，`ManualRequired` 只由显式升级产生：
+   - 不确定 command 缺少权威 `command.received` / `ExecutionEvent` projection 时保持 `PendingEvidence`；
+   - 本次 result 中任何 unresolved command，或已经处于 `MANUAL_RECONCILIATION_REQUIRED` 的 command，都先保持 `PendingEvidence + finding`；result evaluation 不自动产出 durable manual state；
+   - `ManualRequired` 只能由带服务器时间和非空原因的显式人工 / 超时证据触发；缺失 result 也只能通过显式调用升级，没有隐式 timer；
+   - `Completed` 仅表示该 scope 的投递不确定性已有权威 execution state 覆盖，且本次没有 unresolved / manual finding；不表示订单已经 terminal。
+4. `sinan-store` V0004 已实现 durable reconciliation：
+   - `request_id` 是 run identity；request definition 不可变，run status 为 `REQUESTED / PENDING_EVIDENCE / COMPLETED / MANUAL_RECONCILIATION_REQUIRED`；
+   - 普通 result commit 只接受 `Completed / PendingEvidence`；`Completed` 当且仅当 attention command 集合为空，`PendingEvidence` 必须非空，所有 client unresolved command 都必须保留在 attention 集合中；`ManualRequired` 必须走独立显式升级 API 并持久化 timestamp、非空 reason 和 manual evaluation，Completed run 不能再升级；
+   - result、run、account checkpoint 和 position / order full-set replacement 在同一 transaction 中提交，失败整体回滚；
+   - full-set 水位、集合 hash 和 set-membership projection 保留空集合删除语义；checkpoint 的两个集合 hash 必须同时锚定到同一个 durable result fact。延迟到达且 `observed_at < full-set watermark` 的旧逐行事实不能复活已删除行；同水位 single-row 与 full-set 缺键或 payload 不同必须 fail closed 并回滚第二个事实，在线与 rebuild 不依赖到达顺序；更新事实若新于水位则使集合失去一致 full-set 证据，Risk 继续 fail closed；
+   - 只有 `command_ids=None`、`terminal_id=None`、`client_id=None`、`Completed` 且 `command_scope_complete=true` 才推进账户级 `pending_commands_reconciled_at`；targeted request 不得声明 scope complete，route-restricted completion 或未证明 command scope 完整时都不推进。该 completeness 是可信 Core assembler 基于同一 Store read snapshot 产生的内部 attestation，不来自 wire client。缺失 `account` 不推进 account refresh，非空 metadata 数组本身也不能证明完整 metadata refresh；只有上层显式提供并持久化 `symbol_metadata_complete=true` 时才可推进 metadata readiness；
+   - `reconciliation.result` 参与确定性 projection rebuild，重建规则与在线 full-set replacement 一致。
+
+本里程碑只持久化 transport-neutral request / run，不写 `wire_outbox`，也不实现 Gateway session / delivery attempt。Gateway 里程碑负责把已持久化 request 绑定到 active session 和 wire envelope；它仍不得拥有对账或 execution lifecycle 决策。
 
 ## 实现约束
 
@@ -283,23 +338,23 @@ git diff --check
 
 1. SQLite repository 和 projection。（已完成）
 2. Risk 与 circuit breaker 领域逻辑。（已完成）
-3. Circuit Breaker durable restore、Execution command 和状态机。（下一里程碑）
-4. 对账。
-5. Gateway session registry 和出站投递端口。
+3. Circuit Breaker durable restore、Execution command 和状态机。（已完成）
+4. Reconciliation 领域和 V0004 State Store。（已完成）
+5. Gateway session registry 和出站投递端口。（下一里程碑）
 6. Native TCP 和 Execution WebSocket 绑定。
 7. HTTP TradeIntent/state/time API 和 Event WebSocket。
 8. Fake Execution Client 端到端测试。
 9. MQL5 和 OKX 适配器。
 10. Strategy & Decision Control Plane。
 
-Risk 里程碑已经实现第 3.6、7.12-7.13 和 15 节规定的确定性 position-sizing 契约。下一里程碑先实现 Circuit Breaker durable restore，再实现 Execution command / state machine；Execution 必须精确映射已批准 lots，并在任何参数漂移时重新执行风控。若尚未实现 trusted assembler 和原子 workflow commit，则不得接入 live Risk→Execution flow。MQL5 adapter 里程碑必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。
+Risk、Circuit Breaker durable restore、Execution domain / persistence 和 Reconciliation domain / persistence 已完成。下一里程碑实现 Gateway session registry 与出站投递端口，只负责 route、session 和 delivery outcome，不得把 snapshot 提升为执行事实，也不得在 transport 层决定 retry。MQL5 adapter 里程碑必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。
 
 ## 建议的开场提示
 
 ```text
 完整阅读 HANDOFF.md 和 docs/quant_trading_7_layer_target_architecture.md。
-将已经实现的第一、第二、第三里程碑视为经过验证的基线；修改前先运行基线验收命令。
-只实现下一项被明确选择的 Circuit Breaker durable restore 与 Execution command / 状态机里程碑；不得跳过依赖边界或启动无关服务。
+将已经实现的协议、State Store、Risk、Execution 和 Reconciliation 领域 / 持久化里程碑视为经过验证的基线；修改前先运行基线验收命令。
+下一里程碑只实现 Gateway session registry 和出站投递端口；不得把 transport route、wire outbox 或 delivery outcome 混入 Reconciliation / Execution 领域状态机。
 报告完成前，运行 cargo fmt --all --check、cargo check --workspace 和 cargo test --workspace。
 架构存在歧义时，先指出冲突并解决文档问题，再修改代码。
 ```

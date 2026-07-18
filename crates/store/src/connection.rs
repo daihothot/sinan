@@ -141,7 +141,7 @@ mod tests {
             .fetch_one(&store.pool)
             .await
             .expect("schema version should be readable");
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
 
         let mut first = store.pool.acquire().await.expect("first connection");
         let mut second = store.pool.acquire().await.expect("second connection");

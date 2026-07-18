@@ -7,6 +7,7 @@ mod error;
 mod json;
 mod model;
 mod projection;
+mod reconciliation;
 mod repository;
 
 pub use connection::*;
@@ -14,6 +15,7 @@ pub use error::*;
 pub use json::*;
 pub use model::*;
 pub use projection::*;
+pub use reconciliation::*;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +36,11 @@ const EMBEDDED_MIGRATIONS: &[Migration] = &[
         3,
         "execution_durability",
         include_str!("../migrations/V0003__execution_durability.sql"),
+    ),
+    Migration::new(
+        4,
+        "reconciliation_durability",
+        include_str!("../migrations/V0004__reconciliation_durability.sql"),
     ),
 ];
 

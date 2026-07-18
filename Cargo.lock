@@ -968,6 +968,14 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 [[package]]
 name = "sinan-core"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sinan-risk",
+ "sinan-store",
+ "sqlx",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "sinan-domain"
@@ -1012,6 +1020,14 @@ dependencies = [
 [[package]]
 name = "sinan-reconciliation"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinan-execution",
+ "sinan-protocol",
+ "sinan-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sinan-risk"
@@ -1032,6 +1048,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sinan-protocol",
  "sinan-types",
  "sqlx",
  "thiserror",

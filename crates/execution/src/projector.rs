@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use sinan_types::{
-    ExecutionCommandState, ExecutionCommandStatus, ExecutionFailurePolicy, ExecutionLeg,
-    ExecutionEvent, ExecutionEventStatus, ExecutionLegStatus, ExecutionPlan, ExecutionPlanStatus,
-    LegId, RollbackMode,
+    derive_execution_plan_status, AccountId, ExecutionCommandState, ExecutionCommandStatus,
+    ExecutionEvent, ExecutionEventStatus, ExecutionFailurePolicy, ExecutionLeg, ExecutionLegStatus,
+    ExecutionPlan, ExecutionPlanStatus, LegId, PlanId, RollbackMode,
 };
 use thiserror::Error;
 
@@ -32,6 +32,8 @@ pub enum RecoveryDecision {
 
 /// Projects a leg from its single immutable v1 command lifecycle.
 pub fn project_leg(
+    plan_id: &PlanId,
+    account_id: &AccountId,
     leg: &ExecutionLeg,
     command_states: &[ExecutionCommandState],
     events: &[ExecutionEvent],
@@ -40,9 +42,12 @@ pub fn project_leg(
         return Err(ProjectionError::UnsupportedCommandCardinality);
     }
     let command = &command_states[0];
-    if command.leg_id.as_ref() != Some(&leg.definition.leg_id) {
+    if command.account_id != *account_id
+        || command.plan_id.as_ref() != Some(plan_id)
+        || command.leg_id.as_ref() != Some(&leg.definition.leg_id)
+    {
         return Err(ProjectionError::IdentityMismatch(
-            "command state leg_id differs from leg",
+            "command state account/plan/leg identity differs from the projected leg",
         ));
     }
     let mut execution_ids = HashSet::with_capacity(events.len());
@@ -52,8 +57,8 @@ pub fn project_leg(
         if event.execution_id.as_str().trim().is_empty()
             || !execution_ids.insert(&event.execution_id)
             || event.command_id != command.command_id
-            || event.account_id != command.account_id
-            || event.plan_id != command.plan_id
+            || event.account_id != *account_id
+            || event.plan_id.as_ref() != Some(plan_id)
             || event.leg_id != command.leg_id
             || event.symbol != leg.definition.symbol
             || event.event_at < command.created_at
@@ -71,9 +76,9 @@ pub fn project_leg(
                 || event
                     .filled_lots
                     .is_none_or(|lots| !lots.is_finite() || lots <= 0.0)
-                || event
-                    .filled_at
-                    .is_some_and(|filled_at| filled_at < command.created_at || filled_at > event.event_at)
+                || event.filled_at.is_some_and(|filled_at| {
+                    filled_at < command.created_at || filled_at > event.event_at
+                })
             {
                 return Err(ProjectionError::IdentityMismatch(
                     "fill event lacks positive exposure evidence",
@@ -146,6 +151,14 @@ pub fn project_plan(
     if command_states.len() != plan.legs.len() {
         return Err(ProjectionError::UnsupportedCommandCardinality);
     }
+    if command_states.iter().any(|state| {
+        state.account_id != plan.definition.account_id
+            || state.plan_id.as_ref() != Some(&plan.definition.plan_id)
+    }) {
+        return Err(ProjectionError::IdentityMismatch(
+            "command state account/plan identity differs from the plan",
+        ));
+    }
     let mut projected = plan.clone();
     for leg in &mut projected.legs {
         let states: Vec<_> = command_states
@@ -158,7 +171,13 @@ pub fn project_plan(
             .filter(|event| event.leg_id.as_ref() == Some(&leg.definition.leg_id))
             .cloned()
             .collect();
-        *leg = project_leg(leg, &states, &leg_events)?;
+        *leg = project_leg(
+            &projected.definition.plan_id,
+            &projected.definition.account_id,
+            leg,
+            &states,
+            &leg_events,
+        )?;
     }
     if events.iter().any(|event| {
         !projected
@@ -193,35 +212,7 @@ pub fn project_plan(
         .map(|leg| leg.definition.leg_id.clone())
         .collect();
 
-    let statuses: Vec<_> = projected.legs.iter().map(|leg| leg.state.status).collect();
-    let all = |status| statuses.iter().all(|current| *current == status);
-    let any = |predicate: fn(ExecutionLegStatus) -> bool| statuses.iter().copied().any(predicate);
-    let all_terminal = statuses.iter().copied().all(leg_status_is_terminal);
-    let any_filled = any(|status| status == ExecutionLegStatus::Filled);
-    let any_partial = any(|status| status == ExecutionLegStatus::PartiallyFilled);
-
-    projected.state.status = if all(ExecutionLegStatus::Filled) {
-        ExecutionPlanStatus::Completed
-    } else if all(ExecutionLegStatus::Cancelled) {
-        ExecutionPlanStatus::Cancelled
-    } else if all(ExecutionLegStatus::Expired) {
-        ExecutionPlanStatus::Expired
-    } else if any(|status| status == ExecutionLegStatus::ManualReconciliationRequired) {
-        ExecutionPlanStatus::ManualReconciliationRequired
-    } else if any_partial || (any_filled && !all(ExecutionLegStatus::Filled)) {
-        ExecutionPlanStatus::Partial
-    } else if all_terminal {
-        ExecutionPlanStatus::Failed
-    } else if any(|status| {
-        matches!(
-            status,
-            ExecutionLegStatus::DeliveryUnconfirmed | ExecutionLegStatus::Reconciling
-        )
-    }) {
-        ExecutionPlanStatus::Reconciling
-    } else {
-        ExecutionPlanStatus::Pending
-    };
+    projected.state.status = derive_execution_plan_status(&projected.legs);
     projected
         .validate()
         .map_err(|_| ProjectionError::IdentityMismatch("projected plan is invalid"))?;

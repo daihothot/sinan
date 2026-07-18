@@ -1,10 +1,9 @@
 use sinan_types::{
     AccountId, CausationId, ClientId, ClockSyncStatus, CommandId, CorrelationId, ExecutionCommand,
-    ExecutionCommandState, ExecutionCommandStatus, ExecutionEvent, ExecutionLeg,
-    ExecutionLegState, ExecutionLegStatus, ExecutionPlan, ExecutionPlanState, ExecutionPlanStatus,
-    IdempotencyKey, IntentId, LegId, MessageId, PlanId, RiskId, RiskResult, SessionId,
-    SessionStatus, StrategyId, TerminalId, TradeIntent, TradeIntentStatus, WireInboxStatus,
-    WireOutboxStatus,
+    ExecutionCommandState, ExecutionCommandStatus, ExecutionEvent, ExecutionLeg, ExecutionLegState,
+    ExecutionLegStatus, ExecutionPlan, ExecutionPlanState, ExecutionPlanStatus, IdempotencyKey,
+    IntentId, LegId, MessageId, PlanId, RiskId, RiskResult, SessionId, SessionStatus, StrategyId,
+    TerminalId, TradeIntent, TradeIntentStatus, WireInboxStatus, WireOutboxStatus,
 };
 
 use crate::json::CanonicalJson;
@@ -54,6 +53,12 @@ pub struct StoredCircuitBreakerSnapshot {
     pub recovery_epoch: u64,
     pub updated_at: i64,
     pub payload: CanonicalJson,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerHeadMetadata {
+    pub state_revision: u64,
+    pub recovery_epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +168,12 @@ pub struct LegStateUpdate {
     pub expected_updated_at: i64,
     pub state: ExecutionLegState,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionLifecycleUpdate {
+    pub plan: PlanStateUpdate,
+    pub legs: Vec<LegStateUpdate>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

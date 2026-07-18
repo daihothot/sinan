@@ -3,7 +3,7 @@ mod common;
 use common::test_store;
 use serde_json::json;
 use sinan_store::{
-    CanonicalJson, NewCircuitBreakerSnapshot, StoreError, WriteOutcome,
+    CanonicalJson, CircuitBreakerHeadMetadata, NewCircuitBreakerSnapshot, StoreError, WriteOutcome,
     GLOBAL_CIRCUIT_BREAKER_SCOPE,
 };
 
@@ -208,13 +208,25 @@ async fn corrupt_latest_payload_does_not_block_a_fail_closed_append() {
         Err(StoreError::CorruptData { .. })
     ));
     let head = store
-        .get_circuit_breaker_head_revision()
+        .get_circuit_breaker_head_metadata()
         .await
-        .expect("head must remain readable without parsing payload");
-    assert_eq!(head, Some(1));
+        .expect("head metadata must remain readable without parsing payload");
+    assert_eq!(
+        head,
+        Some(CircuitBreakerHeadMetadata {
+            state_revision: 1,
+            recovery_epoch: 0,
+        })
+    );
 
     let recovered = store
-        .write_circuit_breaker_snapshot(snapshot(head, "OPEN", 1, 2_000, 0))
+        .write_circuit_breaker_snapshot(snapshot(
+            head.map(|metadata| metadata.state_revision),
+            "OPEN",
+            1,
+            2_000,
+            0,
+        ))
         .await
         .expect("fail-closed snapshot should append after corrupt payload")
         .into_record();
@@ -227,6 +239,35 @@ async fn corrupt_latest_payload_does_not_block_a_fail_closed_append() {
             .expect("new latest snapshot should be healthy"),
         Some(recovered)
     );
+}
+
+#[tokio::test]
+async fn head_metadata_validates_integer_aliases_without_reading_payload() {
+    let (_database, store, pool) = test_store().await;
+    store
+        .write_circuit_breaker_snapshot(snapshot(None, "OPEN", 3, 1_000, 0))
+        .await
+        .unwrap();
+
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("DROP TRIGGER trg_circuit_breaker_snapshots_no_update")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE circuit_breaker_snapshots SET recovery_epoch = -1")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        store.get_circuit_breaker_head_metadata().await,
+        Err(StoreError::CorruptData { .. })
+    ));
 }
 
 #[tokio::test]

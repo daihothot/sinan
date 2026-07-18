@@ -81,7 +81,7 @@ async fn insert_plan_leg_and_command(pool: &SqlitePool) {
 }
 
 #[tokio::test]
-async fn migration_creates_all_state_store_tables_at_version_three() {
+async fn migration_creates_all_state_store_tables_at_version_four() {
     let pool = migrated_pool().await;
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_schema \
@@ -100,10 +100,11 @@ async fn migration_creates_all_state_store_tables_at_version_three() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(tables.len(), 23);
+    assert_eq!(tables.len(), 27);
     assert_eq!(
         tables,
         [
+            "account_reconciliation_checkpoints",
             "account_snapshots_latest",
             "circuit_breaker_snapshots",
             "command_delivery_attempts",
@@ -121,6 +122,9 @@ async fn migration_creates_all_state_store_tables_at_version_three() {
             "order_snapshots_latest",
             "outbound_spool",
             "position_snapshots_latest",
+            "reconciliation_order_set_members",
+            "reconciliation_position_set_members",
+            "reconciliation_runs",
             "risk_results",
             "symbol_metadata_latest",
             "system_events",
@@ -129,8 +133,8 @@ async fn migration_creates_all_state_store_tables_at_version_three() {
             "wire_outbox",
         ]
     );
-    assert_eq!(migration_count, 3);
-    assert_eq!(user_version, 3);
+    assert_eq!(migration_count, 4);
+    assert_eq!(user_version, 4);
 }
 
 #[tokio::test]
@@ -160,6 +164,9 @@ async fn every_payload_json_column_has_a_payload_hash() {
             "order_snapshots_latest",
             "outbound_spool",
             "position_snapshots_latest",
+            "reconciliation_order_set_members",
+            "reconciliation_position_set_members",
+            "reconciliation_runs",
             "risk_results",
             "symbol_metadata_latest",
             "trade_intents",
@@ -173,7 +180,13 @@ async fn every_payload_json_column_has_a_payload_hash() {
                 .fetch_all(&pool)
                 .await
                 .expect("payload table columns should be readable");
-        assert!(columns.iter().any(|column| column == "payload_hash"));
+        if table == "reconciliation_runs" {
+            for hash in ["request_payload_hash", "result_payload_hash"] {
+                assert!(columns.iter().any(|column| column == hash));
+            }
+        } else {
+            assert!(columns.iter().any(|column| column == "payload_hash"));
+        }
     }
 }
 
@@ -201,6 +214,7 @@ async fn schema_contains_required_query_indexes() {
         "idx_execution_commands_idempotency",
         "idx_execution_events_command_time",
         "idx_outbound_spool_due",
+        "idx_reconciliation_runs_account_status_time",
         "idx_trade_intents_idempotency",
         "idx_wire_inbox_session_sequence",
         "idx_wire_outbox_session_sequence",

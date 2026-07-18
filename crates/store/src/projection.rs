@@ -1,8 +1,9 @@
 //! Latest-state projection writes, reads, and durable rebuilds.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::de::DeserializeOwned;
+use sinan_protocol::ReconciliationResult;
 use sinan_types::{
     AccountId, AccountSnapshot, MarketBar, MarketSnapshot, OrderSnapshot, PositionSnapshot,
     SymbolMetadataSnapshot,
@@ -22,6 +23,7 @@ const SYMBOL_METADATA_EVENT: &str = "symbol.metadata";
 const POSITION_SNAPSHOT_EVENT: &str = "position.snapshot";
 const ORDER_SNAPSHOT_EVENT: &str = "order.snapshot";
 const MARKET_BAR_EVENT: &str = "market.bar";
+const RECONCILIATION_RESULT_EVENT: &str = "reconciliation.result";
 
 /// Result of atomically appending a durable fact and applying its projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,7 +102,7 @@ pub struct StateIngestProjectionRebuildReport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ApplyDecision {
+pub(crate) enum ApplyDecision {
     Applied,
     IgnoredOlder,
     Unchanged,
@@ -132,6 +134,14 @@ impl DurableProjection<'_> {
             Self::Position(value) => CanonicalJson::from_serializable(value),
             Self::Order(value) => CanonicalJson::from_serializable(value),
             Self::MarketBar(value) => CanonicalJson::from_serializable(value),
+        }
+    }
+
+    fn full_set_consistency_account_id(&self) -> Option<&AccountId> {
+        match self {
+            Self::Position(value) => Some(&value.account_id),
+            Self::Order(value) => Some(&value.account_id),
+            _ => None,
         }
     }
 
@@ -280,6 +290,14 @@ impl SqliteStateStore {
             let fact_was_duplicate = matches!(append, WriteOutcome::Duplicate(_));
             let fact = append.into_record();
 
+            if let Some(account_id) = projection.full_set_consistency_account_id() {
+                validate_account_durable_snapshot_full_set_consistency(
+                    transaction.connection(),
+                    account_id,
+                )
+                .await?;
+            }
+
             let projection = projection
                 .apply(transaction.connection(), &fact.metadata, &fact.payload)
                 .await?;
@@ -356,7 +374,13 @@ impl SqliteStateStore {
         &self,
     ) -> Result<StateIngestProjectionRebuildReport, StoreError> {
         let mut transaction = self.begin_write().await?;
-        let result = rebuild_ingest_projections_on(transaction.connection()).await;
+        let result = async {
+            let report = rebuild_ingest_projections_on(transaction.connection()).await?;
+            crate::reconciliation::rebuild_reconciliation_projections_on(transaction.connection())
+                .await?;
+            Ok(report)
+        }
+        .await;
 
         match result {
             Ok(report) => {
@@ -419,7 +443,7 @@ fn classify_latest(
     }
 }
 
-async fn apply_account(
+pub(crate) async fn apply_account(
     connection: &mut SqliteConnection,
     snapshot: &AccountSnapshot,
     payload: &CanonicalJson,
@@ -462,7 +486,7 @@ async fn apply_account(
     Ok(decision)
 }
 
-async fn apply_symbol(
+pub(crate) async fn apply_symbol(
     connection: &mut SqliteConnection,
     snapshot: &SymbolMetadataSnapshot,
     payload: &CanonicalJson,
@@ -511,12 +535,17 @@ async fn apply_symbol(
     Ok(decision)
 }
 
-async fn apply_position(
+pub(crate) async fn apply_position(
     connection: &mut SqliteConnection,
     snapshot: &PositionSnapshot,
     payload: &CanonicalJson,
     updated_at: i64,
 ) -> Result<ApplyDecision, StoreError> {
+    if let Some(decision) =
+        classify_position_full_set_watermark(connection, snapshot, payload).await?
+    {
+        return Ok(decision);
+    }
     let existing = sqlx::query_as::<_, (i64, String)>(
         "SELECT observed_at, payload_hash FROM position_snapshots_latest \
          WHERE account_id = ? AND position_id = ?",
@@ -560,12 +589,16 @@ async fn apply_position(
     Ok(decision)
 }
 
-async fn apply_order(
+pub(crate) async fn apply_order(
     connection: &mut SqliteConnection,
     snapshot: &OrderSnapshot,
     payload: &CanonicalJson,
     updated_at: i64,
 ) -> Result<ApplyDecision, StoreError> {
+    if let Some(decision) = classify_order_full_set_watermark(connection, snapshot, payload).await?
+    {
+        return Ok(decision);
+    }
     let existing = sqlx::query_as::<_, (i64, String)>(
         "SELECT observed_at, payload_hash FROM order_snapshots_latest \
          WHERE account_id = ? AND broker_order_id = ?",
@@ -605,6 +638,393 @@ async fn apply_order(
         .await?;
     }
     Ok(decision)
+}
+
+async fn classify_position_full_set_watermark(
+    connection: &mut SqliteConnection,
+    snapshot: &PositionSnapshot,
+    payload: &CanonicalJson,
+) -> Result<Option<ApplyDecision>, StoreError> {
+    let watermark: Option<i64> = sqlx::query_scalar(
+        "SELECT positions_observed_at FROM account_reconciliation_checkpoints \
+         WHERE account_id = ?",
+    )
+    .bind(snapshot.account_id.as_str())
+    .fetch_optional(&mut *connection)
+    .await?;
+    classify_full_set_member(
+        connection,
+        "position_snapshot",
+        &format!("{}:{}", snapshot.account_id, snapshot.position_id),
+        snapshot.account_id.as_str(),
+        snapshot.position_id.as_str(),
+        snapshot.observed_at,
+        payload.sha256_hex(),
+        watermark,
+        "reconciliation_position_set_members",
+        "position_id",
+    )
+    .await
+}
+
+async fn classify_order_full_set_watermark(
+    connection: &mut SqliteConnection,
+    snapshot: &OrderSnapshot,
+    payload: &CanonicalJson,
+) -> Result<Option<ApplyDecision>, StoreError> {
+    let watermark: Option<i64> = sqlx::query_scalar(
+        "SELECT orders_observed_at FROM account_reconciliation_checkpoints \
+         WHERE account_id = ?",
+    )
+    .bind(snapshot.account_id.as_str())
+    .fetch_optional(&mut *connection)
+    .await?;
+    classify_full_set_member(
+        connection,
+        "order_snapshot",
+        &format!("{}:{}", snapshot.account_id, snapshot.broker_order_id),
+        snapshot.account_id.as_str(),
+        snapshot.broker_order_id.as_str(),
+        snapshot.observed_at,
+        payload.sha256_hex(),
+        watermark,
+        "reconciliation_order_set_members",
+        "broker_order_id",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn classify_full_set_member(
+    connection: &mut SqliteConnection,
+    entity: &'static str,
+    key: &str,
+    account_id: &str,
+    member_id: &str,
+    observed_at: i64,
+    payload_hash: &str,
+    watermark: Option<i64>,
+    membership_table: &'static str,
+    membership_key: &'static str,
+) -> Result<Option<ApplyDecision>, StoreError> {
+    let Some(watermark) = watermark else {
+        return Ok(None);
+    };
+    match observed_at.cmp(&watermark) {
+        std::cmp::Ordering::Less => Ok(Some(ApplyDecision::IgnoredOlder)),
+        std::cmp::Ordering::Greater => Ok(None),
+        std::cmp::Ordering::Equal => {
+            let query = format!(
+                "SELECT payload_hash FROM {membership_table} \
+                 WHERE account_id = ? AND set_observed_at = ? AND {membership_key} = ?"
+            );
+            let member_hash: Option<String> = sqlx::query_scalar(&query)
+                .bind(account_id)
+                .bind(watermark)
+                .bind(member_id)
+                .fetch_optional(connection)
+                .await?;
+            match member_hash.as_deref() {
+                Some(member_hash) if member_hash == payload_hash => {
+                    Ok(Some(ApplyDecision::Unchanged))
+                }
+                None => Err(StoreError::ObservationConflict {
+                    entity,
+                    key: key.to_owned(),
+                    observed_at,
+                }),
+                Some(_) => Err(StoreError::ObservationConflict {
+                    entity,
+                    key: key.to_owned(),
+                    observed_at,
+                }),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DurableFullSet {
+    payload_hash: String,
+    members: BTreeMap<String, String>,
+}
+
+pub(crate) async fn validate_all_durable_snapshot_full_set_consistency(
+    connection: &mut SqliteConnection,
+) -> Result<(), StoreError> {
+    let account_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT account_id FROM core_events \
+         WHERE account_id IS NOT NULL AND event_type IN (?, ?, ?) ORDER BY account_id",
+    )
+    .bind(POSITION_SNAPSHOT_EVENT)
+    .bind(ORDER_SNAPSHOT_EVENT)
+    .bind(RECONCILIATION_RESULT_EVENT)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    for account_id in account_ids {
+        validate_account_durable_snapshot_full_set_consistency(
+            connection,
+            &AccountId::from(account_id),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn validate_account_durable_snapshot_full_set_consistency(
+    connection: &mut SqliteConnection,
+    account_id: &AccountId,
+) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT event_id, event_type, account_id, payload_json, payload_hash \
+         FROM core_events WHERE account_id = ? AND event_type IN (?, ?, ?) ORDER BY event_id",
+    )
+    .bind(account_id.as_str())
+    .bind(POSITION_SNAPSHOT_EVENT)
+    .bind(ORDER_SNAPSHOT_EVENT)
+    .bind(RECONCILIATION_RESULT_EVENT)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    let mut position_facts = BTreeMap::new();
+    let mut order_facts = BTreeMap::new();
+    let mut position_sets = BTreeMap::new();
+    let mut order_sets = BTreeMap::new();
+
+    for row in rows {
+        let event_id: String = row.try_get("event_id")?;
+        let event_type: String = row.try_get("event_type")?;
+        let stored_account_id: String = row.try_get("account_id")?;
+        let payload = CanonicalJson::from_stored(
+            "core_event",
+            &event_id,
+            row.try_get("payload_json")?,
+            row.try_get("payload_hash")?,
+        )?;
+
+        match event_type.as_str() {
+            POSITION_SNAPSHOT_EVENT => {
+                let snapshot: PositionSnapshot = decode_fact(&event_id, &payload)?;
+                ensure_durable_evidence_account(
+                    &event_id,
+                    &stored_account_id,
+                    &snapshot.account_id,
+                )?;
+                record_durable_single_fact(
+                    &mut position_facts,
+                    "position_snapshot",
+                    account_id,
+                    snapshot.position_id.as_str(),
+                    snapshot.observed_at,
+                    payload.sha256_hex(),
+                )?;
+            }
+            ORDER_SNAPSHOT_EVENT => {
+                let snapshot: OrderSnapshot = decode_fact(&event_id, &payload)?;
+                ensure_durable_evidence_account(
+                    &event_id,
+                    &stored_account_id,
+                    &snapshot.account_id,
+                )?;
+                record_durable_single_fact(
+                    &mut order_facts,
+                    "order_snapshot",
+                    account_id,
+                    snapshot.broker_order_id.as_str(),
+                    snapshot.observed_at,
+                    payload.sha256_hex(),
+                )?;
+            }
+            RECONCILIATION_RESULT_EVENT => {
+                let result: ReconciliationResult = decode_fact(&event_id, &payload)?;
+                ensure_durable_evidence_account(&event_id, &stored_account_id, &result.account_id)?;
+                let positions = durable_position_set_members(&event_id, &result)?;
+                let orders = durable_order_set_members(&event_id, &result)?;
+                let positions_payload = CanonicalJson::from_serializable(&result.positions)?;
+                let orders_payload = CanonicalJson::from_serializable(&result.orders)?;
+                record_durable_full_set(
+                    &mut position_sets,
+                    "reconciliation_positions",
+                    account_id,
+                    result.observed_at,
+                    positions_payload.sha256_hex(),
+                    positions,
+                )?;
+                record_durable_full_set(
+                    &mut order_sets,
+                    "reconciliation_orders",
+                    account_id,
+                    result.observed_at,
+                    orders_payload.sha256_hex(),
+                    orders,
+                )?;
+            }
+            _ => unreachable!("query restricts event types"),
+        }
+    }
+
+    validate_durable_facts_against_full_sets(
+        "position_snapshot",
+        account_id,
+        &position_facts,
+        &position_sets,
+    )?;
+    validate_durable_facts_against_full_sets(
+        "order_snapshot",
+        account_id,
+        &order_facts,
+        &order_sets,
+    )
+}
+
+fn durable_position_set_members(
+    event_id: &str,
+    result: &ReconciliationResult,
+) -> Result<BTreeMap<String, String>, StoreError> {
+    let mut members = BTreeMap::new();
+    for snapshot in &result.positions {
+        if snapshot.account_id != result.account_id || snapshot.observed_at != result.observed_at {
+            return Err(StoreError::corrupt(
+                "core_event",
+                event_id,
+                "reconciliation position member does not match result account or observed_at",
+            ));
+        }
+        let payload = CanonicalJson::from_serializable(snapshot)?;
+        if members
+            .insert(
+                snapshot.position_id.to_string(),
+                payload.sha256_hex().to_owned(),
+            )
+            .is_some()
+        {
+            return Err(StoreError::corrupt(
+                "core_event",
+                event_id,
+                "reconciliation position full set contains duplicate keys",
+            ));
+        }
+    }
+    Ok(members)
+}
+
+fn durable_order_set_members(
+    event_id: &str,
+    result: &ReconciliationResult,
+) -> Result<BTreeMap<String, String>, StoreError> {
+    let mut members = BTreeMap::new();
+    for snapshot in &result.orders {
+        if snapshot.account_id != result.account_id || snapshot.observed_at != result.observed_at {
+            return Err(StoreError::corrupt(
+                "core_event",
+                event_id,
+                "reconciliation order member does not match result account or observed_at",
+            ));
+        }
+        let payload = CanonicalJson::from_serializable(snapshot)?;
+        if members
+            .insert(
+                snapshot.broker_order_id.to_string(),
+                payload.sha256_hex().to_owned(),
+            )
+            .is_some()
+        {
+            return Err(StoreError::corrupt(
+                "core_event",
+                event_id,
+                "reconciliation order full set contains duplicate keys",
+            ));
+        }
+    }
+    Ok(members)
+}
+
+fn ensure_durable_evidence_account(
+    event_id: &str,
+    stored_account_id: &str,
+    payload_account_id: &AccountId,
+) -> Result<(), StoreError> {
+    if stored_account_id == payload_account_id.as_str() {
+        Ok(())
+    } else {
+        Err(StoreError::corrupt(
+            "core_event",
+            event_id,
+            "durable evidence payload account_id does not match event route",
+        ))
+    }
+}
+
+fn record_durable_single_fact(
+    facts: &mut BTreeMap<(i64, String), String>,
+    entity: &'static str,
+    account_id: &AccountId,
+    member_id: &str,
+    observed_at: i64,
+    payload_hash: &str,
+) -> Result<(), StoreError> {
+    let key = (observed_at, member_id.to_owned());
+    if facts
+        .insert(key, payload_hash.to_owned())
+        .is_some_and(|existing| existing != payload_hash)
+    {
+        return Err(StoreError::ObservationConflict {
+            entity,
+            key: format!("{account_id}:{member_id}"),
+            observed_at,
+        });
+    }
+    Ok(())
+}
+
+fn record_durable_full_set(
+    sets: &mut BTreeMap<i64, DurableFullSet>,
+    entity: &'static str,
+    account_id: &AccountId,
+    observed_at: i64,
+    payload_hash: &str,
+    members: BTreeMap<String, String>,
+) -> Result<(), StoreError> {
+    if let Some(existing) = sets.get(&observed_at) {
+        if existing.payload_hash != payload_hash || existing.members != members {
+            return Err(StoreError::ObservationConflict {
+                entity,
+                key: account_id.to_string(),
+                observed_at,
+            });
+        }
+        return Ok(());
+    }
+    sets.insert(
+        observed_at,
+        DurableFullSet {
+            payload_hash: payload_hash.to_owned(),
+            members,
+        },
+    );
+    Ok(())
+}
+
+fn validate_durable_facts_against_full_sets(
+    entity: &'static str,
+    account_id: &AccountId,
+    facts: &BTreeMap<(i64, String), String>,
+    sets: &BTreeMap<i64, DurableFullSet>,
+) -> Result<(), StoreError> {
+    for ((observed_at, member_id), payload_hash) in facts {
+        let Some(full_set) = sets.get(observed_at) else {
+            continue;
+        };
+        if full_set.members.get(member_id) != Some(payload_hash) {
+            return Err(StoreError::ObservationConflict {
+                entity,
+                key: format!("{account_id}:{member_id}"),
+                observed_at: *observed_at,
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn apply_market_snapshot(
@@ -924,6 +1344,7 @@ async fn load_markets(
 async fn rebuild_ingest_projections_on(
     connection: &mut SqliteConnection,
 ) -> Result<StateIngestProjectionRebuildReport, StoreError> {
+    validate_all_durable_snapshot_full_set_consistency(connection).await?;
     let rows = sqlx::query(
         "SELECT event_id, event_type, account_id, received_at, payload_json, payload_hash \
          FROM core_events \
@@ -936,6 +1357,9 @@ async fn rebuild_ingest_projections_on(
     .await?;
 
     for table in [
+        "reconciliation_position_set_members",
+        "reconciliation_order_set_members",
+        "account_reconciliation_checkpoints",
         "account_snapshots_latest",
         "symbol_metadata_latest",
         "position_snapshots_latest",
