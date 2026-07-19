@@ -19,13 +19,14 @@ docs/quant_trading_7_layer_target_architecture.md
 ## 当前状态
 
 - 架构和实现规格已经完成记录，并与当前代码保持同步。
-- 第一至第四里程碑已经完成；第五个 Reconciliation 里程碑的纯领域与 V0004 State Store 范围也已完成。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
+- 第一至第六里程碑已经完成。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
 - `sinan-types`、`sinan-protocol`、三个协议黄金样例、SQLite migration、repository 和 state-ingest projection 均已实现并通过测试。
-- `sinan-store` 当前共有 27 张业务表：V0002 的 22 张基础表、V0003 的 Circuit Breaker journal，以及 V0004 的 4 张 Reconciliation run / checkpoint / set-membership 表；canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 projection rebuild 均已实现。
+- `sinan-store` 当前共有 27 张业务表：V0002 的 22 张基础表、V0003 的 Circuit Breaker journal，以及 V0004 的 4 张 Reconciliation run / checkpoint / set-membership 表；V0005 为 session、wire outbox 和 delivery attempt 增加 revision/CAS、sequence high-water、WRITE_STARTED/UNCONFIRMED 和双 subject 持久化边界。canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 projection rebuild 均已实现。
 - `sinan-risk` 已实现不可变 `RiskRequest` / policy / capacity / full-set watermark 领域模型、确定性 Decimal position sizing evaluator 和纯 circuit breaker 状态机。
 - `sinan-execution` 已实现从 approved `RiskResult` 构建 plan / command、精确 lots 映射、command 状态机、leg / plan projector 和 recovery decision；`sinan-store` 已实现 intent / risk / plan / leg / command / initial state 的原子 workflow commit，以及 command、leg、plan projection 的 CAS 持久化边界。
 - Circuit breaker 已有完整、带版本的 durable snapshot 和启动恢复 adapter；缺失、损坏或未知 snapshot 会创建并持久化新的 `OPEN` safety incident，已知 `recovery_epoch` 不会回退。
-- `sinan-reconciliation` 已实现 transport-neutral request 生成、result 校验、`Completed / PendingEvidence` 评估和显式 evidence 驱动的 `ManualRequired` 升级；V0004 已实现 reconciliation run、checkpoint、position / order full-set 原子替换及旧逐行事实防复活。Gateway session、wire outbox、Native TCP / Execution WebSocket 和 HTTP 仍是后续里程碑范围。
+- `sinan-reconciliation` 已实现 transport-neutral request 生成、result 校验、`Completed / PendingEvidence` 评估和显式 evidence 驱动的 `ManualRequired` 升级；V0004 已实现 reconciliation run、checkpoint、position / order full-set 原子替换及旧逐行事实防复活。
+- `sinan-gateway` 已实现 transport-neutral live session fencing、durable session registry、heartbeat clock health、startup/disconnect recovery 和 Execution-owned `OutboundDeliveryPort` adapter；Native TCP / Execution WebSocket listener、inbound router 和 HTTP 仍是后续里程碑范围。
 - 现有 MQL5 EA 仍位于 MetaTrader 工作区，不属于此 Rust 仓库。
 - 当前工作区已通过 `cargo fmt --all --check`、`cargo check --workspace`、`cargo test --workspace` 和 `git diff --check`。
 
@@ -54,6 +55,8 @@ docs/quant_trading_7_layer_target_architecture.md
 21. sizing 的 tick ceil、volume-step floor、预算、敞口和保证金比较必须在 Decimal 域完成；第一版不允许多空、相关性或对冲抵消 hard-risk budget。
 22. Reconciliation snapshot / result 是 broker 状态观测，不是执行事实；不得据此推进 `ORDER_SENT / FILLED / FAILED / EXPIRED` 或自动 retry。执行状态只能由 typed dispatch / delivery / reconciliation evidence、`command.received`、`ExecutionEvent`、显式时间证据或显式人工证据通过 Execution 状态机推进。
 23. `ReconciliationRequest.command_ids=None` 表示该账户及可选 `terminal_id / client_id` route 内的全量 command；`Some` 必须非空、唯一并稳定排序。账户级 `Completed` 只有 request route 完全不受限（`terminal_id=None && client_id=None`），并同时持久化 `command_scope_complete=true`，证明评估使用了同一可信 Store read snapshot 的全账户 command scope，才可推进 pending-command 水位。`positions / orders` 是账户完整集合，空集合也形成水位，且每行 `observed_at` 必须等于 result 的 `observed_at`。
+24. Gateway route 的可选 `client_id / terminal_id` 是筛选条件；匹配到多个 active session 时必须返回 `AmbiguousRoute`，不得任选一个。新 session 必须原子 stale 同 route 的旧 session，旧 callback 只能按精确 `session_id / revision` 操作。
+25. `wire_outbox.ACKED` 只表示 `transport.ack`；`command_delivery_attempts.ACKED` 只表示已验证的 `command.received`。transport write 的崩溃窗口使用 `WRITE_STARTED`，timeout / disconnect / 不确定 write 使用 attempt `UNCONFIRMED`；Gateway 只报告这些 outcome，不推进 `ExecutionCommandState`。
 
 ## Rust 工作区目标
 
@@ -288,7 +291,7 @@ git diff --check
 
 第四里程碑没有接入 live Risk→Execution application flow。后续 HTTP / Core 组合层接入时，仍必须从 State Store 单一一致性读快照组装 `RiskRequest`，并复用原子 workflow commit；不能在 `sinan-risk` 内增加 Store、HTTP 或 Compute 依赖。
 
-## 第五里程碑（当前；领域与持久化范围已完成）
+## 第五里程碑（已完成）
 
 第五里程碑完成 Reconciliation 的 pure domain 和 V0004 State Store，不实现 Gateway、socket、wire session 或真实 `reconciliation.request` 投递：
 
@@ -315,6 +318,30 @@ git diff --check
 
 本里程碑只持久化 transport-neutral request / run，不写 `wire_outbox`，也不实现 Gateway session / delivery attempt。Gateway 里程碑负责把已持久化 request 绑定到 active session 和 wire envelope；它仍不得拥有对账或 execution lifecycle 决策。
 
+## 第六里程碑（已完成）
+
+第六里程碑完成 Gateway session registry、V0005 delivery durability 和 transport-neutral 出站投递端口，不实现 Native TCP / Execution WebSocket listener 或 inbound router：
+
+1. `sinan-execution` 定义 object-safe `OutboundDeliveryPort`：
+   - `DeliveryOutcome` 明确区分 `Sent / Rejected / DefinitelyNotWritten / Unconfirmed`；
+   - Gateway 只返回 delivery evidence，不修改 `ExecutionCommandState`，不拥有 retry 或 reconciliation evaluation；
+   - `Sent` 只在真实 transport write 接受完整 envelope 后返回，进入 SQLite 或未执行的用户态队列不构成发送证据。
+2. `sinan-gateway` 实现 session registry：
+   - 同 route activation 通过共享锁串行化 live fence、durable replacement 和 live publish；disconnect / startup fence 使用同一把锁，旧 callback 不能移除 replacement epoch；
+   - registration 在 fence 前完整校验 identity、capabilities 和 `max_inflight_commands`；heartbeat 每次持久化 freshness 与有效 clock status，无效时间证据先落 `UNSYNCED` 再返回错误；
+   - process-local handle 以原子 write admission 与 fence 线性化，replacement 与已准入 write 并发时结果按 transport 证据收敛。
+3. Gateway outbound adapter 实现 durable bind/write/replay：
+   - route 解析、heartbeat/clock/expiry 重验、inflight 检查、sequence reserve、outbox 和 attempt insert 在同一 `BEGIN IMMEDIATE` transaction 中完成；transport I/O 在事务提交之后执行；
+   - `session.accepted` 占用 sequence 1，后续从 2 开始；并发 reserve 唯一单调，V4→V5 升级从历史 outbox 回填 high-water，升级后下一次 reserve 为 `MAX+1`；
+   - outbox payload 必须与 durable command / reconciliation parent payload 精确一致；尚未生成 outbox 的 rejection 保存完整 draft canonical JSON/hash，同 message ID 的 subject、route、envelope 或 payload 漂移 fail closed；
+   - `PENDING → WRITE_STARTED` 在 write 前持久化，crash/timeout/disconnect/uncertain write 收敛为 `UNCONFIRMED` 且禁止自动重放；backpressure、确定未写入和不确定写入保持不同 outcome。
+4. ACK 与 inflight 语义已固定：
+   - ACCEPTED / DUPLICATE `transport.ack` 只推进 `wire_outbox.ACKED`，不修改 attempt 或 execution lifecycle；
+   - REJECTED `transport.ack` 保留 `wire_outbox.FAILED` 和 reason，结束 transport-admission inflight，但不把 attempt 置为 `ACKED`；并发 write completion 可把 `PENDING` 收敛为 `SENT`，已有独立证据保持不变；late `command.received` 仍可推进 attempt `ACKED`，不得抹掉 rejection fact；
+   - 只有已验证的 `command.received` 推进 attempt `ACKED`；timeout/disconnect 不得覆盖更强证据。
+
+第六里程碑的 Gateway 测试覆盖 concurrent activation、activation/disconnect、startup fence、invalid heartbeat、sequence 并发、normal/replay/backpressure/failure/unconfirmed、replacement/write admission、ACK/receipt/timeout/disconnect 竞态和 payload drift。下一里程碑为 Native TCP 与 Execution WebSocket transport binding。
+
 ## 实现约束
 
 - 业务时间戳使用服务器时间域的 Unix 毫秒值。
@@ -340,21 +367,21 @@ git diff --check
 2. Risk 与 circuit breaker 领域逻辑。（已完成）
 3. Circuit Breaker durable restore、Execution command 和状态机。（已完成）
 4. Reconciliation 领域和 V0004 State Store。（已完成）
-5. Gateway session registry 和出站投递端口。（下一里程碑）
-6. Native TCP 和 Execution WebSocket 绑定。
+5. Gateway session registry 和出站投递端口。（已完成）
+6. Native TCP 和 Execution WebSocket 绑定。（下一里程碑）
 7. HTTP TradeIntent/state/time API 和 Event WebSocket。
 8. Fake Execution Client 端到端测试。
 9. MQL5 和 OKX 适配器。
 10. Strategy & Decision Control Plane。
 
-Risk、Circuit Breaker durable restore、Execution domain / persistence 和 Reconciliation domain / persistence 已完成。下一里程碑实现 Gateway session registry 与出站投递端口，只负责 route、session 和 delivery outcome，不得把 snapshot 提升为执行事实，也不得在 transport 层决定 retry。MQL5 adapter 里程碑必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。
+Risk、Circuit Breaker durable restore、Execution、Reconciliation 和 Gateway session/outbound durability 已完成。下一里程碑实现 Native TCP 与 Execution WebSocket transport binding；两者必须复用同一 Execution Client Protocol、session registry 和 outbound sink contract，不得在 transport 层复制 lifecycle、retry 或 reconciliation policy。MQL5 adapter 里程碑必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。
 
 ## 建议的开场提示
 
 ```text
 完整阅读 HANDOFF.md 和 docs/quant_trading_7_layer_target_architecture.md。
-将已经实现的协议、State Store、Risk、Execution 和 Reconciliation 领域 / 持久化里程碑视为经过验证的基线；修改前先运行基线验收命令。
-下一里程碑只实现 Gateway session registry 和出站投递端口；不得把 transport route、wire outbox 或 delivery outcome 混入 Reconciliation / Execution 领域状态机。
+将已经实现的协议、State Store、Risk、Execution、Reconciliation 和 Gateway session/outbound 里程碑视为经过验证的基线；修改前先运行基线验收命令。
+下一里程碑只实现 Native TCP 与 Execution WebSocket transport binding；复用现有 registry / sink / delivery adapter，不得把 transport route、wire outcome 或 retry 决策混入 Reconciliation / Execution 领域状态机。
 报告完成前，运行 cargo fmt --all --check、cargo check --workspace 和 cargo test --workspace。
 架构存在歧义时，先指出冲突并解决文档问题，再修改代码。
 ```

@@ -5,14 +5,19 @@ use std::{
 };
 
 use serde::de::DeserializeOwned;
+use serde_json::Value;
+use sinan_protocol::{
+    decode_wire_message, ExecutionClientMessageType, ReconciliationRequest,
+    SUPPORTED_SCHEMA_VERSION,
+};
 use sinan_types::{
     single_leg_id, AccountId, AdjustedRiskLegAction, CausationId, ClientId, ClockSyncStatus,
     CommandId, CorrelationId, ExecutionAction, ExecutionCommand, ExecutionCommandState,
     ExecutionCommandStatus, ExecutionEvent, ExecutionId, ExecutionLeg, ExecutionLegDefinition,
     ExecutionLegState, ExecutionLegStatus, ExecutionPlan, ExecutionPlanDefinition,
     ExecutionPlanState, ExecutionPlanStatus, IdempotencyKey, IntentId, LegId, MessageId, PlanId,
-    RiskId, RiskResult, SessionId, StrategyId, TerminalId, TradeIntent, TradeIntentAction,
-    TradeIntentLegAction, TradeIntentStatus,
+    RequestId, RiskId, RiskResult, SessionId, StrategyId, TerminalId, TradeIntent,
+    TradeIntentAction, TradeIntentLegAction, TradeIntentStatus,
 };
 use sqlx::{Row, SqliteConnection};
 
@@ -3991,12 +3996,21 @@ pub(crate) async fn enqueue_wire_outbox_on(
     connection: &mut SqliteConnection,
     message: NewWireOutbox,
 ) -> Result<WriteOutcome<StoredWireOutbox>, StoreError> {
+    let inserted: StoredWireOutbox = message.clone().into();
+    validate_stored_wire_outbox(&inserted).map_err(|error| match error {
+        StoreError::CorruptData { reason, .. } => StoreError::InvalidRecord {
+            entity: "wire_outbox",
+            key: message.message_id.to_string(),
+            reason,
+        },
+        other => other,
+    })?;
     let sequence = sequence_to_i64("wire_outbox.sequence", message.sequence)?;
     let result = sqlx::query(
         "INSERT INTO wire_outbox (\
-            message_id, session_id, message_type, sequence, command_id, payload_json, \
-            payload_hash, status, created_at, sent_at, acked_at, last_error\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            message_id, session_id, message_type, sequence, command_id, request_id, payload_json, \
+            payload_hash, status, revision, created_at, updated_at, sent_at, acked_at, last_error\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?) \
          ON CONFLICT DO NOTHING",
     )
     .bind(message.message_id.as_str())
@@ -4004,17 +4018,18 @@ pub(crate) async fn enqueue_wire_outbox_on(
     .bind(&message.message_type)
     .bind(sequence)
     .bind(message.command_id.as_ref().map(CommandId::as_str))
+    .bind(message.request_id.as_ref().map(RequestId::as_str))
     .bind(message.payload.as_str())
     .bind(message.payload.sha256_hex())
     .bind(message.status.as_str())
     .bind(message.created_at)
+    .bind(message.updated_at)
     .bind(message.sent_at)
     .bind(message.acked_at)
     .bind(&message.last_error)
     .execute(&mut *connection)
     .await?;
 
-    let inserted: StoredWireOutbox = message.clone().into();
     if result.rows_affected() == 1 {
         return Ok(WriteOutcome::Inserted(inserted));
     }
@@ -4032,7 +4047,7 @@ pub(crate) async fn enqueue_wire_outbox_on(
     }
 }
 
-async fn fetch_wire_outbox_by_id<'e, E>(
+pub(crate) async fn fetch_wire_outbox_by_id<'e, E>(
     executor: E,
     message_id: &MessageId,
 ) -> Result<Option<StoredWireOutbox>, StoreError>
@@ -4040,8 +4055,9 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let row = sqlx::query(
-        "SELECT message_id, session_id, message_type, sequence, command_id, payload_json, \
-                payload_hash, status, created_at, sent_at, acked_at, last_error \
+        "SELECT message_id, session_id, message_type, sequence, command_id, request_id, \
+                payload_json, payload_hash, status, revision, created_at, updated_at, sent_at, \
+                acked_at, last_error \
          FROM wire_outbox WHERE message_id = ?",
     )
     .bind(message_id.as_str())
@@ -4058,8 +4074,9 @@ async fn fetch_wire_outbox_conflicts(
         let sequence = sequence_to_i64("wire_outbox.sequence", Some(sequence))?
             .expect("Some sequence remains Some");
         sqlx::query(
-            "SELECT message_id, session_id, message_type, sequence, command_id, payload_json, \
-                    payload_hash, status, created_at, sent_at, acked_at, last_error \
+            "SELECT message_id, session_id, message_type, sequence, command_id, request_id, \
+                    payload_json, payload_hash, status, revision, created_at, updated_at, sent_at, \
+                    acked_at, last_error \
              FROM wire_outbox \
              WHERE message_id = ? OR (session_id = ? AND sequence = ?)",
         )
@@ -4070,8 +4087,9 @@ async fn fetch_wire_outbox_conflicts(
         .await?
     } else {
         sqlx::query(
-            "SELECT message_id, session_id, message_type, sequence, command_id, payload_json, \
-                    payload_hash, status, created_at, sent_at, acked_at, last_error \
+            "SELECT message_id, session_id, message_type, sequence, command_id, request_id, \
+                    payload_json, payload_hash, status, revision, created_at, updated_at, sent_at, \
+                    acked_at, last_error \
              FROM wire_outbox WHERE message_id = ?",
         )
         .bind(message.message_id.as_str())
@@ -4081,7 +4099,9 @@ async fn fetch_wire_outbox_conflicts(
     rows.into_iter().map(wire_outbox_from_row).collect()
 }
 
-fn wire_outbox_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredWireOutbox, StoreError> {
+pub(crate) fn wire_outbox_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StoredWireOutbox, StoreError> {
     let key: String = row.try_get("message_id")?;
     let payload = CanonicalJson::from_stored(
         "wire_outbox",
@@ -4089,19 +4109,24 @@ fn wire_outbox_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredWireOutbox
         row.try_get("payload_json")?,
         row.try_get("payload_hash")?,
     )?;
-    Ok(StoredWireOutbox {
+    let stored = StoredWireOutbox {
         message_id: MessageId::from(key.clone()),
         session_id: optional_id(&row, "session_id")?,
         message_type: row.try_get("message_type")?,
         sequence: sequence_from_row("wire_outbox", &key, row.try_get("sequence")?)?,
         command_id: optional_id(&row, "command_id")?,
+        request_id: optional_id(&row, "request_id")?,
         payload,
         status: parse_enum_column("wire_outbox", &key, "status", row.try_get("status")?)?,
+        revision: non_negative_from_row("wire_outbox", &key, "revision", row.try_get("revision")?)?,
         created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
         sent_at: row.try_get("sent_at")?,
         acked_at: row.try_get("acked_at")?,
         last_error: row.try_get("last_error")?,
-    })
+    };
+    validate_stored_wire_outbox(&stored)?;
+    Ok(stored)
 }
 
 fn same_wire_outbox_fact(existing: &StoredWireOutbox, incoming: &NewWireOutbox) -> bool {
@@ -4110,6 +4135,7 @@ fn same_wire_outbox_fact(existing: &StoredWireOutbox, incoming: &NewWireOutbox) 
         && existing.message_type == incoming.message_type
         && existing.sequence == incoming.sequence
         && existing.command_id == incoming.command_id
+        && existing.request_id == incoming.request_id
         && existing.payload == incoming.payload
 }
 
@@ -4121,8 +4147,8 @@ pub(crate) async fn insert_session_on(
         "INSERT INTO execution_client_sessions (\
             session_id, client_id, account_id, terminal_id, platform, status, capabilities_json, \
             remote_addr, connected_at, last_heartbeat_at, last_time_sync_at, clock_sync_status, \
-            disconnected_at\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            disconnected_at, revision, updated_at, last_outbound_sequence, max_inflight_commands\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 1, ?) \
          ON CONFLICT DO NOTHING",
     )
     .bind(session.session_id.as_str())
@@ -4138,6 +4164,11 @@ pub(crate) async fn insert_session_on(
     .bind(session.last_time_sync_at)
     .bind(session.clock_sync_status.map(ClockSyncStatus::as_str))
     .bind(session.disconnected_at)
+    .bind(session.updated_at)
+    .bind(positive_u64_to_i64(
+        "execution_client_sessions.max_inflight_commands",
+        session.max_inflight_commands,
+    )?)
     .execute(&mut *connection)
     .await?;
 
@@ -4167,7 +4198,7 @@ pub(crate) async fn insert_session_on(
     ))
 }
 
-async fn fetch_session_by_id<'e, E>(
+pub(crate) async fn fetch_session_by_id<'e, E>(
     executor: E,
     session_id: &SessionId,
 ) -> Result<Option<StoredSessionRecord>, StoreError>
@@ -4177,7 +4208,8 @@ where
     let row = sqlx::query(
         "SELECT session_id, client_id, account_id, terminal_id, platform, status, \
                 capabilities_json, remote_addr, connected_at, last_heartbeat_at, \
-                last_time_sync_at, clock_sync_status, disconnected_at \
+                last_time_sync_at, clock_sync_status, disconnected_at, revision, updated_at, \
+                last_outbound_sequence, max_inflight_commands \
          FROM execution_client_sessions WHERE session_id = ?",
     )
     .bind(session_id.as_str())
@@ -4186,7 +4218,9 @@ where
     row.map(session_from_row).transpose()
 }
 
-fn session_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredSessionRecord, StoreError> {
+pub(crate) fn session_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StoredSessionRecord, StoreError> {
     let key: String = row.try_get("session_id")?;
     let capabilities_text: String = row.try_get("capabilities_json")?;
     let capabilities = CanonicalJson::parse(&capabilities_text).map_err(|error| {
@@ -4204,7 +4238,7 @@ fn session_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredSessionRecord,
         ));
     }
 
-    Ok(StoredSessionRecord {
+    let session = StoredSessionRecord {
         session_id: SessionId::from(key.clone()),
         client_id: ClientId::from(row.try_get::<String, _>("client_id")?),
         account_id: AccountId::from(row.try_get::<String, _>("account_id")?),
@@ -4228,7 +4262,46 @@ fn session_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredSessionRecord,
             row.try_get("clock_sync_status")?,
         )?,
         disconnected_at: row.try_get("disconnected_at")?,
-    })
+        revision: non_negative_from_row(
+            "execution_client_session",
+            &key,
+            "revision",
+            row.try_get("revision")?,
+        )?,
+        updated_at: row.try_get("updated_at")?,
+        last_outbound_sequence: positive_from_row(
+            "execution_client_session",
+            &key,
+            "last_outbound_sequence",
+            row.try_get("last_outbound_sequence")?,
+        )?,
+        max_inflight_commands: positive_from_row(
+            "execution_client_session",
+            &key,
+            "max_inflight_commands",
+            row.try_get("max_inflight_commands")?,
+        )?,
+    };
+    if session.updated_at < session.connected_at
+        || session
+            .last_heartbeat_at
+            .is_some_and(|at| at < session.connected_at || at > session.updated_at)
+        || session
+            .last_time_sync_at
+            .is_some_and(|at| at < session.connected_at || at > session.updated_at)
+        || (session.status == sinan_types::SessionStatus::Active
+            && session.disconnected_at.is_some())
+        || (session.clock_sync_status == Some(ClockSyncStatus::Synced)
+            && session.last_time_sync_at.is_none())
+        || (session.last_time_sync_at.is_some() && session.clock_sync_status.is_none())
+    {
+        return Err(StoreError::corrupt(
+            "execution_client_session",
+            &key,
+            "session timestamps, status, or clock-sync evidence are inconsistent",
+        ));
+    }
+    Ok(session)
 }
 
 fn same_session_identity(existing: &StoredSessionRecord, incoming: &NewSessionRecord) -> bool {
@@ -4245,6 +4318,87 @@ fn same_session_identity(existing: &StoredSessionRecord, incoming: &NewSessionRe
         && existing.last_time_sync_at == incoming.last_time_sync_at
         && existing.clock_sync_status == incoming.clock_sync_status
         && existing.disconnected_at == incoming.disconnected_at
+        && existing.updated_at == incoming.updated_at
+        && existing.max_inflight_commands == incoming.max_inflight_commands
+}
+
+pub(crate) fn validate_stored_wire_outbox(message: &StoredWireOutbox) -> Result<(), StoreError> {
+    let key = message.message_id.as_str();
+    let wire = decode_wire_message::<Value>(
+        message.payload.as_str().as_bytes(),
+        SUPPORTED_SCHEMA_VERSION,
+    )
+    .map_err(|error| StoreError::corrupt("wire_outbox", key, error.to_string()))?;
+
+    if wire.message_id != message.message_id
+        || wire.message_type.as_str() != message.message_type
+        || wire.session_id != message.session_id
+        || wire.sequence != message.sequence
+    {
+        return Err(StoreError::corrupt(
+            "wire_outbox",
+            key,
+            "wire envelope identity does not match denormalized columns",
+        ));
+    }
+
+    match wire.message_type {
+        ExecutionClientMessageType::ExecutionCommand => {
+            let payload: ExecutionCommand =
+                serde_json::from_value(wire.payload).map_err(|error| {
+                    StoreError::corrupt(
+                        "wire_outbox",
+                        key,
+                        format!("invalid execution.command payload: {error}"),
+                    )
+                })?;
+            if message.command_id.as_ref() != Some(&payload.command_id)
+                || message.request_id.is_some()
+            {
+                return Err(StoreError::corrupt(
+                    "wire_outbox",
+                    key,
+                    "execution.command subject does not match payload",
+                ));
+            }
+        }
+        ExecutionClientMessageType::ReconciliationRequest => {
+            let payload: ReconciliationRequest =
+                serde_json::from_value(wire.payload).map_err(|error| {
+                    StoreError::corrupt(
+                        "wire_outbox",
+                        key,
+                        format!("invalid reconciliation.request payload: {error}"),
+                    )
+                })?;
+            if message.request_id.as_ref() != Some(&payload.request_id)
+                || message.command_id.is_some()
+            {
+                return Err(StoreError::corrupt(
+                    "wire_outbox",
+                    key,
+                    "reconciliation.request subject does not match payload",
+                ));
+            }
+        }
+        _ if message.command_id.is_some() || message.request_id.is_some() => {
+            return Err(StoreError::corrupt(
+                "wire_outbox",
+                key,
+                "message type must not carry a delivery subject",
+            ));
+        }
+        _ => {}
+    }
+
+    if message.updated_at < message.created_at {
+        return Err(StoreError::corrupt(
+            "wire_outbox",
+            key,
+            "updated_at precedes created_at",
+        ));
+    }
+    Ok(())
 }
 
 fn deserialize_payload<T: DeserializeOwned>(
@@ -4402,6 +4556,33 @@ fn sequence_from_row(
                 .map_err(|_| StoreError::corrupt(entity, key, "sequence does not fit in u64"))
         })
         .transpose()
+}
+
+fn non_negative_from_row(
+    entity: &'static str,
+    key: &str,
+    column: &'static str,
+    value: i64,
+) -> Result<u64, StoreError> {
+    u64::try_from(value)
+        .map_err(|_| StoreError::corrupt(entity, key, format!("{column} must be non-negative")))
+}
+
+fn positive_from_row(
+    entity: &'static str,
+    key: &str,
+    column: &'static str,
+    value: i64,
+) -> Result<u64, StoreError> {
+    if value <= 0 {
+        return Err(StoreError::corrupt(
+            entity,
+            key,
+            format!("{column} must be greater than zero"),
+        ));
+    }
+    u64::try_from(value)
+        .map_err(|_| StoreError::corrupt(entity, key, format!("{column} does not fit in u64")))
 }
 
 fn validate_hash(entity: &'static str, key: &str, hash: &str) -> Result<(), StoreError> {

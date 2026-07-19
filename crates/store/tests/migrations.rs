@@ -7,8 +7,10 @@ const EXECUTION_DURABILITY_SQL: &str =
     include_str!("../migrations/V0003__execution_durability.sql");
 const RECONCILIATION_DURABILITY_SQL: &str =
     include_str!("../migrations/V0004__reconciliation_durability.sql");
+const GATEWAY_DELIVERY_DURABILITY_SQL: &str =
+    include_str!("../migrations/V0005__gateway_delivery_durability.sql");
 
-fn embedded_migrations() -> [Migration; 4] {
+fn embedded_migrations() -> [Migration; 5] {
     [
         Migration::new(1, "init", INIT_SQL),
         Migration::new(2, "state_store_schema", STATE_STORE_SQL),
@@ -17,6 +19,11 @@ fn embedded_migrations() -> [Migration; 4] {
             4,
             "reconciliation_durability",
             RECONCILIATION_DURABILITY_SQL,
+        ),
+        Migration::new(
+            5,
+            "gateway_delivery_durability",
+            GATEWAY_DELIVERY_DURABILITY_SQL,
         ),
     ]
 }
@@ -46,7 +53,7 @@ async fn first_run_applies_all_embedded_migrations() {
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "init");
     assert_eq!(rows[0].2, Migration::new(1, "init", INIT_SQL).checksum());
@@ -77,7 +84,19 @@ async fn first_run_applies_all_embedded_migrations() {
         .checksum()
     );
     assert!(rows[3].3 > 0);
-    assert_eq!(user_version, 4);
+    assert_eq!(rows[4].0, 5);
+    assert_eq!(rows[4].1, "gateway_delivery_durability");
+    assert_eq!(
+        rows[4].2,
+        Migration::new(
+            5,
+            "gateway_delivery_durability",
+            GATEWAY_DELIVERY_DURABILITY_SQL
+        )
+        .checksum()
+    );
+    assert!(rows[4].3 > 0);
+    assert_eq!(user_version, 5);
 }
 
 #[tokio::test]
@@ -92,7 +111,7 @@ async fn repeated_run_is_idempotent() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
 }
 
 #[tokio::test]
@@ -118,8 +137,8 @@ async fn version_one_database_upgrades_to_latest_schema() {
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(versions, vec![1, 2, 3, 4]);
-    assert_eq!(user_version, 4);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(user_version, 5);
 }
 
 #[tokio::test]
@@ -143,7 +162,89 @@ async fn version_two_database_upgrades_to_execution_durability_schema() {
             .fetch_all(&pool)
             .await
             .expect("migration versions should be readable");
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn version_four_upgrade_backfills_outbound_sequence_high_water_marks() {
+    let pool = memory_pool().await;
+    Migrator::new([
+        embedded_migrations()[0],
+        embedded_migrations()[1],
+        embedded_migrations()[2],
+        embedded_migrations()[3],
+    ])
+    .expect("version four migrations should be valid")
+    .run(&pool)
+    .await
+    .expect("version four should apply");
+
+    for (session_id, client_id) in [
+        ("session-with-history", "client-with-history"),
+        ("session-without-history", "client-without-history"),
+    ] {
+        sqlx::query(
+            "INSERT INTO execution_client_sessions (\
+                 session_id, client_id, account_id, platform, status, capabilities_json, \
+                 connected_at, last_heartbeat_at, last_time_sync_at, clock_sync_status\
+             ) VALUES (?, ?, 'account-1', 'MT5', 'ACTIVE', '[]', 100, 110, 105, 'SYNCED')",
+        )
+        .bind(session_id)
+        .bind(client_id)
+        .execute(&pool)
+        .await
+        .expect("version four session fixture should insert");
+    }
+
+    for (message_id, sequence) in [("message-7", 7_i64), ("message-42", 42_i64)] {
+        sqlx::query(
+            "INSERT INTO wire_outbox (\
+                 message_id, session_id, message_type, sequence, payload_json, payload_hash, \
+                 status, created_at\
+             ) VALUES (?, 'session-with-history', 'heartbeat', ?, '{}', ?, 'PENDING', 111)",
+        )
+        .bind(message_id)
+        .bind(sequence)
+        .bind("0".repeat(64))
+        .execute(&pool)
+        .await
+        .expect("version four outbox fixture should insert");
+    }
+
+    migrate(&pool)
+        .await
+        .expect("gateway delivery migration should apply");
+
+    let with_history: (i64, i64, i64) = sqlx::query_as(
+        "SELECT last_outbound_sequence, revision, updated_at \
+         FROM execution_client_sessions WHERE session_id = 'session-with-history'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("upgraded session should be readable");
+    let without_history: (i64, i64, i64) = sqlx::query_as(
+        "SELECT last_outbound_sequence, revision, updated_at \
+         FROM execution_client_sessions WHERE session_id = 'session-without-history'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("upgraded session without outbox should be readable");
+
+    assert_eq!(with_history, (42, 1, 110));
+    assert_eq!(without_history, (1, 0, 110));
+
+    let next_reservation: (i64, i64) = sqlx::query_as(
+        "UPDATE execution_client_sessions \
+         SET last_outbound_sequence = last_outbound_sequence + 1, \
+             revision = revision + 1, updated_at = 111 \
+         WHERE session_id = 'session-with-history' AND status = 'ACTIVE' \
+           AND revision = 1 AND last_outbound_sequence = 42 \
+         RETURNING last_outbound_sequence, revision",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("first post-upgrade reservation should pass the session CAS");
+    assert_eq!(next_reservation, (43, 2));
 }
 
 #[tokio::test]
@@ -253,7 +354,7 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
         .expect("initial migration should succeed");
     sqlx::query(
         "INSERT INTO schema_migrations (version, name, checksum, applied_at) \
-         VALUES (5, 'unknown', 'unknown', 1)",
+         VALUES (6, 'unknown', 'unknown', 1)",
     )
     .execute(&pool)
     .await
@@ -266,8 +367,8 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
     assert!(matches!(
         error,
         MigrationError::DatabaseAhead {
-            applied: 5,
-            available: 4
+            applied: 6,
+            available: 5
         }
     ));
 }
@@ -290,7 +391,7 @@ async fn lower_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 4,
+            expected: 5,
             actual: 0
         }
     ));
@@ -302,7 +403,7 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     migrate(&pool)
         .await
         .expect("initial migration should succeed");
-    sqlx::query("PRAGMA user_version = 5")
+    sqlx::query("PRAGMA user_version = 6")
         .execute(&pool)
         .await
         .expect("test fixture should raise user_version");
@@ -314,8 +415,8 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 4,
-            actual: 5
+            expected: 5,
+            actual: 6
         }
     ));
 }
@@ -331,8 +432,9 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         embedded_migrations()[1],
         embedded_migrations()[2],
         embedded_migrations()[3],
+        embedded_migrations()[4],
         Migration::new(
-            5,
+            6,
             "broken",
             "CREATE TABLE rollback_probe (id INTEGER PRIMARY KEY);\
              INSERT INTO missing_table DEFAULT VALUES;",
@@ -364,8 +466,8 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         .expect("user_version should be readable");
 
     assert!(!probe_exists);
-    assert_eq!(migration_count, 4);
-    assert_eq!(user_version, 4);
+    assert_eq!(migration_count, 5);
+    assert_eq!(user_version, 5);
 }
 
 #[test]

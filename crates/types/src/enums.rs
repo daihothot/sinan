@@ -296,6 +296,7 @@ string_enum! {
 string_enum! {
     pub enum WireOutboxStatus {
         Pending => "PENDING",
+        WriteStarted => "WRITE_STARTED",
         Sent => "SENT",
         Acked => "ACKED",
         Failed => "FAILED",
@@ -377,7 +378,7 @@ string_enum! {
         Backpressure => "BACKPRESSURE",
         NoActiveSession => "NO_ACTIVE_SESSION",
         Failed => "FAILED",
-        Timeout => "TIMEOUT",
+        Unconfirmed => "UNCONFIRMED",
         Cancelled => "CANCELLED"
     }
 }

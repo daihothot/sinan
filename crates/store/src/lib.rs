@@ -4,6 +4,7 @@
 
 mod connection;
 mod error;
+mod gateway_delivery;
 mod json;
 mod model;
 mod projection;
@@ -41,6 +42,11 @@ const EMBEDDED_MIGRATIONS: &[Migration] = &[
         4,
         "reconciliation_durability",
         include_str!("../migrations/V0004__reconciliation_durability.sql"),
+    ),
+    Migration::new(
+        5,
+        "gateway_delivery_durability",
+        include_str!("../migrations/V0005__gateway_delivery_durability.sql"),
     ),
 ];
 

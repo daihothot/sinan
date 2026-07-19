@@ -81,7 +81,7 @@ async fn insert_plan_leg_and_command(pool: &SqlitePool) {
 }
 
 #[tokio::test]
-async fn migration_creates_all_state_store_tables_at_version_four() {
+async fn migration_creates_all_state_store_tables_at_version_five() {
     let pool = migrated_pool().await;
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_schema \
@@ -133,8 +133,8 @@ async fn migration_creates_all_state_store_tables_at_version_four() {
             "wire_outbox",
         ]
     );
-    assert_eq!(migration_count, 4);
-    assert_eq!(user_version, 4);
+    assert_eq!(migration_count, 5);
+    assert_eq!(user_version, 5);
 }
 
 #[tokio::test]
@@ -153,6 +153,7 @@ async fn every_payload_json_column_has_a_payload_hash() {
         [
             "account_snapshots_latest",
             "circuit_breaker_snapshots",
+            "command_delivery_attempts",
             "core_events",
             "event_stream_log",
             "execution_commands",
@@ -180,7 +181,11 @@ async fn every_payload_json_column_has_a_payload_hash() {
                 .fetch_all(&pool)
                 .await
                 .expect("payload table columns should be readable");
-        if table == "reconciliation_runs" {
+        if table == "command_delivery_attempts" {
+            assert!(columns
+                .iter()
+                .any(|column| column == "request_payload_hash"));
+        } else if table == "reconciliation_runs" {
             for hash in ["request_payload_hash", "result_payload_hash"] {
                 assert!(columns.iter().any(|column| column == hash));
             }

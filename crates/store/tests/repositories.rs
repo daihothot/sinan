@@ -178,9 +178,11 @@ fn session(session_id: &str) -> NewSessionRecord {
         remote_addr: Some("127.0.0.1:5000".to_owned()),
         connected_at: 1_000,
         last_heartbeat_at: None,
-        last_time_sync_at: None,
+        last_time_sync_at: Some(1_000),
         clock_sync_status: Some(ClockSyncStatus::Synced),
         disconnected_at: None,
+        max_inflight_commands: 8,
+        updated_at: 1_000,
     }
 }
 
@@ -731,9 +733,20 @@ async fn wire_and_session_primitives_deduplicate_without_registry_behavior() {
         message_type: "heartbeat".to_owned(),
         sequence: Some(1),
         command_id: None,
-        payload: CanonicalJson::from_value(json!({"type": "heartbeat"})).unwrap(),
+        request_id: None,
+        payload: CanonicalJson::from_value(json!({
+            "message_id": "out_1",
+            "type": "heartbeat",
+            "schema_version": "ecp.v1.0",
+            "session_id": "session_1",
+            "sent_at": 1_100,
+            "sequence": 1,
+            "payload": {}
+        }))
+        .unwrap(),
         status: WireOutboxStatus::Pending,
         created_at: 1_100,
+        updated_at: 1_100,
         sent_at: None,
         acked_at: None,
         last_error: None,
