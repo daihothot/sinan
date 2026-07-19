@@ -5,14 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sinan-execution = { path = "../execution" }
 sinan-protocol = { path = "../protocol" }
 sinan-store = { path = "../store" }
 sinan-types = { path = "../types" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true

@@ -64,6 +64,11 @@ impl NativeTcpFrameDecoder {
         self.buffer.len()
     }
 
+    /// Reports an incomplete prefix or payload retained across reads.
+    pub fn has_pending_frame(&self) -> bool {
+        !self.buffer.is_empty() || self.expected_payload_len.is_some()
+    }
+
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.expected_payload_len = None;
@@ -198,6 +203,15 @@ mod tests {
             vec![br#"{"ok":true}"#.to_vec()]
         );
         assert_eq!(decoder.buffered_bytes(), 0);
+        assert!(!decoder.has_pending_frame());
+    }
+
+    #[test]
+    fn complete_prefix_without_payload_remains_pending() {
+        let mut decoder = NativeTcpFrameDecoder::new(1024);
+        assert!(decoder.feed(&3_u32.to_be_bytes()).unwrap().is_empty());
+        assert_eq!(decoder.buffered_bytes(), 0);
+        assert!(decoder.has_pending_frame());
     }
 
     #[test]

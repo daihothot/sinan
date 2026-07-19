@@ -19,6 +19,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +28,9 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = "0.28"
+uuid = { version = "1", features = ["v4"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

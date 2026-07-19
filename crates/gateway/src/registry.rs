@@ -47,7 +47,10 @@ impl LiveSessionHandle {
     /// Fencing is linearized against write admission. An admitted write may
     /// finish, but every write that observes this fence is rejected.
     pub(crate) fn fence(&self) {
-        self.state.fetch_or(FENCED_BIT, Ordering::AcqRel);
+        let previous = self.state.fetch_or(FENCED_BIT, Ordering::AcqRel);
+        if previous & FENCED_BIT == 0 {
+            self.sink.close();
+        }
     }
 
     pub(crate) async fn write(&self, frame: OutboundFrame) -> SinkWriteOutcome {
@@ -62,6 +65,12 @@ impl LiveSessionHandle {
             };
         };
         self.sink.write(frame).await
+    }
+
+    pub(crate) fn skip(&self, sequence: u64) {
+        if !self.is_fenced() {
+            self.sink.skip(sequence);
+        }
     }
 
     fn acquire_write(&self) -> Option<WritePermit<'_>> {
@@ -212,6 +221,8 @@ mod tests {
         fn write<'a>(&'a self, _frame: OutboundFrame) -> SinkWriteFuture<'a> {
             Box::pin(ready(SinkWriteOutcome::Written))
         }
+
+        fn skip(&self, _sequence: u64) {}
     }
 
     struct ControlledSink {
@@ -231,6 +242,8 @@ mod tests {
                 SinkWriteOutcome::Written
             })
         }
+
+        fn skip(&self, _sequence: u64) {}
     }
 
     fn route() -> LiveSessionRoute {

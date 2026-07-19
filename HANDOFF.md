@@ -19,14 +19,14 @@ docs/quant_trading_7_layer_target_architecture.md
 ## 当前状态
 
 - 架构和实现规格已经完成记录，并与当前代码保持同步。
-- 第一至第六里程碑已经完成。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
+- 第一至第七里程碑已经完成。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
 - `sinan-types`、`sinan-protocol`、三个协议黄金样例、SQLite migration、repository 和 state-ingest projection 均已实现并通过测试。
 - `sinan-store` 当前共有 27 张业务表：V0002 的 22 张基础表、V0003 的 Circuit Breaker journal，以及 V0004 的 4 张 Reconciliation run / checkpoint / set-membership 表；V0005 为 session、wire outbox 和 delivery attempt 增加 revision/CAS、sequence high-water、WRITE_STARTED/UNCONFIRMED 和双 subject 持久化边界。canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 projection rebuild 均已实现。
 - `sinan-risk` 已实现不可变 `RiskRequest` / policy / capacity / full-set watermark 领域模型、确定性 Decimal position sizing evaluator 和纯 circuit breaker 状态机。
 - `sinan-execution` 已实现从 approved `RiskResult` 构建 plan / command、精确 lots 映射、command 状态机、leg / plan projector 和 recovery decision；`sinan-store` 已实现 intent / risk / plan / leg / command / initial state 的原子 workflow commit，以及 command、leg、plan projection 的 CAS 持久化边界。
 - Circuit breaker 已有完整、带版本的 durable snapshot 和启动恢复 adapter；缺失、损坏或未知 snapshot 会创建并持久化新的 `OPEN` safety incident，已知 `recovery_epoch` 不会回退。
 - `sinan-reconciliation` 已实现 transport-neutral request 生成、result 校验、`Completed / PendingEvidence` 评估和显式 evidence 驱动的 `ManualRequired` 升级；V0004 已实现 reconciliation run、checkpoint、position / order full-set 原子替换及旧逐行事实防复活。
-- `sinan-gateway` 已实现 transport-neutral live session fencing、durable session registry、heartbeat clock health、startup/disconnect recovery 和 Execution-owned `OutboundDeliveryPort` adapter；Native TCP / Execution WebSocket listener、inbound router 和 HTTP 仍是后续里程碑范围。
+- `sinan-gateway` 已实现 live/durable session fencing、heartbeat clock health、Execution-owned `OutboundDeliveryPort` adapter，以及共享同一协议状态机的 Native TCP / Execution WebSocket binding；client auth、resume handoff、durable inbound admission contract、单 writer、有界资源/停机和真实 loopback 测试均已落地。HTTP、Event WebSocket、production inbound handler 及 TransportEvent/deadletter composition 仍是后续里程碑范围。
 - 现有 MQL5 EA 仍位于 MetaTrader 工作区，不属于此 Rust 仓库。
 - 当前工作区已通过 `cargo fmt --all --check`、`cargo check --workspace`、`cargo test --workspace` 和 `git diff --check`。
 
@@ -57,6 +57,11 @@ docs/quant_trading_7_layer_target_architecture.md
 23. `ReconciliationRequest.command_ids=None` 表示该账户及可选 `terminal_id / client_id` route 内的全量 command；`Some` 必须非空、唯一并稳定排序。账户级 `Completed` 只有 request route 完全不受限（`terminal_id=None && client_id=None`），并同时持久化 `command_scope_complete=true`，证明评估使用了同一可信 Store read snapshot 的全账户 command scope，才可推进 pending-command 水位。`positions / orders` 是账户完整集合，空集合也形成水位，且每行 `observed_at` 必须等于 result 的 `observed_at`。
 24. Gateway route 的可选 `client_id / terminal_id` 是筛选条件；匹配到多个 active session 时必须返回 `AmbiguousRoute`，不得任选一个。新 session 必须原子 stale 同 route 的旧 session，旧 callback 只能按精确 `session_id / revision` 操作。
 25. `wire_outbox.ACKED` 只表示 `transport.ack`；`command_delivery_attempts.ACKED` 只表示已验证的 `command.received`。transport write 的崩溃窗口使用 `WRITE_STARTED`，timeout / disconnect / 不确定 write 使用 attempt `UNCONFIRMED`；Gateway 只报告这些 outcome，不推进 `ExecutionCommandState`。
+26. `InboundAdmission::Accepted / Duplicate / Rejected` 都是 ACK 前的 durable decision 承诺：Accepted 必须 crash-recoverable，Duplicate 必须匹配相同 durable identity/payload，Rejected 必须持久化稳定 typed reason；只进入内存队列不得发送 `transport.ack`。admission error / timeout 不发 ACK，并关闭当前 session。
+27. `session.accepted` 固定占用 outbound sequence 1；control message、execution command 和 reconciliation request 共用 durable session sequence。单 writer 必须按 sequence 输出；显式无 wire 结果使用 skip，未解释的 gap、overflow 或 backpressure 必须 fail closed。
+28. Execution Client client-auth secret 只能接受匹配 identity 的 ACTIVE / NEXT；token 和配置 secret 不得进入 Debug 或日志。非空 resume cursor 必须在 accepted 前交给 durable resume handler，且不得触发 command 自动重放。
+29. `heartbeat_timeout / time_sync_interval / max_time_sync_rtt / max_clock_offset` 的下发值与 session route gate 必须使用同一 policy；高 RTT sample 只丢弃 sample，不能丢失合法 heartbeat liveness。
+30. 明文 Execution Client transport 只允许 loopback 或具备明确隔离的受控私网；跨主机或跨安全边界必须使用 TLS，服务间优先使用 mTLS。
 
 ## Rust 工作区目标
 
@@ -340,7 +345,38 @@ git diff --check
    - REJECTED `transport.ack` 保留 `wire_outbox.FAILED` 和 reason，结束 transport-admission inflight，但不把 attempt 置为 `ACKED`；并发 write completion 可把 `PENDING` 收敛为 `SENT`，已有独立证据保持不变；late `command.received` 仍可推进 attempt `ACKED`，不得抹掉 rejection fact；
    - 只有已验证的 `command.received` 推进 attempt `ACKED`；timeout/disconnect 不得覆盖更强证据。
 
-第六里程碑的 Gateway 测试覆盖 concurrent activation、activation/disconnect、startup fence、invalid heartbeat、sequence 并发、normal/replay/backpressure/failure/unconfirmed、replacement/write admission、ACK/receipt/timeout/disconnect 竞态和 payload drift。下一里程碑为 Native TCP 与 Execution WebSocket transport binding。
+第六里程碑的 Gateway 测试覆盖 concurrent activation、activation/disconnect、startup fence、invalid heartbeat、sequence 并发、normal/replay/backpressure/failure/unconfirmed、replacement/write admission、ACK/receipt/timeout/disconnect 竞态和 payload drift。第七里程碑在此基线上完成真实 transport binding。
+
+## 第七里程碑（已完成）
+
+第七里程碑完成 Native TCP 与 Execution WebSocket transport binding，并复用第六里程碑的 session/outbound durability，不在 transport 层引入 execution lifecycle、retry 或 reconciliation 决策：
+
+1. 共享连接与认证状态机：
+   - `ConfiguredClientAuthenticator` 按 client/account/terminal/platform/remote identity 绑定凭证，只接受 ACTIVE / NEXT client-auth secret，Debug 输出脱敏；
+   - 首条数据消息必须是合法 `session.hello`，认证成功后分配新 session；`session.accepted` 真实写成功后才进入 active message loop；
+   - `GatewayConnectionService` 同时限制两个 binding 的总 connection 和 pending handshake，并强制 session clock policy 与 hello 下发 policy 一致。
+2. 两种真实 transport binding：
+   - Native TCP 使用 4-byte unsigned big-endian length prefix，支持拆包、粘包和多 frame；零长度、超限、不完整、非 UTF-8/JSON frame 均立即 fail closed；
+   - Execution WebSocket 固定使用 `/execution-client`，一个 Text message 对应一个 `WireMessage`；Binary/raw/超限消息拒绝，且与后续 `/events` endpoint 隔离；
+   - public stream adapter 和 listener path 都受共享 semaphore 约束；握手使用统一 deadline，shutdown 具有 grace bound、abort/drain fallback，完成任务优先回收。
+   - `inbound_admission_timeout` 强制短于总 `handshake_timeout`（当前默认 2 秒 / 5 秒），使及时 hello 的内部 resume timeout 分支可在总 deadline 前到达；`session.rejected` 在剩余写预算内 best-effort 返回，总 deadline 始终优先 fail closed。
+3. 单 writer 与 outbound ordering：
+   - 每个 connection 只有一个 writer，bootstrap、control 和 durable business frame 共用有界 admission；oneshot completion 只在实际 transport write 后返回证据；
+   - `session.accepted` 固定 sequence 1；后续 control / command / reconciliation 共用 `last_outbound_sequence`，支持有界乱序重排、显式 skip 和 gap timeout；
+   - control message 使用 deferred materialization，在 concrete writer 即将写入前生成 `sent_at`；`time.sync.response.server_send_at == server_time == envelope.sent_at`；encode/size/materialization 失败关闭 writer。
+4. Inbound、time 和 resume 边界：
+   - 两个 binding 共用 direction allowlist、递归 payload identity 校验、session sequence 和 `InboundMessagePort`；只有 durable `Accepted / Duplicate / Rejected` admission 后才发送 transport ACK；
+   - admission error/timeout 写 `InboundAdmissionFailed`、不发 ACK 并断开；transport adapter 不修改 `ExecutionCommandState`；
+   - heartbeat 将结构非法时间证据降为 UNSYNCED 但不刷新 durable heartbeat；缺失/高 RTT sample 被丢弃，合法 heartbeat 仍刷新 liveness；sent_at/effective time skew 和 clock health transition 产出 typed transport event；
+   - 非空 resume cursor 在 accepted 前完整交给 `SessionResumePort`；未配置 durable handler、失败或 timeout 拒绝握手，transport 不自动 replay command。
+5. Session 与 Store 生命周期收口：
+   - control sequence 与 business delivery 使用同一 durable cursor；exact session close 在单个 `BEGIN IMMEDIATE` 事务中读取最新 revision 后关闭，避免与 sequence reserve 竞争时 CAS 饥饿；
+   - replacement 会真实关闭旧 socket；connection/server task cancellation、bootstrap cancellation 和 commit-uncertain activation 都有 RAII cleanup，最终 exact-disconnect durable epoch；
+   - writer queue、reorder buffer、write、handshake、admission、event write、connection task 和 shutdown 都有明确资源或时间上限。
+
+本里程碑的 Gateway 单元测试覆盖 auth、identity、clock policy、deferred writer、乱序/skip/gap、shutdown fallback 和原有 outbound durability；Store 测试覆盖 control/business cursor 及 exact-close 并发/幂等。真实 loopback 测试覆盖 Native TCP 拆包/粘包、非法 frame、认证拒绝、replacement、resume 成功/失败/timeout、clock event、durable admission 完成前无 ACK、Duplicate/typed Rejected ACK、admission error/timeout、activation/connection cancellation 和 handshake deadline，以及 Execution WebSocket path、Text/Binary、超限和认证行为。
+
+本里程碑只定义 production inbound durability、resume durability 和 transport event 的强制 port contract，并使用测试 adapter 验证 transport 行为；尚未新增 production wire inbox/spool handler、TransportEvent/deadletter persistence，也未组合真实 Execution/Reconciliation inbound dispatcher。TLS/mTLS termination、HTTP API 和 Event WebSocket 同样不在本里程碑内。下一里程碑必须在 composition/application 层履行这些 durable contract，不能把测试中的内存 recording/noop adapter 当成生产实现。
 
 ## 实现约束
 
@@ -368,20 +404,20 @@ git diff --check
 3. Circuit Breaker durable restore、Execution command 和状态机。（已完成）
 4. Reconciliation 领域和 V0004 State Store。（已完成）
 5. Gateway session registry 和出站投递端口。（已完成）
-6. Native TCP 和 Execution WebSocket 绑定。（下一里程碑）
-7. HTTP TradeIntent/state/time API 和 Event WebSocket。
+6. Native TCP 和 Execution WebSocket 绑定。（已完成）
+7. HTTP TradeIntent/state/time API、Event WebSocket，以及 production inbound、TransportEvent/deadletter composition。（下一里程碑）
 8. Fake Execution Client 端到端测试。
 9. MQL5 和 OKX 适配器。
 10. Strategy & Decision Control Plane。
 
-Risk、Circuit Breaker durable restore、Execution、Reconciliation 和 Gateway session/outbound durability 已完成。下一里程碑实现 Native TCP 与 Execution WebSocket transport binding；两者必须复用同一 Execution Client Protocol、session registry 和 outbound sink contract，不得在 transport 层复制 lifecycle、retry 或 reconciliation policy。MQL5 adapter 里程碑必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。
+Risk、Circuit Breaker durable restore、Execution、Reconciliation、Gateway session/outbound durability 和两种 Execution Client transport binding 已完成。下一里程碑实现 HTTP TradeIntent/state/time API、Event WebSocket，以及 production inbound、TransportEvent/deadletter composition；必须履行 durable admission、事件持久化和授权一致性契约，不得让 HTTP/Event WS 绕过 Trading Core。MQL5 adapter 里程碑仍必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。
 
 ## 建议的开场提示
 
 ```text
 完整阅读 HANDOFF.md 和 docs/quant_trading_7_layer_target_architecture.md。
-将已经实现的协议、State Store、Risk、Execution、Reconciliation 和 Gateway session/outbound 里程碑视为经过验证的基线；修改前先运行基线验收命令。
-下一里程碑只实现 Native TCP 与 Execution WebSocket transport binding；复用现有 registry / sink / delivery adapter，不得把 transport route、wire outcome 或 retry 决策混入 Reconciliation / Execution 领域状态机。
+将已经实现的协议、State Store、Risk、Execution、Reconciliation、Gateway session/outbound 和 Execution Client transport binding 视为经过验证的基线；修改前先运行基线验收命令。
+下一里程碑实现 HTTP TradeIntent/state/time API、Event WebSocket，以及 production inbound、TransportEvent/deadletter composition；复用现有 durable Store、Gateway admission/event port 和授权模型，不得创建绕过 Trading Core 的 execution 通道。
 报告完成前，运行 cargo fmt --all --check、cargo check --workspace 和 cargo test --workspace。
 架构存在歧义时，先指出冲突并解决文档问题，再修改代码。
 ```

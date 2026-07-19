@@ -34,6 +34,17 @@ pub type SinkWriteFuture<'a> = Pin<Box<dyn Future<Output = SinkWriteOutcome> + S
 /// Object-safe boundary implemented later by Native TCP and Execution WS.
 pub trait OutboundSink: Send + Sync {
     fn write<'a>(&'a self, frame: OutboundFrame) -> SinkWriteFuture<'a>;
+
+    /// Advances a durably reserved sequence that intentionally produced no
+    /// wire message (for example, an expiry discovered during final claim).
+    fn skip(&self, sequence: u64);
+
+    /// Stops accepting new writes and asks the owning transport to close.
+    ///
+    /// Transport bindings override this synchronous hook so replacement
+    /// fencing can wake their read and write loops. Stateless test and adapter
+    /// sinks may retain the default no-op implementation.
+    fn close(&self) {}
 }
 
 #[cfg(test)]
@@ -53,6 +64,8 @@ mod tests {
             let outcome = self.outcome.clone();
             Box::pin(async move { outcome })
         }
+
+        fn skip(&self, _sequence: u64) {}
     }
 
     #[tokio::test]

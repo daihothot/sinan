@@ -1,16 +1,16 @@
-use std::{fmt::Display, sync::Arc};
+use std::fmt::Display;
 
 use serde::{de::DeserializeOwned, Serialize};
 use sinan_execution::{
     DeliveryFailure, DeliveryFuture, DeliveryInfrastructureError, DeliveryOutcome, DeliveryReceipt,
     DeliveryRejection, DeliveryRejectionReason, DeliveryRequest, DeliveryUncertainty,
-    OutboundDeliveryPort, ServerClock,
+    OutboundDeliveryPort,
 };
 use sinan_protocol::{ReconciliationRequest, WireMessage, SUPPORTED_SCHEMA_VERSION};
 use sinan_store::{
     CanonicalJson, ClaimWireOutbox, CompleteTransportWrite, DeliverySubject, NewDeliveryAttempt,
     NewReservedDelivery, OutboxClaimOutcome, ReserveOutboundSequence, SequenceReservation,
-    SessionRouteQuery, SessionRouteResolution, SqliteStateStore, StoreError, StoredDeliveryAttempt,
+    SessionRouteQuery, SessionRouteResolution, StoreError, StoredDeliveryAttempt,
     StoredOutboundDelivery, WriteTransaction, DELIVERY_ERROR_CLOCK_UNHEALTHY,
     DELIVERY_ERROR_COMMAND_EXPIRED, DELIVERY_ERROR_SESSION_UNAVAILABLE,
     TRANSPORT_ACK_REJECTED_PREFIX,
@@ -21,25 +21,22 @@ use sinan_types::{
 
 use crate::{
     validation::{validate_command_request, validate_reconciliation_request},
-    LiveSessionRegistry, OutboundFrame, SinkWriteOutcome,
+    GatewaySessionRegistry, OutboundFrame, SinkWriteOutcome,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GatewayOutboundConfig {
-    pub heartbeat_timeout_ms: u64,
     pub confirmation_timeout_ms: u64,
 }
 
 impl GatewayOutboundConfig {
     pub fn validate(self) -> Result<Self, DeliveryInfrastructureError> {
-        if self.heartbeat_timeout_ms == 0 || self.confirmation_timeout_ms == 0 {
+        if self.confirmation_timeout_ms == 0 {
             return Err(DeliveryInfrastructureError::new(
                 "gateway timeout configuration must be greater than zero",
             ));
         }
-        if self.heartbeat_timeout_ms > i64::MAX as u64
-            || self.confirmation_timeout_ms > i64::MAX as u64
-        {
+        if self.confirmation_timeout_ms > i64::MAX as u64 {
             return Err(DeliveryInfrastructureError::new(
                 "gateway timeout configuration exceeds the server-time domain",
             ));
@@ -50,23 +47,17 @@ impl GatewayOutboundConfig {
 
 #[derive(Clone)]
 pub struct GatewayOutboundAdapter {
-    store: SqliteStateStore,
-    live_sessions: Arc<LiveSessionRegistry>,
-    clock: Arc<dyn ServerClock>,
+    sessions: GatewaySessionRegistry,
     config: GatewayOutboundConfig,
 }
 
 impl GatewayOutboundAdapter {
     pub fn new(
-        store: SqliteStateStore,
-        live_sessions: Arc<LiveSessionRegistry>,
-        clock: Arc<dyn ServerClock>,
+        sessions: GatewaySessionRegistry,
         config: GatewayOutboundConfig,
     ) -> Result<Self, DeliveryInfrastructureError> {
         Ok(Self {
-            store,
-            live_sessions,
-            clock,
+            sessions,
             config: config.validate()?,
         })
     }
@@ -108,10 +99,15 @@ impl GatewayOutboundAdapter {
         let message_id = request.message.message_id.clone();
         let attempt_id = attempt_id(&message_id);
         let rejected_request_payload = rejected_request_payload(&request)?;
-        let heartbeat_timeout = i64::try_from(self.config.heartbeat_timeout_ms)
+        let heartbeat_timeout = i64::try_from(self.sessions.config().max_time_sync_age_ms)
             .map_err(|error| infrastructure(error.to_string()))?;
         let fresh_after = now.saturating_sub(heartbeat_timeout);
-        let mut transaction = self.store.begin_write().await.map_err(infrastructure)?;
+        let mut transaction = self
+            .sessions
+            .store()
+            .begin_write()
+            .await
+            .map_err(infrastructure)?;
         if let Some(existing) = transaction
             .get_outbound_delivery(&message_id)
             .await
@@ -334,10 +330,11 @@ impl GatewayOutboundAdapter {
             self.server_now()?,
             prepared.outbox.updated_at.max(prepared.attempt.updated_at),
         );
-        let heartbeat_timeout = i64::try_from(self.config.heartbeat_timeout_ms)
+        let heartbeat_timeout = i64::try_from(self.sessions.config().max_time_sync_age_ms)
             .map_err(|error| infrastructure(error.to_string()))?;
         let claim = self
-            .store
+            .sessions
+            .store()
             .claim_outbox(ClaimWireOutbox {
                 message_id: prepared.outbox.message_id.clone(),
                 expected_outbox_revision: prepared.outbox.revision,
@@ -355,6 +352,7 @@ impl GatewayOutboundAdapter {
             Ok(OutboxClaimOutcome::Expired(rejected))
             | Ok(OutboxClaimOutcome::SessionUnavailable(rejected))
             | Ok(OutboxClaimOutcome::ClockUnhealthy(rejected)) => {
+                self.skip_reserved_sequence(&rejected);
                 return durable_delivery_outcome(
                     rejected,
                     claim_at,
@@ -383,7 +381,7 @@ impl GatewayOutboundAdapter {
             sequence,
             wire_bytes: claimed.outbox.payload.as_str().as_bytes().to_vec(),
         };
-        let outcome = match self.live_sessions.handle(&session_id) {
+        let outcome = match self.sessions.live_sessions().handle(&session_id) {
             Some(handle) => handle.write(frame).await,
             None => SinkWriteOutcome::DefinitelyNotWritten {
                 error: "active session has no live transport sink".to_owned(),
@@ -403,14 +401,19 @@ impl GatewayOutboundAdapter {
 
         match outcome {
             SinkWriteOutcome::Written => {
-                let completion = self.store.finish_transport_write_sent(complete(None)).await;
+                let completion = self
+                    .sessions
+                    .store()
+                    .finish_transport_write_sent(complete(None))
+                    .await;
                 self.outcome_after_completion(&claimed.outbox.message_id, completion, completed_at)
                     .await
             }
             SinkWriteOutcome::Backpressure { queue_depth } => {
                 let error = format!("transport write backpressure at queue depth {queue_depth}");
                 let completion = self
-                    .store
+                    .sessions
+                    .store()
                     .finish_transport_write_backpressure(complete(Some(error)))
                     .await;
                 self.outcome_after_completion(&claimed.outbox.message_id, completion, completed_at)
@@ -418,7 +421,8 @@ impl GatewayOutboundAdapter {
             }
             SinkWriteOutcome::DefinitelyNotWritten { error } => {
                 let completion = self
-                    .store
+                    .sessions
+                    .store()
                     .finish_transport_write_failed(complete(Some(error)))
                     .await;
                 self.outcome_after_completion(&claimed.outbox.message_id, completion, completed_at)
@@ -426,12 +430,25 @@ impl GatewayOutboundAdapter {
             }
             SinkWriteOutcome::Unconfirmed { error } => {
                 let completion = self
-                    .store
+                    .sessions
+                    .store()
                     .finish_transport_write_unconfirmed(complete(Some(error)))
                     .await;
                 self.outcome_after_completion(&claimed.outbox.message_id, completion, completed_at)
                     .await
             }
+        }
+    }
+
+    fn skip_reserved_sequence(&self, delivery: &StoredOutboundDelivery) {
+        let (Some(session_id), Some(sequence)) = (
+            delivery.outbox.session_id.as_ref(),
+            delivery.outbox.sequence,
+        ) else {
+            return;
+        };
+        if let Some(handle) = self.sessions.live_sessions().handle(session_id) {
+            handle.skip(sequence);
         }
     }
 
@@ -460,7 +477,8 @@ impl GatewayOutboundAdapter {
         observed_at: i64,
     ) -> Result<DeliveryOutcome, DeliveryInfrastructureError> {
         let existing = self
-            .store
+            .sessions
+            .store()
             .get_outbound_delivery(message_id)
             .await
             .map_err(infrastructure)?
@@ -519,14 +537,7 @@ impl GatewayOutboundAdapter {
     }
 
     fn server_now(&self) -> Result<i64, DeliveryInfrastructureError> {
-        let now = self.clock.now_ms();
-        if now < 0 {
-            Err(infrastructure(
-                "server clock returned a negative Unix millisecond timestamp",
-            ))
-        } else {
-            Ok(now)
-        }
+        self.sessions.server_now().map_err(infrastructure)
     }
 }
 
@@ -982,13 +993,14 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use sinan_execution::ServerClock;
     use sinan_protocol::{
         ExecutionClientMessageType, ExecutionClientPlatform, ReconciliationReason,
     };
     use sinan_store::{
         CanonicalJson, CoreEventMetadata, DeliverySubject, NewExecutionCommand,
-        NewReconciliationRun, NewRiskResult, NewTradeIntent, OutboundReservation, StoreOptions,
-        StoredDeliveryAttempt, StoredWireOutbox,
+        NewReconciliationRun, NewRiskResult, NewTradeIntent, OutboundReservation, SqliteStateStore,
+        StoreOptions, StoredDeliveryAttempt, StoredWireOutbox,
     };
     use sinan_types::{
         single_leg_id, AccountId, AdjustedRiskLeg, AdjustedRiskLegAction, ClientId, CommandId,
@@ -999,8 +1011,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        GatewaySessionConfig, GatewaySessionRegistry, OutboundSink, SessionRegistration,
-        SinkWriteFuture,
+        GatewaySessionConfig, GatewaySessionRegistry, LiveSessionRegistry, OutboundSink,
+        SessionRegistration, SinkWriteFuture,
     };
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -1080,6 +1092,8 @@ mod tests {
             let outcome = self.outcome.clone();
             Box::pin(async move { outcome })
         }
+
+        fn skip(&self, _sequence: u64) {}
     }
 
     struct ControlledSink {
@@ -1104,6 +1118,8 @@ mod tests {
                 SinkWriteOutcome::Written
             })
         }
+
+        fn skip(&self, _sequence: u64) {}
     }
 
     async fn test_store() -> (TestDatabase, SqliteStateStore) {
@@ -1141,6 +1157,8 @@ mod tests {
             clock,
             GatewaySessionConfig {
                 max_clock_offset_ms: 250,
+                max_time_sync_age_ms: 500,
+                max_time_sync_rtt_ms: 1_000,
             },
         )
         .unwrap()
@@ -1151,12 +1169,10 @@ mod tests {
         live: Arc<LiveSessionRegistry>,
         clock: Arc<ManualClock>,
     ) -> GatewayOutboundAdapter {
+        let sessions = session_registry(store, live, clock);
         GatewayOutboundAdapter::new(
-            store,
-            live,
-            clock,
+            sessions,
             GatewayOutboundConfig {
-                heartbeat_timeout_ms: 500,
                 confirmation_timeout_ms: 1_000,
             },
         )
@@ -1793,12 +1809,20 @@ mod tests {
             execution_command(&store, "command_1", 1_150).await,
             "message_1",
         );
-        let adapter = GatewayOutboundAdapter::new(
+        let outbound_sessions = GatewaySessionRegistry::new(
             store.clone(),
             live,
             Arc::new(ClaimExpiryClock::new()),
+            GatewaySessionConfig {
+                max_clock_offset_ms: 250,
+                max_time_sync_age_ms: 500,
+                max_time_sync_rtt_ms: 1_000,
+            },
+        )
+        .unwrap();
+        let adapter = GatewayOutboundAdapter::new(
+            outbound_sessions,
             GatewayOutboundConfig {
-                heartbeat_timeout_ms: 500,
                 confirmation_timeout_ms: 1_000,
             },
         )

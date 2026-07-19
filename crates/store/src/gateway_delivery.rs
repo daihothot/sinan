@@ -14,9 +14,11 @@ use crate::{
     json::CanonicalJson,
     model::{
         ClaimWireOutbox, CommandReceivedAttemptUpdate, CompleteTransportWrite,
-        DeliveryAttemptTimeout, DeliveryStartupFenceReport, DeliverySubject, NewDeliveryAttempt,
+        ControlOutboundReservation, ControlSequenceReservation, DeliveryAttemptTimeout,
+        DeliveryStartupFenceReport, DeliverySubject, ExactSessionClose, NewDeliveryAttempt,
         NewReservedDelivery, NewSessionRecord, NewWireOutbox, OutboundReservation,
-        OutboxClaimOutcome, ReserveOutboundSequence, SequenceReservation, SessionDisconnectOutcome,
+        OutboxClaimOutcome, ReserveControlOutboundSequence, ReserveOutboundSequence,
+        SequenceReservation, SessionClockInvalidation, SessionDisconnectOutcome,
         SessionHeartbeatUpdate, SessionReplacement, SessionRouteQuery, SessionRouteResolution,
         SessionStatusUpdate, StoredDeliveryAttempt, StoredOutboundDelivery, StoredSessionRecord,
         StoredWireOutbox, TransportAckUpdate, WriteOutcome, DELIVERY_ERROR_CLOCK_UNHEALTHY,
@@ -59,6 +61,16 @@ impl SqliteStateStore {
         Ok(session)
     }
 
+    pub async fn invalidate_session_clock(
+        &self,
+        update: SessionClockInvalidation,
+    ) -> Result<StoredSessionRecord, StoreError> {
+        let mut transaction = self.begin_write().await?;
+        let session = transaction.invalidate_session_clock(update).await?;
+        transaction.commit().await?;
+        Ok(session)
+    }
+
     pub async fn mark_session_stale(
         &self,
         update: SessionStatusUpdate,
@@ -75,6 +87,32 @@ impl SqliteStateStore {
     ) -> Result<SessionDisconnectOutcome, StoreError> {
         let mut transaction = self.begin_write().await?;
         let outcome = transaction.disconnect_session(update).await?;
+        transaction.commit().await?;
+        Ok(outcome)
+    }
+
+    pub async fn mark_exact_session_stale(
+        &self,
+        update: ExactSessionClose,
+    ) -> Result<SessionDisconnectOutcome, StoreError> {
+        self.close_exact_session(update, SessionStatus::Stale).await
+    }
+
+    pub async fn disconnect_exact_session(
+        &self,
+        update: ExactSessionClose,
+    ) -> Result<SessionDisconnectOutcome, StoreError> {
+        self.close_exact_session(update, SessionStatus::Disconnected)
+            .await
+    }
+
+    async fn close_exact_session(
+        &self,
+        update: ExactSessionClose,
+        status: SessionStatus,
+    ) -> Result<SessionDisconnectOutcome, StoreError> {
+        let mut transaction = self.begin_write().await?;
+        let outcome = close_exact_session_on(transaction.connection(), update, status).await?;
         transaction.commit().await?;
         Ok(outcome)
     }
@@ -100,6 +138,18 @@ impl SqliteStateStore {
         let outcome = transaction.record_delivery_attempt(attempt).await?;
         transaction.commit().await?;
         Ok(outcome)
+    }
+
+    pub async fn reserve_control_outbound_sequence(
+        &self,
+        request: ReserveControlOutboundSequence,
+    ) -> Result<ControlSequenceReservation, StoreError> {
+        let mut transaction = self.begin_write().await?;
+        let reservation = transaction
+            .reserve_control_outbound_sequence(request)
+            .await?;
+        transaction.commit().await?;
+        Ok(reservation)
     }
 
     pub async fn claim_outbox(
@@ -275,6 +325,13 @@ impl WriteTransaction {
         update_session_heartbeat_on(self.connection(), update).await
     }
 
+    pub async fn invalidate_session_clock(
+        &mut self,
+        update: SessionClockInvalidation,
+    ) -> Result<StoredSessionRecord, StoreError> {
+        invalidate_session_clock_on(self.connection(), update).await
+    }
+
     pub async fn mark_session_stale(
         &mut self,
         update: SessionStatusUpdate,
@@ -287,6 +344,20 @@ impl WriteTransaction {
         update: SessionStatusUpdate,
     ) -> Result<SessionDisconnectOutcome, StoreError> {
         close_session_on(self.connection(), update, SessionStatus::Disconnected).await
+    }
+
+    pub async fn mark_exact_session_stale(
+        &mut self,
+        update: ExactSessionClose,
+    ) -> Result<SessionDisconnectOutcome, StoreError> {
+        close_exact_session_on(self.connection(), update, SessionStatus::Stale).await
+    }
+
+    pub async fn disconnect_exact_session(
+        &mut self,
+        update: ExactSessionClose,
+    ) -> Result<SessionDisconnectOutcome, StoreError> {
+        close_exact_session_on(self.connection(), update, SessionStatus::Disconnected).await
     }
 
     pub async fn fence_interrupted_writes(
@@ -309,6 +380,13 @@ impl WriteTransaction {
         reservation: ReserveOutboundSequence,
     ) -> Result<SequenceReservation, StoreError> {
         reserve_outbound_sequence_on(self.connection(), reservation).await
+    }
+
+    pub async fn reserve_control_outbound_sequence(
+        &mut self,
+        request: ReserveControlOutboundSequence,
+    ) -> Result<ControlSequenceReservation, StoreError> {
+        reserve_control_outbound_sequence_on(self.connection(), request).await
     }
 
     pub async fn enqueue_reserved_delivery(
@@ -576,6 +654,39 @@ async fn update_session_heartbeat_on(
     required_session(connection, &update.session_id).await
 }
 
+async fn invalidate_session_clock_on(
+    connection: &mut SqliteConnection,
+    update: SessionClockInvalidation,
+) -> Result<StoredSessionRecord, StoreError> {
+    let current = required_session(connection, &update.session_id).await?;
+    require_active_session_revision(&current, update.expected_revision)?;
+    if update.updated_at < current.updated_at {
+        return Err(stale_session(&update.session_id));
+    }
+    let next_revision = checked_increment("execution_client_sessions.revision", current.revision)?;
+    let result = sqlx::query(
+        "UPDATE execution_client_sessions \
+         SET clock_sync_status = 'UNSYNCED', revision = ?, updated_at = ? \
+         WHERE session_id = ? AND status = 'ACTIVE' AND revision = ?",
+    )
+    .bind(u64_to_i64(
+        "execution_client_sessions.revision",
+        next_revision,
+    )?)
+    .bind(update.updated_at)
+    .bind(update.session_id.as_str())
+    .bind(u64_to_i64(
+        "execution_client_sessions.revision",
+        update.expected_revision,
+    )?)
+    .execute(&mut *connection)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(stale_session(&update.session_id));
+    }
+    required_session(connection, &update.session_id).await
+}
+
 async fn close_session_on(
     connection: &mut SqliteConnection,
     update: SessionStatusUpdate,
@@ -603,6 +714,42 @@ async fn close_session_on(
     )
     .await?;
     transition_session_status_on(connection, &current, status, update.changed_at).await?;
+    Ok(SessionDisconnectOutcome {
+        session: required_session(connection, &update.session_id).await?,
+        unconfirmed_attempts,
+    })
+}
+
+async fn close_exact_session_on(
+    connection: &mut SqliteConnection,
+    update: ExactSessionClose,
+    status: SessionStatus,
+) -> Result<SessionDisconnectOutcome, StoreError> {
+    require_non_empty("session status delivery_error", &update.delivery_error)?;
+    let current = required_session(connection, &update.session_id).await?;
+    if current.status != SessionStatus::Active {
+        return Ok(SessionDisconnectOutcome {
+            session: current,
+            unconfirmed_attempts: Vec::new(),
+        });
+    }
+    let changed_at = update.changed_at.max(current.updated_at);
+    settle_rejected_pending_attempts_on(connection, &update.session_id, changed_at).await?;
+    let unconfirmed_attempts = unconfirm_session_attempts_on(
+        connection,
+        &update.session_id,
+        changed_at,
+        &update.delivery_error,
+    )
+    .await?;
+    cancel_session_pending_deliveries_on(
+        connection,
+        &update.session_id,
+        changed_at,
+        &update.delivery_error,
+    )
+    .await?;
+    transition_session_status_on(connection, &current, status, changed_at).await?;
     Ok(SessionDisconnectOutcome {
         session: required_session(connection, &update.session_id).await?,
         unconfirmed_attempts,
@@ -786,6 +933,64 @@ async fn reserve_outbound_sequence_on(
         sequence,
         subject: request.subject,
     }))
+}
+
+async fn reserve_control_outbound_sequence_on(
+    connection: &mut SqliteConnection,
+    request: ReserveControlOutboundSequence,
+) -> Result<ControlSequenceReservation, StoreError> {
+    let Some(session) = fetch_session_by_id(&mut *connection, &request.session_id).await? else {
+        return Ok(ControlSequenceReservation::SessionUnavailable);
+    };
+    if session.status != SessionStatus::Active {
+        return Ok(ControlSequenceReservation::SessionUnavailable);
+    }
+    if request.reserved_at < session.updated_at {
+        return Err(stale_session(&request.session_id));
+    }
+
+    let sequence = checked_increment(
+        "execution_client_sessions.last_outbound_sequence",
+        session.last_outbound_sequence,
+    )?;
+    let revision = checked_increment("execution_client_sessions.revision", session.revision)?;
+    let result = sqlx::query(
+        "UPDATE execution_client_sessions \
+         SET last_outbound_sequence = ?, revision = ?, updated_at = ? \
+         WHERE session_id = ? AND status = 'ACTIVE' AND revision = ? \
+           AND last_outbound_sequence = ?",
+    )
+    .bind(u64_to_i64(
+        "execution_client_sessions.last_outbound_sequence",
+        sequence,
+    )?)
+    .bind(u64_to_i64("execution_client_sessions.revision", revision)?)
+    .bind(request.reserved_at)
+    .bind(session.session_id.as_str())
+    .bind(u64_to_i64(
+        "execution_client_sessions.revision",
+        session.revision,
+    )?)
+    .bind(u64_to_i64(
+        "execution_client_sessions.last_outbound_sequence",
+        session.last_outbound_sequence,
+    )?)
+    .execute(&mut *connection)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(stale_session(&request.session_id));
+    }
+
+    Ok(ControlSequenceReservation::Reserved(
+        ControlOutboundReservation {
+            session_id: session.session_id,
+            client_id: session.client_id,
+            account_id: session.account_id,
+            terminal_id: session.terminal_id,
+            session_revision: revision,
+            sequence,
+        },
+    ))
 }
 
 async fn validate_subject_route(

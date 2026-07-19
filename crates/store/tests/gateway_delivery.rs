@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde_json::json;
 use sinan_protocol::{
     ExecutionClientMessageType, ReconciliationReason, ReconciliationRequest, TransportAckStatus,
@@ -5,8 +7,9 @@ use sinan_protocol::{
 };
 use sinan_store::{
     CanonicalJson, ClaimWireOutbox, CommandReceivedAttemptUpdate, CompleteTransportWrite,
-    DeliveryAttemptTimeout, DeliveryRejectionKind, DeliverySubject, NewDeliveryAttempt,
-    NewReservedDelivery, NewSessionRecord, OutboxClaimOutcome, ReserveOutboundSequence,
+    ControlSequenceReservation, DeliveryAttemptTimeout, DeliveryRejectionKind, DeliverySubject,
+    ExactSessionClose, NewDeliveryAttempt, NewReservedDelivery, NewSessionRecord,
+    OutboxClaimOutcome, ReserveControlOutboundSequence, ReserveOutboundSequence,
     SequenceReservation, SessionHeartbeatUpdate, SessionRouteQuery, SessionRouteResolution,
     SessionStatusUpdate, SqliteStateStore, StoreError, StoredOutboundDelivery,
     TRANSPORT_ACK_REJECTED_PREFIX,
@@ -256,6 +259,276 @@ async fn probe_reservation(
         .unwrap();
     transaction.rollback().await.unwrap();
     outcome
+}
+
+#[tokio::test]
+async fn control_sequence_reservations_share_the_durable_session_cursor() {
+    let (_database, store, pool) = test_store().await;
+    let value = command("command-control-interleave", 10_000);
+    seed_command(&pool, &value).await;
+    store
+        .replace_active_session(active_session(
+            "session-control-1",
+            "client-1",
+            "terminal-1",
+            100,
+            8,
+        ))
+        .await
+        .unwrap();
+
+    let mut transaction = store.begin_write().await.unwrap();
+    let first = transaction
+        .reserve_control_outbound_sequence(ReserveControlOutboundSequence {
+            session_id: SessionId::from("session-control-1"),
+            reserved_at: 100,
+        })
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let ControlSequenceReservation::Reserved(first) = first else {
+        panic!("expected the first control sequence reservation");
+    };
+    assert_eq!(first.sequence, 2);
+    assert_eq!(first.session_revision, 1);
+
+    let second = store
+        .reserve_control_outbound_sequence(ReserveControlOutboundSequence {
+            session_id: SessionId::from("session-control-1"),
+            reserved_at: 101,
+        })
+        .await
+        .unwrap();
+    let ControlSequenceReservation::Reserved(second) = second else {
+        panic!("expected the second control sequence reservation");
+    };
+    assert_eq!(second.sequence, 3);
+    assert_eq!(second.session_revision, 2);
+
+    let business_store = store.clone();
+    let (control, business) = tokio::join!(
+        store.reserve_control_outbound_sequence(ReserveControlOutboundSequence {
+            session_id: SessionId::from("session-control-1"),
+            reserved_at: 102,
+        }),
+        prepare_and_commit(
+            business_store,
+            value,
+            "message-control-interleave",
+            "attempt-control-interleave",
+            102,
+        ),
+    );
+    let ControlSequenceReservation::Reserved(control) = control.unwrap() else {
+        panic!("expected the concurrent control sequence reservation");
+    };
+    let mut concurrent_sequences = vec![
+        control.sequence,
+        business
+            .outbox
+            .sequence
+            .expect("reserved business delivery should have a sequence"),
+    ];
+    concurrent_sequences.sort_unstable();
+    assert_eq!(concurrent_sequences, vec![4, 5]);
+
+    let before_replacement = store
+        .get_session(&SessionId::from("session-control-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before_replacement.last_outbound_sequence, 5);
+    assert_eq!(before_replacement.revision, 4);
+    assert_eq!(before_replacement.updated_at, 102);
+
+    let replacement = store
+        .replace_active_session(active_session(
+            "session-control-2",
+            "client-1",
+            "terminal-1",
+            103,
+            8,
+        ))
+        .await
+        .unwrap();
+    let stale = replacement.replaced_session.unwrap();
+    assert_eq!(stale.status, SessionStatus::Stale);
+    assert_eq!(stale.last_outbound_sequence, 5);
+    assert!(matches!(
+        store
+            .reserve_control_outbound_sequence(ReserveControlOutboundSequence {
+                session_id: stale.session_id.clone(),
+                reserved_at: 103,
+            })
+            .await
+            .unwrap(),
+        ControlSequenceReservation::SessionUnavailable
+    ));
+    assert_eq!(
+        store
+            .get_session(&stale.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_outbound_sequence,
+        5
+    );
+
+    assert!(matches!(
+        store
+            .reserve_control_outbound_sequence(ReserveControlOutboundSequence {
+                session_id: replacement.session.session_id.clone(),
+                reserved_at: 102,
+            })
+            .await,
+        Err(StoreError::StaleWrite {
+            entity: "execution_client_session",
+            ..
+        })
+    ));
+    let active = store
+        .get_session(&replacement.session.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.last_outbound_sequence, 1);
+    assert_eq!(active.revision, 0);
+    assert_eq!(active.updated_at, 103);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_close_wins_against_reservations_and_is_idempotent_after_terminal_state() {
+    let (_database, store, pool) = test_store().await;
+    let value = command("command-exact-close-race", 10_000);
+    seed_command(&pool, &value).await;
+    store
+        .replace_active_session(active_session(
+            "session-exact-close",
+            "client-1",
+            "terminal-1",
+            100,
+            64,
+        ))
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(33));
+    let mut tasks = Vec::new();
+    for index in 0..32 {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        let command_id = value.command_id.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            if index % 2 == 0 {
+                let outcome = store
+                    .reserve_control_outbound_sequence(ReserveControlOutboundSequence {
+                        session_id: SessionId::from("session-exact-close"),
+                        reserved_at: 200,
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    outcome,
+                    ControlSequenceReservation::Reserved(_)
+                        | ControlSequenceReservation::SessionUnavailable
+                ));
+                return;
+            }
+
+            let mut transaction = store.begin_write().await.unwrap();
+            match transaction
+                .resolve_session_route(route(true))
+                .await
+                .unwrap()
+            {
+                SessionRouteResolution::Ready(session) => {
+                    let outcome = transaction
+                        .reserve_outbound_sequence(ReserveOutboundSequence {
+                            session_id: session.session_id,
+                            expected_revision: session.revision,
+                            subject: DeliverySubject::ExecutionCommand(command_id),
+                            fresh_after: 0,
+                            reserved_at: 200,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(matches!(outcome, SequenceReservation::Reserved(_)));
+                    transaction.commit().await.unwrap();
+                }
+                SessionRouteResolution::NoActiveSession => {
+                    transaction.rollback().await.unwrap();
+                }
+                other => panic!("unexpected route during exact-close race: {other:?}"),
+            }
+        }));
+    }
+
+    barrier.wait().await;
+    let closed = store
+        .disconnect_exact_session(ExactSessionClose {
+            session_id: SessionId::from("session-exact-close"),
+            changed_at: 200,
+            delivery_error: "CONNECTION_TASK_DROPPED".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(closed.session.status, SessionStatus::Disconnected);
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let terminal = store
+        .get_session(&SessionId::from("session-exact-close"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, SessionStatus::Disconnected);
+
+    for close_as_stale in [false, true] {
+        let request = ExactSessionClose {
+            session_id: terminal.session_id.clone(),
+            changed_at: 201,
+            delivery_error: "DUPLICATE_CLOSE".to_owned(),
+        };
+        let repeated = if close_as_stale {
+            store.mark_exact_session_stale(request).await.unwrap()
+        } else {
+            store.disconnect_exact_session(request).await.unwrap()
+        };
+        assert_eq!(repeated.session, terminal);
+        assert!(repeated.unconfirmed_attempts.is_empty());
+    }
+
+    store
+        .replace_active_session(active_session(
+            "session-exact-stale",
+            "client-2",
+            "terminal-2",
+            300,
+            8,
+        ))
+        .await
+        .unwrap();
+    let stale = store
+        .mark_exact_session_stale(ExactSessionClose {
+            session_id: SessionId::from("session-exact-stale"),
+            changed_at: 301,
+            delivery_error: "HEARTBEAT_TIMEOUT".to_owned(),
+        })
+        .await
+        .unwrap()
+        .session;
+    assert_eq!(stale.status, SessionStatus::Stale);
+    let repeated = store
+        .disconnect_exact_session(ExactSessionClose {
+            session_id: stale.session_id.clone(),
+            changed_at: 302,
+            delivery_error: "LATE_DISCONNECT".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(repeated.session, stale);
 }
 
 #[tokio::test]

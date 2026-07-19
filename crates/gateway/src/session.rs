@@ -3,9 +3,10 @@ use std::sync::Arc;
 use sinan_execution::ServerClock;
 use sinan_protocol::{ExecutionClientPlatform, HeartbeatPayload};
 use sinan_store::{
-    CanonicalJson, DeliveryStartupFenceReport, NewSessionRecord, SessionDisconnectOutcome,
-    SessionHeartbeatUpdate, SessionReplacement, SessionStatusUpdate, SqliteStateStore, StoreError,
-    StoredSessionRecord,
+    CanonicalJson, ControlSequenceReservation, DeliveryStartupFenceReport, ExactSessionClose,
+    NewSessionRecord, ReserveControlOutboundSequence, SessionClockInvalidation,
+    SessionDisconnectOutcome, SessionHeartbeatUpdate, SessionReplacement, SessionStatusUpdate,
+    SqliteStateStore, StoreError, StoredSessionRecord,
 };
 use sinan_types::{AccountId, ClientId, ClockSyncStatus, SessionId, SessionStatus, TerminalId};
 use thiserror::Error;
@@ -37,11 +38,19 @@ impl SessionRegistration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GatewaySessionConfig {
     pub max_clock_offset_ms: u64,
+    pub max_time_sync_age_ms: u64,
+    pub max_time_sync_rtt_ms: u64,
 }
 
 impl GatewaySessionConfig {
     fn validate(self) -> Result<Self, SessionRegistryError> {
-        if self.max_clock_offset_ms == 0 || self.max_clock_offset_ms > i64::MAX as u64 {
+        if self.max_clock_offset_ms == 0
+            || self.max_clock_offset_ms > i64::MAX as u64
+            || self.max_time_sync_age_ms == 0
+            || self.max_time_sync_age_ms > i64::MAX as u64
+            || self.max_time_sync_rtt_ms == 0
+            || self.max_time_sync_rtt_ms > i64::MAX as u64
+        {
             Err(SessionRegistryError::InvalidConfig)
         } else {
             Ok(self)
@@ -61,6 +70,7 @@ pub struct HeartbeatAssessment {
     pub session: StoredSessionRecord,
     pub health: HeartbeatHealth,
     pub clock_skew_ms: u64,
+    pub previous_clock_sync_status: Option<ClockSyncStatus>,
 }
 
 #[derive(Debug, Error)]
@@ -106,6 +116,37 @@ impl GatewaySessionRegistry {
 
     pub fn live_sessions(&self) -> &Arc<LiveSessionRegistry> {
         &self.live_sessions
+    }
+
+    pub(crate) fn config(&self) -> GatewaySessionConfig {
+        self.config
+    }
+
+    pub(crate) fn store(&self) -> &SqliteStateStore {
+        &self.store
+    }
+
+    pub fn server_now(&self) -> Result<i64, SessionRegistryError> {
+        let now = self.clock.now_ms();
+        if now < 0 {
+            Err(SessionRegistryError::InvalidHeartbeat("server_clock"))
+        } else {
+            Ok(now)
+        }
+    }
+
+    pub async fn reserve_control_outbound_sequence(
+        &self,
+        session_id: SessionId,
+        reserved_at: i64,
+    ) -> Result<ControlSequenceReservation, SessionRegistryError> {
+        Ok(self
+            .store
+            .reserve_control_outbound_sequence(ReserveControlOutboundSequence {
+                session_id,
+                reserved_at,
+            })
+            .await?)
     }
 
     pub async fn activate(
@@ -179,83 +220,103 @@ impl GatewaySessionRegistry {
         heartbeat: &HeartbeatPayload,
     ) -> Result<HeartbeatAssessment, SessionRegistryError> {
         let now = self.server_now()?;
-        let current =
-            self.store
-                .get_session(session_id)
-                .await?
-                .ok_or_else(|| StoreError::NotFound {
-                    entity: "execution_client_session",
-                    key: session_id.to_string(),
-                })?;
-        if heartbeat.effective_server_now < 0 {
-            self.persist_clock_unhealthy(&current, now).await?;
-            return Err(SessionRegistryError::InvalidHeartbeat(
-                "effective_server_now",
-            ));
+        let mut last_stale = None;
+        for _ in 0..8 {
+            let current =
+                self.store
+                    .get_session(session_id)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "execution_client_session",
+                        key: session_id.to_string(),
+                    })?;
+            let clock_skew_ms = if heartbeat.effective_server_now < 0 {
+                u64::MAX
+            } else {
+                now.abs_diff(heartbeat.effective_server_now)
+            };
+            let qualified_time_sync_at = heartbeat
+                .last_time_sync_at_server_ms
+                .filter(|_| {
+                    heartbeat
+                        .last_time_sync_rtt_ms
+                        .is_some_and(|rtt| rtt <= self.config.max_time_sync_rtt_ms)
+                })
+                .filter(|sample_at| {
+                    current
+                        .last_time_sync_at
+                        .is_none_or(|last_at| *sample_at >= last_at)
+                });
+            let time_sync_at = qualified_time_sync_at.or(current.last_time_sync_at);
+            let time_sync_stale = heartbeat.clock_sync_status == ClockSyncStatus::Synced
+                && time_sync_at.is_none_or(|at| {
+                    now.saturating_sub(at) as u64 > self.config.max_time_sync_age_ms
+                });
+            let effective_status =
+                if clock_skew_ms > self.config.max_clock_offset_ms || time_sync_stale {
+                    ClockSyncStatus::Unsynced
+                } else {
+                    heartbeat.clock_sync_status
+                };
+            let invalid_field = if heartbeat.effective_server_now < 0 {
+                Some("effective_server_now")
+            } else if heartbeat
+                .last_time_sync_at_server_ms
+                .is_some_and(|at| at < current.connected_at || at > now)
+            {
+                Some("last_time_sync_at_server_ms")
+            } else {
+                None
+            };
+            let updated_at = now.max(current.updated_at);
+            let update_result = if invalid_field.is_some() {
+                self.store
+                    .invalidate_session_clock(SessionClockInvalidation {
+                        session_id: session_id.clone(),
+                        expected_revision: current.revision,
+                        updated_at,
+                    })
+                    .await
+            } else {
+                self.store
+                    .update_session_heartbeat(SessionHeartbeatUpdate {
+                        session_id: session_id.clone(),
+                        expected_revision: current.revision,
+                        heartbeat_at: now,
+                        clock_sync_status: effective_status,
+                        last_time_sync_at: qualified_time_sync_at,
+                        updated_at,
+                    })
+                    .await
+            };
+            let session = match update_result {
+                Ok(session) => session,
+                Err(error @ StoreError::StaleWrite { .. }) => {
+                    last_stale = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(field) = invalid_field {
+                return Err(SessionRegistryError::InvalidHeartbeat(field));
+            }
+            let health = if clock_skew_ms > self.config.max_clock_offset_ms {
+                HeartbeatHealth::ClockSkew
+            } else if session.clock_sync_status == Some(ClockSyncStatus::Synced) {
+                HeartbeatHealth::Healthy
+            } else {
+                HeartbeatHealth::ClockUnhealthy
+            };
+            return Ok(HeartbeatAssessment {
+                session,
+                health,
+                clock_skew_ms,
+                previous_clock_sync_status: current.clock_sync_status,
+            });
         }
-        let clock_skew_ms = now.abs_diff(heartbeat.effective_server_now);
-        let effective_status = if clock_skew_ms > self.config.max_clock_offset_ms {
-            ClockSyncStatus::Unsynced
-        } else {
-            heartbeat.clock_sync_status
-        };
-        if heartbeat
-            .last_time_sync_at_server_ms
-            .is_some_and(|at| at < current.connected_at || at > now)
-        {
-            self.persist_clock_unhealthy(&current, now).await?;
-            return Err(SessionRegistryError::InvalidHeartbeat(
-                "last_time_sync_at_server_ms",
-            ));
-        }
-        if effective_status == ClockSyncStatus::Synced
-            && heartbeat.last_time_sync_at_server_ms.is_none()
-            && current.last_time_sync_at.is_none()
-        {
-            self.persist_clock_unhealthy(&current, now).await?;
-            return Err(SessionRegistryError::InvalidHeartbeat("clock_sync_status"));
-        }
-        let session = self
-            .store
-            .update_session_heartbeat(SessionHeartbeatUpdate {
-                session_id: session_id.clone(),
-                expected_revision: current.revision,
-                heartbeat_at: now,
-                clock_sync_status: effective_status,
-                last_time_sync_at: heartbeat.last_time_sync_at_server_ms,
-                updated_at: now.max(current.updated_at),
-            })
-            .await?;
-        let health = if clock_skew_ms > self.config.max_clock_offset_ms {
-            HeartbeatHealth::ClockSkew
-        } else if session.clock_sync_status == Some(ClockSyncStatus::Synced) {
-            HeartbeatHealth::Healthy
-        } else {
-            HeartbeatHealth::ClockUnhealthy
-        };
-        Ok(HeartbeatAssessment {
-            session,
-            health,
-            clock_skew_ms,
-        })
-    }
-
-    async fn persist_clock_unhealthy(
-        &self,
-        current: &StoredSessionRecord,
-        heartbeat_at: i64,
-    ) -> Result<(), SessionRegistryError> {
-        self.store
-            .update_session_heartbeat(SessionHeartbeatUpdate {
-                session_id: current.session_id.clone(),
-                expected_revision: current.revision,
-                heartbeat_at,
-                clock_sync_status: ClockSyncStatus::Unsynced,
-                last_time_sync_at: None,
-                updated_at: heartbeat_at.max(current.updated_at),
-            })
-            .await?;
-        Ok(())
+        Err(last_stale
+            .expect("heartbeat CAS retry records every stale write")
+            .into())
     }
 
     pub async fn mark_stale(
@@ -287,25 +348,15 @@ impl GatewaySessionRegistry {
         if let Some(handle) = self.live_sessions.handle(session_id) {
             handle.fence();
         }
-        let current =
-            self.store
-                .get_session(session_id)
-                .await?
-                .ok_or_else(|| StoreError::NotFound {
-                    entity: "execution_client_session",
-                    key: session_id.to_string(),
-                })?;
-        let now = self.server_now()?.max(current.updated_at);
-        let update = SessionStatusUpdate {
+        let update = ExactSessionClose {
             session_id: session_id.clone(),
-            expected_revision: current.revision,
-            changed_at: now,
+            changed_at: self.server_now()?,
             delivery_error: error,
         };
         let outcome = if stale {
-            self.store.mark_session_stale(update).await?
+            self.store.mark_exact_session_stale(update).await?
         } else {
-            self.store.disconnect_session(update).await?
+            self.store.disconnect_exact_session(update).await?
         };
         self.live_sessions.disconnect(session_id);
         Ok(outcome)
@@ -324,15 +375,6 @@ impl GatewaySessionRegistry {
             })
             .await?;
         Ok(())
-    }
-
-    fn server_now(&self) -> Result<i64, SessionRegistryError> {
-        let now = self.clock.now_ms();
-        if now < 0 {
-            Err(SessionRegistryError::InvalidHeartbeat("server_clock"))
-        } else {
-            Ok(now)
-        }
     }
 }
 
@@ -460,6 +502,8 @@ mod tests {
         fn write<'a>(&'a self, _frame: OutboundFrame) -> SinkWriteFuture<'a> {
             Box::pin(async { SinkWriteOutcome::Written })
         }
+
+        fn skip(&self, _sequence: u64) {}
     }
 
     async fn test_store() -> (TestDatabase, SqliteStateStore) {
@@ -497,6 +541,8 @@ mod tests {
             clock,
             GatewaySessionConfig {
                 max_clock_offset_ms: 250,
+                max_time_sync_age_ms: 15_000,
+                max_time_sync_rtt_ms: 1_000,
             },
         )
         .expect("gateway session config should be valid")
@@ -693,6 +739,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.clock_sync_status, Some(ClockSyncStatus::Unsynced));
+        assert_eq!(stored.last_heartbeat_at, Some(1_100));
+        assert_eq!(stored.last_time_sync_at, Some(1_050));
         let mut transaction = store.begin_write().await.unwrap();
         let route = transaction
             .resolve_session_route(SessionRouteQuery {
@@ -709,6 +757,125 @@ mod tests {
             route,
             SessionRouteResolution::ClockUnhealthy { candidate_count: 1 }
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_or_unqualified_time_sync_evidence_cannot_keep_session_synced() {
+        let (_database, store) = test_store().await;
+        let live = Arc::new(LiveSessionRegistry::new());
+        let clock = Arc::new(ManualClock::new(1_000));
+        let registry = registry(store.clone(), live, Arc::clone(&clock));
+        registry
+            .activate(registration("session_1"), Arc::new(WrittenSink))
+            .await
+            .unwrap();
+
+        clock.set(1_100);
+        registry
+            .assess_heartbeat(
+                &SessionId::from("session_1"),
+                &HeartbeatPayload {
+                    effective_server_now: 1_100,
+                    clock_sync_status: ClockSyncStatus::Synced,
+                    last_time_sync_at_server_ms: Some(1_050),
+                    last_time_sync_rtt_ms: Some(10),
+                    server_time_offset_ms: Some(0),
+                    send_queue_depth: None,
+                    command_inbox_depth: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        clock.set(1_200);
+        let regressed_sample = registry
+            .assess_heartbeat(
+                &SessionId::from("session_1"),
+                &HeartbeatPayload {
+                    effective_server_now: 1_200,
+                    clock_sync_status: ClockSyncStatus::Synced,
+                    last_time_sync_at_server_ms: Some(1_040),
+                    last_time_sync_rtt_ms: Some(10),
+                    server_time_offset_ms: Some(0),
+                    send_queue_depth: None,
+                    command_inbox_depth: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(regressed_sample.health, HeartbeatHealth::Healthy);
+        assert_eq!(regressed_sample.session.last_time_sync_at, Some(1_050));
+        assert_eq!(regressed_sample.session.last_heartbeat_at, Some(1_200));
+
+        clock.set(20_000);
+        let stale = registry
+            .assess_heartbeat(
+                &SessionId::from("session_1"),
+                &HeartbeatPayload {
+                    effective_server_now: 20_000,
+                    clock_sync_status: ClockSyncStatus::Synced,
+                    last_time_sync_at_server_ms: None,
+                    last_time_sync_rtt_ms: None,
+                    server_time_offset_ms: Some(0),
+                    send_queue_depth: None,
+                    command_inbox_depth: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.health, HeartbeatHealth::ClockUnhealthy);
+        assert_eq!(
+            stale.session.clock_sync_status,
+            Some(ClockSyncStatus::Unsynced)
+        );
+
+        clock.set(20_100);
+        let missing_rtt = registry
+            .assess_heartbeat(
+                &SessionId::from("session_1"),
+                &HeartbeatPayload {
+                    effective_server_now: 20_100,
+                    clock_sync_status: ClockSyncStatus::Degraded,
+                    last_time_sync_at_server_ms: Some(20_050),
+                    last_time_sync_rtt_ms: None,
+                    server_time_offset_ms: Some(0),
+                    send_queue_depth: None,
+                    command_inbox_depth: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_rtt.health, HeartbeatHealth::ClockUnhealthy);
+        assert_eq!(
+            missing_rtt.session.clock_sync_status,
+            Some(ClockSyncStatus::Degraded)
+        );
+
+        clock.set(20_200);
+        let high_rtt = registry
+            .assess_heartbeat(
+                &SessionId::from("session_1"),
+                &HeartbeatPayload {
+                    effective_server_now: 20_200,
+                    clock_sync_status: ClockSyncStatus::Synced,
+                    last_time_sync_at_server_ms: Some(20_150),
+                    last_time_sync_rtt_ms: Some(1_001),
+                    server_time_offset_ms: Some(0),
+                    send_queue_depth: None,
+                    command_inbox_depth: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(high_rtt.health, HeartbeatHealth::ClockUnhealthy);
+        let stored = store
+            .get_session(&SessionId::from("session_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.last_time_sync_at, Some(1_050));
+        assert_eq!(stored.clock_sync_status, Some(ClockSyncStatus::Unsynced));
+        assert_eq!(stored.last_heartbeat_at, Some(20_200));
     }
 
     #[tokio::test]

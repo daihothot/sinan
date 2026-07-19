@@ -430,9 +430,23 @@ pub struct SessionHeartbeatUpdate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionClockInvalidation {
+    pub session_id: SessionId,
+    pub expected_revision: u64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionStatusUpdate {
     pub session_id: SessionId,
     pub expected_revision: u64,
+    pub changed_at: i64,
+    pub delivery_error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactSessionClose {
+    pub session_id: SessionId,
     pub changed_at: i64,
     pub delivery_error: String,
 }
@@ -489,6 +503,28 @@ pub enum SequenceReservation {
         inflight: u64,
         limit: u64,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveControlOutboundSequence {
+    pub session_id: SessionId,
+    pub reserved_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlOutboundReservation {
+    pub session_id: SessionId,
+    pub client_id: ClientId,
+    pub account_id: AccountId,
+    pub terminal_id: Option<TerminalId>,
+    pub session_revision: u64,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlSequenceReservation {
+    Reserved(ControlOutboundReservation),
+    SessionUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
