@@ -70,7 +70,7 @@ impl AuthorizedAccountScope {
         self.account_ids.contains(account_id)
     }
 
-    fn iter(&self) -> impl Iterator<Item = &AccountId> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &AccountId> {
         self.account_ids.iter()
     }
 }
@@ -336,22 +336,7 @@ impl SqliteStateStore {
         }
 
         let mut transaction = self.pool.begin().await?;
-        let result = async {
-            let accounts = load_accounts(&mut transaction, scope).await?;
-            let positions = load_positions(&mut transaction, scope).await?;
-            let orders = load_orders(&mut transaction, scope).await?;
-            let symbols = load_symbols(&mut transaction, scope).await?;
-            let markets = load_markets(&mut transaction, scope).await?;
-
-            Ok(LatestStateProjection {
-                accounts,
-                positions,
-                orders,
-                symbols,
-                markets,
-            })
-        }
-        .await;
+        let result = load_latest_state_on(&mut transaction, scope).await;
 
         match result {
             Ok(state) => {
@@ -393,6 +378,19 @@ impl SqliteStateStore {
             }
         }
     }
+}
+
+pub(crate) async fn load_latest_state_on(
+    connection: &mut SqliteConnection,
+    scope: &AuthorizedAccountScope,
+) -> Result<LatestStateProjection, StoreError> {
+    Ok(LatestStateProjection {
+        accounts: load_accounts(connection, scope).await?,
+        positions: load_positions(connection, scope).await?,
+        orders: load_orders(connection, scope).await?,
+        symbols: load_symbols(connection, scope).await?,
+        markets: load_markets(connection, scope).await?,
+    })
 }
 
 fn require_event_account(metadata: &CoreEventMetadata) -> Result<&AccountId, StoreError> {

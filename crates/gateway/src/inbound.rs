@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use serde_json::Value;
 use sinan_protocol::{
-    ExecutionClientMessageType, ExecutionClientPlatform, ResumeCursor, WireMessage,
+    ExecutionClientMessageType, ExecutionClientPlatform, ResumeCursor, SchemaVersion, WireMessage,
 };
 use sinan_types::{AccountId, ClientId, ErrorCode, MessageId, SessionId, TerminalId};
 use thiserror::Error;
@@ -159,7 +159,28 @@ pub struct TransportEvent {
     pub remote_addr: Option<String>,
     pub session_id: Option<SessionId>,
     pub message_id: Option<MessageId>,
+    pub evidence: TransportEventEvidence,
     pub detail: String,
+}
+
+/// Redacted wire evidence that is safe to retain with a transport event.
+///
+/// The typed fields deliberately cannot carry arbitrary credential, HMAC, or
+/// payload text. Raw payload bytes are never retained by this boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransportEventEvidence {
+    pub message_type: Option<ExecutionClientMessageType>,
+    pub schema_version: Option<SchemaVersion>,
+    pub raw_payload_length: Option<u64>,
+}
+
+impl TransportEventEvidence {
+    pub fn with_raw_payload_length(raw_payload_length: usize) -> Self {
+        Self {
+            raw_payload_length: u64::try_from(raw_payload_length).ok(),
+            ..Self::default()
+        }
+    }
 }
 
 pub type TransportEventFuture<'a> =

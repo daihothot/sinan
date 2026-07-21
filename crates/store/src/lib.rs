@@ -3,20 +3,28 @@
 //! SQLite migrations, repositories, and latest-state projections.
 
 mod connection;
+mod control_plane;
 mod error;
+mod event_stream;
 mod gateway_delivery;
+mod inbound_durability;
 mod json;
 mod model;
 mod projection;
 mod reconciliation;
 mod repository;
+mod transport_events;
 
 pub use connection::*;
+pub use control_plane::*;
 pub use error::*;
+pub use event_stream::*;
+pub use inbound_durability::*;
 pub use json::*;
 pub use model::*;
 pub use projection::*;
 pub use reconciliation::*;
+pub use transport_events::*;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,6 +55,16 @@ const EMBEDDED_MIGRATIONS: &[Migration] = &[
         5,
         "gateway_delivery_durability",
         include_str!("../migrations/V0005__gateway_delivery_durability.sql"),
+    ),
+    Migration::new(
+        6,
+        "event_stream_sequence",
+        include_str!("../migrations/V0006__event_stream_sequence.sql"),
+    ),
+    Migration::new(
+        7,
+        "inbound_durability",
+        include_str!("../migrations/V0007__inbound_durability.sql"),
     ),
 ];
 

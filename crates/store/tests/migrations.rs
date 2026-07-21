@@ -9,8 +9,11 @@ const RECONCILIATION_DURABILITY_SQL: &str =
     include_str!("../migrations/V0004__reconciliation_durability.sql");
 const GATEWAY_DELIVERY_DURABILITY_SQL: &str =
     include_str!("../migrations/V0005__gateway_delivery_durability.sql");
+const EVENT_STREAM_SEQUENCE_SQL: &str =
+    include_str!("../migrations/V0006__event_stream_sequence.sql");
+const INBOUND_DURABILITY_SQL: &str = include_str!("../migrations/V0007__inbound_durability.sql");
 
-fn embedded_migrations() -> [Migration; 5] {
+fn embedded_migrations() -> [Migration; 7] {
     [
         Migration::new(1, "init", INIT_SQL),
         Migration::new(2, "state_store_schema", STATE_STORE_SQL),
@@ -25,6 +28,8 @@ fn embedded_migrations() -> [Migration; 5] {
             "gateway_delivery_durability",
             GATEWAY_DELIVERY_DURABILITY_SQL,
         ),
+        Migration::new(6, "event_stream_sequence", EVENT_STREAM_SEQUENCE_SQL),
+        Migration::new(7, "inbound_durability", INBOUND_DURABILITY_SQL),
     ]
 }
 
@@ -53,7 +58,7 @@ async fn first_run_applies_all_embedded_migrations() {
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 7);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "init");
     assert_eq!(rows[0].2, Migration::new(1, "init", INIT_SQL).checksum());
@@ -96,7 +101,21 @@ async fn first_run_applies_all_embedded_migrations() {
         .checksum()
     );
     assert!(rows[4].3 > 0);
-    assert_eq!(user_version, 5);
+    assert_eq!(rows[5].0, 6);
+    assert_eq!(rows[5].1, "event_stream_sequence");
+    assert_eq!(
+        rows[5].2,
+        Migration::new(6, "event_stream_sequence", EVENT_STREAM_SEQUENCE_SQL).checksum()
+    );
+    assert!(rows[5].3 > 0);
+    assert_eq!(rows[6].0, 7);
+    assert_eq!(rows[6].1, "inbound_durability");
+    assert_eq!(
+        rows[6].2,
+        Migration::new(7, "inbound_durability", INBOUND_DURABILITY_SQL).checksum()
+    );
+    assert!(rows[6].3 > 0);
+    assert_eq!(user_version, 7);
 }
 
 #[tokio::test]
@@ -111,7 +130,7 @@ async fn repeated_run_is_idempotent() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(count, 5);
+    assert_eq!(count, 7);
 }
 
 #[tokio::test]
@@ -137,8 +156,8 @@ async fn version_one_database_upgrades_to_latest_schema() {
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
-    assert_eq!(user_version, 5);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(user_version, 7);
 }
 
 #[tokio::test]
@@ -162,7 +181,7 @@ async fn version_two_database_upgrades_to_execution_durability_schema() {
             .fetch_all(&pool)
             .await
             .expect("migration versions should be readable");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
 }
 
 #[tokio::test]
@@ -245,6 +264,87 @@ async fn version_four_upgrade_backfills_outbound_sequence_high_water_marks() {
     .await
     .expect("first post-upgrade reservation should pass the session CAS");
     assert_eq!(next_reservation, (43, 2));
+}
+
+#[tokio::test]
+async fn version_five_upgrade_backfills_event_order_and_preserves_spool_foreign_keys() {
+    let pool = memory_pool().await;
+    Migrator::new(embedded_migrations()[..5].iter().copied())
+        .expect("version five migrations should be valid")
+        .run(&pool)
+        .await
+        .expect("version five should apply");
+    let hash = "0".repeat(64);
+    for event_id in ["event-a", "event-b"] {
+        sqlx::query(
+            "INSERT INTO event_stream_log (\
+                 event_id, topic, event_type, payload_json, payload_hash, created_at\
+             ) VALUES (?, 'system.event', 'test', '{}', ?, 100)",
+        )
+        .bind(event_id)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("version five stream fixture should insert");
+    }
+    sqlx::query(
+        "INSERT INTO outbound_spool (\
+             spool_id, target, event_id, payload_json, payload_hash, status, created_at, updated_at\
+         ) VALUES ('spool-a', 'audit', 'event-a', '{}', ?, 'PENDING', 100, 100)",
+    )
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .expect("version five spool fixture should insert");
+
+    migrate(&pool)
+        .await
+        .expect("event stream sequence migration should apply");
+
+    let ordered: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT stream_sequence, event_id FROM event_stream_log ORDER BY stream_sequence",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("upgraded event order should be readable");
+    assert_eq!(
+        ordered,
+        [(1, "event-a".to_owned()), (2, "event-b".to_owned())]
+    );
+    let spool_event: Option<String> =
+        sqlx::query_scalar("SELECT event_id FROM outbound_spool WHERE spool_id = 'spool-a'")
+            .fetch_one(&pool)
+            .await
+            .expect("upgraded spool should be readable");
+    assert_eq!(spool_event.as_deref(), Some("event-a"));
+
+    sqlx::query(
+        "INSERT INTO event_stream_log (\
+             event_id, topic, event_type, payload_json, payload_hash, created_at\
+         ) VALUES ('event-c', 'system.event', 'test', '{}', ?, 100)",
+    )
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .expect("post-upgrade event should insert");
+    let next_sequence: i64 = sqlx::query_scalar(
+        "SELECT stream_sequence FROM event_stream_log WHERE event_id = 'event-c'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("post-upgrade sequence should be readable");
+    assert_eq!(next_sequence, 3);
+
+    sqlx::query("DELETE FROM event_stream_log WHERE event_id = 'event-a'")
+        .execute(&pool)
+        .await
+        .expect("retention delete should succeed");
+    let cleared_spool_event: Option<String> =
+        sqlx::query_scalar("SELECT event_id FROM outbound_spool WHERE spool_id = 'spool-a'")
+            .fetch_one(&pool)
+            .await
+            .expect("spool foreign-key action should be readable");
+    assert_eq!(cleared_spool_event, None);
 }
 
 #[tokio::test]
@@ -354,7 +454,7 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
         .expect("initial migration should succeed");
     sqlx::query(
         "INSERT INTO schema_migrations (version, name, checksum, applied_at) \
-         VALUES (6, 'unknown', 'unknown', 1)",
+         VALUES (8, 'unknown', 'unknown', 1)",
     )
     .execute(&pool)
     .await
@@ -367,8 +467,8 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
     assert!(matches!(
         error,
         MigrationError::DatabaseAhead {
-            applied: 6,
-            available: 5
+            applied: 8,
+            available: 7
         }
     ));
 }
@@ -391,7 +491,7 @@ async fn lower_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 5,
+            expected: 7,
             actual: 0
         }
     ));
@@ -403,7 +503,7 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     migrate(&pool)
         .await
         .expect("initial migration should succeed");
-    sqlx::query("PRAGMA user_version = 6")
+    sqlx::query("PRAGMA user_version = 8")
         .execute(&pool)
         .await
         .expect("test fixture should raise user_version");
@@ -415,8 +515,8 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 5,
-            actual: 6
+            expected: 7,
+            actual: 8
         }
     ));
 }
@@ -433,8 +533,10 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         embedded_migrations()[2],
         embedded_migrations()[3],
         embedded_migrations()[4],
+        embedded_migrations()[5],
+        embedded_migrations()[6],
         Migration::new(
-            6,
+            8,
             "broken",
             "CREATE TABLE rollback_probe (id INTEGER PRIMARY KEY);\
              INSERT INTO missing_table DEFAULT VALUES;",
@@ -466,8 +568,8 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         .expect("user_version should be readable");
 
     assert!(!probe_exists);
-    assert_eq!(migration_count, 5);
-    assert_eq!(user_version, 5);
+    assert_eq!(migration_count, 7);
+    assert_eq!(user_version, 7);
 }
 
 #[test]

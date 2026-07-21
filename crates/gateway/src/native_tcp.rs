@@ -13,8 +13,21 @@ use tokio::{
 use crate::{
     writer::{QueuedOutboundSink, QueuedSinkDropGuard, QueuedWriter},
     ConnectionError, ExecutionTransport, GatewayConnectionService, InboundProgress,
-    SinkWriteOutcome, TransportEventKind,
+    SinkWriteOutcome, TransportEventEvidence, TransportEventKind,
 };
+
+fn native_error_evidence(error: &NativeTcpError) -> TransportEventEvidence {
+    match error {
+        NativeTcpError::Frame(FrameDecodeError::FrameTooLarge { length, .. })
+        | NativeTcpError::MessageTooLarge { length, .. } => {
+            TransportEventEvidence::with_raw_payload_length(*length)
+        }
+        NativeTcpError::Frame(FrameDecodeError::WireProtocolViolation) => {
+            TransportEventEvidence::with_raw_payload_length(0)
+        }
+        _ => TransportEventEvidence::default(),
+    }
+}
 
 #[derive(Clone)]
 pub struct NativeTcpBinding {
@@ -101,11 +114,12 @@ impl NativeTcpBinding {
                             }
                             _ => TransportEventKind::WireProtocolViolation,
                         };
-                        self.service.record_transport_event(
+                        self.service.record_transport_event_with_evidence(
                             ExecutionTransport::NativeTcp,
                             kind,
                             remote_addr.as_deref(),
                             None,
+                            native_error_evidence(&error),
                             error.to_string(),
                         ).await;
                         sink.close();
@@ -223,11 +237,12 @@ impl NativeTcpBinding {
                                 }
                                 _ => TransportEventKind::WireProtocolViolation,
                             };
-                            self.service.record_transport_event(
+                            self.service.record_transport_event_with_evidence(
                                 ExecutionTransport::NativeTcp,
                                 kind,
                                 remote_addr.as_deref(),
                                 Some(&active.context().session_id),
+                                native_error_evidence(&error),
                                 error.to_string(),
                             ).await;
                             let _ = active.disconnect("NATIVE_TCP_FRAME_FAILURE").await;

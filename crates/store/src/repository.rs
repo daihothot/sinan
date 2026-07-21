@@ -42,7 +42,8 @@ const CORE_EVENT_COLUMNS: &str = "event_id, event_type, aggregate_type, aggregat
     terminal_id, strategy_id, intent_id, plan_id, leg_id, command_id, idempotency_key, \
     event_at, received_at, created_at, source, payload_json, payload_hash";
 
-const RISK_RESULT_COLUMNS: &str = "r.risk_id, r.intent_id, r.account_id, r.approved, r.reason, \
+pub(crate) const RISK_RESULT_COLUMNS: &str =
+    "r.risk_id, r.intent_id, r.account_id, r.approved, r.reason, \
     r.snapshot_age_ms, r.symbol_metadata_age_ms, r.evaluated_at, r.valid_until, r.payload_json, \
     r.payload_hash, i.intent_id AS parent_intent_id, i.decision_id AS intent_decision_id, \
     i.strategy_id AS intent_strategy_id, i.account_id AS intent_account_id, \
@@ -564,7 +565,7 @@ pub(crate) async fn write_circuit_breaker_snapshot_on(
     }
 }
 
-async fn fetch_latest_circuit_breaker_snapshot<'e, E>(
+pub(crate) async fn fetch_latest_circuit_breaker_snapshot<'e, E>(
     executor: E,
 ) -> Result<Option<StoredCircuitBreakerSnapshot>, StoreError>
 where
@@ -1069,7 +1070,7 @@ async fn fetch_execution_plan_by_id(
     }
 }
 
-async fn execution_plan_from_row(
+pub(crate) async fn execution_plan_from_row(
     connection: &mut SqliteConnection,
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<StoredExecutionPlan, StoreError> {
@@ -2688,7 +2689,9 @@ async fn fetch_trade_intent_conflicts(
     rows.into_iter().map(trade_intent_from_row).collect()
 }
 
-fn trade_intent_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredTradeIntent, StoreError> {
+pub(crate) fn trade_intent_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StoredTradeIntent, StoreError> {
     let key: String = row.try_get("intent_id")?;
     let payload = CanonicalJson::from_stored(
         "trade_intent",
@@ -3089,7 +3092,9 @@ where
     row.map(risk_result_from_row).transpose()
 }
 
-fn risk_result_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredRiskResult, StoreError> {
+pub(crate) fn risk_result_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StoredRiskResult, StoreError> {
     let key: String = row.try_get("risk_id")?;
     let payload = CanonicalJson::from_stored(
         "risk_result",
@@ -3399,7 +3404,7 @@ async fn fetch_execution_command_conflicts(
     rows.into_iter().map(execution_command_from_row).collect()
 }
 
-fn execution_command_from_row(
+pub(crate) fn execution_command_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<StoredExecutionCommand, StoreError> {
     let key: String = row.try_get("command_id")?;
@@ -3671,7 +3676,7 @@ where
     row.map(execution_command_state_from_row).transpose()
 }
 
-fn execution_command_state_from_row(
+pub(crate) fn execution_command_state_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<ExecutionCommandState, StoreError> {
     let key: String = row.try_get("command_id")?;
@@ -3779,7 +3784,7 @@ where
     row.map(execution_event_from_row).transpose()
 }
 
-fn execution_event_from_row(
+pub(crate) fn execution_event_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<StoredExecutionEvent, StoreError> {
     let key: String = row.try_get("execution_id")?;

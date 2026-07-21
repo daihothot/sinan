@@ -11,6 +11,7 @@ use tokio::{
 use tokio_tungstenite::{
     accept_hdr_async_with_config,
     tungstenite::{
+        error::CapacityError,
         handshake::server::{ErrorResponse, Request, Response},
         http::StatusCode,
         protocol::WebSocketConfig,
@@ -21,10 +22,22 @@ use tokio_tungstenite::{
 use crate::{
     writer::{QueuedOutboundSink, QueuedSinkDropGuard, QueuedWriter},
     ConnectionError, ExecutionTransport, GatewayConnectionService, InboundProgress,
-    SinkWriteOutcome, TransportEventKind,
+    SinkWriteOutcome, TransportEventEvidence, TransportEventKind,
 };
 
 pub const EXECUTION_WEBSOCKET_PATH: &str = "/execution-client";
+
+fn websocket_error_evidence(error: &ExecutionWebSocketError) -> TransportEventEvidence {
+    match error {
+        ExecutionWebSocketError::Tungstenite(TungsteniteError::Capacity(
+            CapacityError::MessageTooLong { size, .. },
+        ))
+        | ExecutionWebSocketError::BinaryMessage { length: size } => {
+            TransportEventEvidence::with_raw_payload_length(*size)
+        }
+        _ => TransportEventEvidence::default(),
+    }
+}
 
 #[derive(Clone)]
 pub struct ExecutionWebSocketBinding {
@@ -129,11 +142,12 @@ impl ExecutionWebSocketBinding {
                             ) => TransportEventKind::WireFrameTooLarge,
                             _ => TransportEventKind::WireProtocolViolation,
                         };
-                        self.service.record_transport_event(
+                        self.service.record_transport_event_with_evidence(
                             ExecutionTransport::ExecutionWebSocket,
                             kind,
                             remote_addr.as_deref(),
                             None,
+                            websocket_error_evidence(&error),
                             error.to_string(),
                         ).await;
                         sink.close();
@@ -251,11 +265,12 @@ impl ExecutionWebSocketBinding {
                                 ) => TransportEventKind::WireFrameTooLarge,
                                 _ => TransportEventKind::WireProtocolViolation,
                             };
-                            self.service.record_transport_event(
+                            self.service.record_transport_event_with_evidence(
                                 ExecutionTransport::ExecutionWebSocket,
                                 kind,
                                 remote_addr.as_deref(),
                                 Some(&active.context().session_id),
+                                websocket_error_evidence(&error),
                                 error.to_string(),
                             ).await;
                             let _ = active.disconnect("EXECUTION_WEBSOCKET_MESSAGE_FAILURE").await;
@@ -379,7 +394,11 @@ where
     loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => return Ok(Some(text.as_bytes().to_vec())),
-            Some(Ok(Message::Binary(_))) => return Err(ExecutionWebSocketError::BinaryMessage),
+            Some(Ok(Message::Binary(payload))) => {
+                return Err(ExecutionWebSocketError::BinaryMessage {
+                    length: payload.len(),
+                });
+            }
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
             Some(Ok(Message::Close(_))) | None => return Ok(None),
             Some(Ok(Message::Frame(_))) => return Err(ExecutionWebSocketError::RawFrameMessage),
@@ -461,8 +480,8 @@ pub enum ExecutionWebSocketError {
     #[error(transparent)]
     Tungstenite(#[from] TungsteniteError),
 
-    #[error("Execution WebSocket endpoint received a binary data message")]
-    BinaryMessage,
+    #[error("Execution WebSocket endpoint received a binary data message ({length} bytes)")]
+    BinaryMessage { length: usize },
 
     #[error("Execution WebSocket surfaced an unexpected raw frame message")]
     RawFrameMessage,

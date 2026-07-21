@@ -220,6 +220,13 @@ impl RecordingEventPort {
             .map(|event| event.kind)
             .collect()
     }
+
+    fn recorded(&self) -> Vec<TransportEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 impl TransportEventPort for RecordingEventPort {
@@ -636,6 +643,138 @@ async fn invalid_length_prefixes_close_without_waiting_for_payload_or_sending_an
     let event_kinds = server.events.kinds();
     assert!(event_kinds.contains(&TransportEventKind::WireProtocolViolation));
     assert!(event_kinds.contains(&TransportEventKind::WireFrameTooLarge));
+    let events = server.events.recorded();
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event.kind == TransportEventKind::WireProtocolViolation)
+            .expect("zero-length frame should emit a protocol violation")
+            .evidence
+            .raw_payload_length,
+        Some(0)
+    );
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event.kind == TransportEventKind::WireFrameTooLarge)
+            .expect("oversized frame should emit a size violation")
+            .evidence
+            .raw_payload_length,
+        Some((MAX_FRAME_BYTES + 1) as u64)
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_session_hello_is_a_redacted_schema_deadletter_event() {
+    let server = TestServer::start().await;
+    let mut stream = server.connect().await;
+    let malformed_hello = br#"{
+        "message_id":"malformed_hello",
+        "type":"session.hello",
+        "schema_version":"ecp.v1.0",
+        "payload":{"token":"must-not-be-retained","hmac":"must-not-be-retained"}
+    }"#;
+    let framed = NativeTcpFrameEncoder::new(MAX_FRAME_BYTES)
+        .encode(malformed_hello)
+        .expect("malformed hello should fit the configured frame limit");
+    stream
+        .write_all(&framed)
+        .await
+        .expect("malformed hello write should succeed");
+    expect_closed_without_frame(&mut stream).await;
+
+    let events = server.events.recorded();
+    let event = events
+        .iter()
+        .find(|event| event.kind == TransportEventKind::SchemaRejected)
+        .expect("malformed hello should emit a schema rejection");
+    assert_eq!(
+        event.evidence.message_type,
+        Some(ExecutionClientMessageType::SessionHello)
+    );
+    assert_eq!(
+        event.evidence.schema_version,
+        Some(SUPPORTED_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        event.evidence.raw_payload_length,
+        Some(malformed_hello.len() as u64)
+    );
+    assert!(!event.detail.contains("must-not-be-retained"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != TransportEventKind::HandshakeRejected),
+        "decode failures must not be downgraded to handshake rejection system events"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_non_hello_first_message_remains_a_handshake_rejection() {
+    let server = TestServer::start().await;
+    let mut stream = server.connect().await;
+    let mut wrong_direction = hello("wrong_first_type", CLIENT_SECRET);
+    wrong_direction.message_type = ExecutionClientMessageType::MarketTick;
+    wrong_direction.session_id = Some(SessionId::from("unbound-session"));
+    wrong_direction.sent_at = Some(1_800_000_000_000);
+    stream
+        .write_all(&frame(&wrong_direction))
+        .await
+        .expect("wrong first message write should succeed");
+    expect_closed_without_frame(&mut stream).await;
+
+    let event_kinds = server.events.kinds();
+    assert!(event_kinds.contains(&TransportEventKind::HandshakeRejected));
+    assert!(!event_kinds.contains(&TransportEventKind::SchemaRejected));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schema_rejection_records_only_typed_redacted_wire_evidence() {
+    let server = TestServer::start().await;
+    let mut stream = server.connect().await;
+    let accepted = authenticate(&mut stream, "hello_schema_evidence").await;
+    let mut message = client_message("bad_schema", &accepted.payload.session_id, 1);
+    message.schema_version = "ecp.v2.0".to_owned();
+    message.payload["credential"] = json!("must-not-be-retained");
+    let wire_bytes = serde_json::to_vec(&message).expect("test message should encode");
+    let framed = NativeTcpFrameEncoder::new(MAX_FRAME_BYTES)
+        .encode(&wire_bytes)
+        .expect("test message should fit the configured frame limit");
+    stream
+        .write_all(&framed)
+        .await
+        .expect("invalid-schema message write should succeed");
+    expect_closed_without_frame(&mut stream).await;
+
+    assert!(server.inbound.admitted().is_empty());
+    let event = server
+        .events
+        .recorded()
+        .into_iter()
+        .find(|event| event.kind == TransportEventKind::SchemaRejected)
+        .expect("invalid schema should emit a schema rejection");
+    assert_eq!(
+        event.evidence.message_type,
+        Some(ExecutionClientMessageType::MarketTick)
+    );
+    assert_eq!(
+        event
+            .evidence
+            .schema_version
+            .map(|version| version.to_string()),
+        Some("ecp.v2.0".to_owned())
+    );
+    assert_eq!(
+        event.evidence.raw_payload_length,
+        Some(wire_bytes.len() as u64)
+    );
+    assert!(!event.detail.contains("must-not-be-retained"));
 
     server.shutdown().await;
 }

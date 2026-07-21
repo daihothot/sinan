@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sinan_protocol::{
     decode_wire_message, ExecutionClientMessageType, HeartbeatPayload, HelloAcceptedPayload,
-    HelloPayload, ProtocolReason, SessionRejected, TimeSyncRequest, TimeSyncResponse, TransportAck,
-    TransportAckStatus, WireMessage, SUPPORTED_SCHEMA_VERSION,
+    HelloPayload, ProtocolReason, SchemaVersion, SessionRejected, TimeSyncRequest,
+    TimeSyncResponse, TransportAck, TransportAckStatus, WireMessage, SUPPORTED_SCHEMA_VERSION,
 };
 use sinan_store::{ControlSequenceReservation, StoreError};
 use sinan_types::{ClockSyncStatus, ErrorCode, MessageId, SessionId};
@@ -21,8 +21,41 @@ use crate::{
     InboundAdmission, InboundAdmissionError, InboundMessage, InboundMessagePort,
     SessionRegistration, SessionRegistryError, SessionResumeError, SessionResumePort,
     SessionResumeRequest, SinkWriteOutcome, TransportConfigError, TransportEvent,
-    TransportEventKind, TransportEventPort,
+    TransportEventEvidence, TransportEventKind, TransportEventPort,
 };
+
+#[derive(Deserialize)]
+struct RedactedMessageTypeProbe {
+    #[serde(rename = "type")]
+    message_type: ExecutionClientMessageType,
+}
+
+#[derive(Deserialize)]
+struct RedactedSchemaVersionProbe {
+    schema_version: SchemaVersion,
+}
+
+fn redacted_wire_evidence(wire_bytes: &[u8]) -> TransportEventEvidence {
+    let mut evidence = TransportEventEvidence::with_raw_payload_length(wire_bytes.len());
+    if let Ok(probe) = serde_json::from_slice::<RedactedMessageTypeProbe>(wire_bytes) {
+        evidence.message_type = Some(probe.message_type);
+    }
+    if let Ok(probe) = serde_json::from_slice::<RedactedSchemaVersionProbe>(wire_bytes) {
+        evidence.schema_version = Some(probe.schema_version);
+    }
+    evidence
+}
+
+fn decoded_wire_evidence<T>(
+    envelope: &WireMessage<T>,
+    raw_payload_length: usize,
+) -> TransportEventEvidence {
+    TransportEventEvidence {
+        message_type: Some(envelope.message_type),
+        schema_version: envelope.schema().ok(),
+        raw_payload_length: u64::try_from(raw_payload_length).ok(),
+    }
+}
 
 #[derive(Clone)]
 pub struct GatewayConnectionService {
@@ -101,14 +134,35 @@ impl GatewayConnectionService {
         session_id: Option<&SessionId>,
         detail: impl Into<String>,
     ) {
+        self.record_transport_event_with_evidence(
+            transport,
+            kind,
+            remote_addr,
+            session_id,
+            TransportEventEvidence::default(),
+            detail,
+        )
+        .await;
+    }
+
+    pub(crate) async fn record_transport_event_with_evidence(
+        &self,
+        transport: ExecutionTransport,
+        kind: TransportEventKind,
+        remote_addr: Option<&str>,
+        session_id: Option<&SessionId>,
+        evidence: TransportEventEvidence,
+        detail: impl Into<String>,
+    ) {
         let occurred_at = self.inner.sessions.server_now().unwrap_or_default();
-        self.record_event(
+        self.record_event_with_evidence(
             transport,
             kind,
             occurred_at,
             remote_addr,
             session_id,
             None,
+            evidence,
             detail,
         )
         .await;
@@ -144,26 +198,28 @@ impl GatewayConnectionService {
     ) -> Result<ActiveConnection, ConnectionError> {
         let now = self.inner.sessions.server_now()?;
         if hello_bytes.is_empty() || hello_bytes.len() > self.inner.config.max_message_bytes {
-            self.record_event(
+            self.record_event_with_evidence(
                 transport,
                 TransportEventKind::WireFrameTooLarge,
                 now,
                 remote_addr,
                 None,
                 None,
+                TransportEventEvidence::with_raw_payload_length(hello_bytes.len()),
                 "initial Execution Client message violates the configured size bound",
             )
             .await;
             return Err(ConnectionError::InvalidHandshake("invalid hello size"));
         }
         if std::str::from_utf8(&hello_bytes).is_err() {
-            self.record_event(
+            self.record_event_with_evidence(
                 transport,
                 TransportEventKind::DecodeFailed,
                 now,
                 remote_addr,
                 None,
                 None,
+                TransportEventEvidence::with_raw_payload_length(hello_bytes.len()),
                 "session.hello is not UTF-8",
             )
             .await;
@@ -174,7 +230,7 @@ impl GatewayConnectionService {
                 Ok(hello) if hello.message_type == ExecutionClientMessageType::SessionHello => {
                     hello
                 }
-                _ => {
+                Ok(_) => {
                     self.record_event(
                         transport,
                         TransportEventKind::HandshakeRejected,
@@ -182,7 +238,21 @@ impl GatewayConnectionService {
                         remote_addr,
                         None,
                         None,
-                        "first data message is not a valid session.hello envelope",
+                        "first data message is not session.hello",
+                    )
+                    .await;
+                    return Err(ConnectionError::InvalidHandshake("invalid session.hello"));
+                }
+                Err(_) => {
+                    self.record_event_with_evidence(
+                        transport,
+                        TransportEventKind::SchemaRejected,
+                        now,
+                        remote_addr,
+                        None,
+                        None,
+                        redacted_wire_evidence(&hello_bytes),
+                        "first data message failed JSON, type, schema, or session.hello validation",
                     )
                     .await;
                     return Err(ConnectionError::InvalidHandshake("invalid session.hello"));
@@ -472,6 +542,31 @@ impl GatewayConnectionService {
         message_id: Option<&MessageId>,
         detail: impl Into<String>,
     ) {
+        self.record_event_with_evidence(
+            transport,
+            kind,
+            occurred_at,
+            remote_addr,
+            session_id,
+            message_id,
+            TransportEventEvidence::default(),
+            detail,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_event_with_evidence(
+        &self,
+        transport: ExecutionTransport,
+        kind: TransportEventKind,
+        occurred_at: i64,
+        remote_addr: Option<&str>,
+        session_id: Option<&SessionId>,
+        message_id: Option<&MessageId>,
+        evidence: TransportEventEvidence,
+        detail: impl Into<String>,
+    ) {
         let event = TransportEvent {
             transport,
             kind,
@@ -479,13 +574,19 @@ impl GatewayConnectionService {
             remote_addr: remote_addr.map(str::to_owned),
             session_id: session_id.cloned(),
             message_id: message_id.cloned(),
+            evidence,
             detail: detail.into(),
         };
-        let _ = tokio::time::timeout(
+        match tokio::time::timeout(
             self.inner.config.event_write_timeout,
             self.inner.events.record(event),
         )
-        .await;
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("Gateway transport event persistence failed: {error}"),
+            Err(_) => eprintln!("Gateway transport event persistence timed out"),
+        }
     }
 }
 
@@ -566,20 +667,22 @@ impl ActiveConnection {
     ) -> Result<InboundProgress, ConnectionError> {
         let received_at = self.service.inner.sessions.server_now()?;
         if wire_bytes.is_empty() || wire_bytes.len() > self.service.inner.config.max_message_bytes {
-            self.event(
+            self.event_with_evidence(
                 TransportEventKind::WireFrameTooLarge,
                 received_at,
                 None,
+                TransportEventEvidence::with_raw_payload_length(wire_bytes.len()),
                 "inbound message violates the configured size bound",
             )
             .await;
             return Err(ConnectionError::FatalProtocol("invalid message size"));
         }
         if std::str::from_utf8(&wire_bytes).is_err() {
-            self.event(
+            self.event_with_evidence(
                 TransportEventKind::DecodeFailed,
                 received_at,
                 None,
+                TransportEventEvidence::with_raw_payload_length(wire_bytes.len()),
                 "inbound message is not UTF-8",
             )
             .await;
@@ -588,10 +691,11 @@ impl ActiveConnection {
         let envelope = match decode_wire_message::<Value>(&wire_bytes, SUPPORTED_SCHEMA_VERSION) {
             Ok(envelope) => envelope,
             Err(_) => {
-                self.event(
+                self.event_with_evidence(
                     TransportEventKind::SchemaRejected,
                     received_at,
                     None,
+                    redacted_wire_evidence(&wire_bytes),
                     "inbound message failed JSON, type, schema, or envelope validation",
                 )
                 .await;
@@ -649,10 +753,32 @@ impl ActiveConnection {
 
         match envelope.message_type {
             ExecutionClientMessageType::TimeSyncRequest => {
-                let request =
-                    decode_wire_message::<TimeSyncRequest>(&wire_bytes, SUPPORTED_SCHEMA_VERSION)
-                        .map_err(|_| ConnectionError::FatalProtocol("invalid time.sync.request"))?;
+                let request = match decode_wire_message::<TimeSyncRequest>(
+                    &wire_bytes,
+                    SUPPORTED_SCHEMA_VERSION,
+                ) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        self.event_with_evidence(
+                            TransportEventKind::SchemaRejected,
+                            received_at,
+                            Some(&envelope.message_id),
+                            decoded_wire_evidence(&envelope, wire_bytes.len()),
+                            "time.sync.request payload failed validation",
+                        )
+                        .await;
+                        return Err(ConnectionError::FatalProtocol("invalid time.sync.request"));
+                    }
+                };
                 if request.payload.request_id.as_str().trim().is_empty() {
+                    self.event_with_evidence(
+                        TransportEventKind::SchemaRejected,
+                        received_at,
+                        Some(&envelope.message_id),
+                        decoded_wire_evidence(&envelope, wire_bytes.len()),
+                        "time.sync.request has an empty request_id",
+                    )
+                    .await;
                     return Err(ConnectionError::FatalProtocol(
                         "time.sync.request has an empty request_id",
                     ));
@@ -671,9 +797,23 @@ impl ActiveConnection {
                 Ok(InboundProgress::Continue)
             }
             ExecutionClientMessageType::Heartbeat => {
-                let heartbeat =
-                    decode_wire_message::<HeartbeatPayload>(&wire_bytes, SUPPORTED_SCHEMA_VERSION)
-                        .map_err(|_| ConnectionError::FatalProtocol("invalid heartbeat payload"))?;
+                let heartbeat = match decode_wire_message::<HeartbeatPayload>(
+                    &wire_bytes,
+                    SUPPORTED_SCHEMA_VERSION,
+                ) {
+                    Ok(heartbeat) => heartbeat,
+                    Err(_) => {
+                        self.event_with_evidence(
+                            TransportEventKind::SchemaRejected,
+                            received_at,
+                            Some(&envelope.message_id),
+                            decoded_wire_evidence(&envelope, wire_bytes.len()),
+                            "heartbeat payload failed validation",
+                        )
+                        .await;
+                        return Err(ConnectionError::FatalProtocol("invalid heartbeat payload"));
+                    }
+                };
                 let assessment = match self
                     .service
                     .inner
@@ -936,14 +1076,33 @@ impl ActiveConnection {
         message_id: Option<&MessageId>,
         detail: &'static str,
     ) {
+        self.event_with_evidence(
+            kind,
+            occurred_at,
+            message_id,
+            TransportEventEvidence::default(),
+            detail,
+        )
+        .await;
+    }
+
+    async fn event_with_evidence(
+        &self,
+        kind: TransportEventKind,
+        occurred_at: i64,
+        message_id: Option<&MessageId>,
+        evidence: TransportEventEvidence,
+        detail: &'static str,
+    ) {
         self.service
-            .record_event(
+            .record_event_with_evidence(
                 self.context.transport,
                 kind,
                 occurred_at,
                 self.context.remote_addr.as_deref(),
                 Some(&self.context.session_id),
                 message_id,
+                evidence,
                 detail,
             )
             .await;
@@ -1002,4 +1161,37 @@ pub enum ConnectionError {
 
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacted_wire_evidence_only_accepts_typed_header_fields() {
+        let invalid_schema = br#"{
+            "type":"market.tick",
+            "schema_version":"client-auth-secret",
+            "payload":{"token":"must-not-be-retained","hmac":"must-not-be-retained"}
+        }"#;
+        let evidence = redacted_wire_evidence(invalid_schema);
+        assert_eq!(
+            evidence.message_type,
+            Some(ExecutionClientMessageType::MarketTick)
+        );
+        assert_eq!(evidence.schema_version, None);
+        assert_eq!(
+            evidence.raw_payload_length,
+            Some(invalid_schema.len() as u64)
+        );
+
+        let invalid_message_type = br#"{
+            "type":"client-auth-secret",
+            "schema_version":"ecp.v1.0",
+            "payload":{"hmac":"must-not-be-retained"}
+        }"#;
+        let evidence = redacted_wire_evidence(invalid_message_type);
+        assert_eq!(evidence.message_type, None);
+        assert_eq!(evidence.schema_version, Some(SUPPORTED_SCHEMA_VERSION));
+    }
 }

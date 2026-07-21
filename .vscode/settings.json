@@ -1,6 +1,7 @@
 {
     "cSpell.words": [
         "acked",
+        "Addrs",
         "ahash",
         "arrayvec",
         "atoi",
@@ -42,6 +43,7 @@
         "syscall",
         "thiserror",
         "tinystr",
+        "Tungstenite",
         "typenum",
         "wasi",
         "zerocopy",

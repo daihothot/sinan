@@ -81,7 +81,7 @@ async fn insert_plan_leg_and_command(pool: &SqlitePool) {
 }
 
 #[tokio::test]
-async fn migration_creates_all_state_store_tables_at_version_five() {
+async fn migration_creates_all_state_store_tables_at_version_seven() {
     let pool = migrated_pool().await;
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_schema \
@@ -100,7 +100,7 @@ async fn migration_creates_all_state_store_tables_at_version_five() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(tables.len(), 27);
+    assert_eq!(tables.len(), 30);
     assert_eq!(
         tables,
         [
@@ -117,6 +117,8 @@ async fn migration_creates_all_state_store_tables_at_version_five() {
             "execution_events",
             "execution_legs",
             "execution_plans",
+            "inbound_admissions",
+            "inbound_rejections",
             "market_bars",
             "market_snapshots",
             "order_snapshots_latest",
@@ -126,6 +128,7 @@ async fn migration_creates_all_state_store_tables_at_version_five() {
             "reconciliation_position_set_members",
             "reconciliation_runs",
             "risk_results",
+            "session_resume_admissions",
             "symbol_metadata_latest",
             "system_events",
             "trade_intents",
@@ -133,8 +136,8 @@ async fn migration_creates_all_state_store_tables_at_version_five() {
             "wire_outbox",
         ]
     );
-    assert_eq!(migration_count, 5);
-    assert_eq!(user_version, 5);
+    assert_eq!(migration_count, 7);
+    assert_eq!(user_version, 7);
 }
 
 #[tokio::test]
@@ -216,6 +219,9 @@ async fn schema_contains_required_query_indexes() {
         "idx_core_events_message_id",
         "idx_core_events_type_time",
         "idx_event_stream_topic_time",
+        "idx_event_stream_topic_sequence",
+        "idx_event_stream_account_sequence",
+        "idx_event_stream_created_sequence",
         "idx_execution_commands_idempotency",
         "idx_execution_events_command_time",
         "idx_outbound_spool_due",
