@@ -121,6 +121,9 @@ pub fn transition_command(
             "evidence predates command creation",
         ));
     }
+    if let Some(received) = receipt_evidence(evidence) {
+        return apply_receipt_evidence(command, state, received, target);
+    }
     if evidence_at < latest_lifecycle_evidence_at(state) {
         return Err(CommandTransitionError::InvalidTimestamp(
             "advancing evidence predates existing lifecycle evidence",
@@ -185,6 +188,80 @@ pub fn transition_command(
     }
     validate_command_state(command, &next)?;
     Ok(CommandTransitionOutcome::Applied(next))
+}
+
+fn receipt_evidence(evidence: CommandEvidence<'_>) -> Option<&CommandReceived> {
+    match evidence {
+        CommandEvidence::ReceivedRecorded(received)
+        | CommandEvidence::ReceivedDuplicateKnownSamePayload(received) => Some(received),
+        _ => None,
+    }
+}
+
+fn apply_receipt_evidence(
+    command: &ExecutionCommand,
+    state: &ExecutionCommandState,
+    received: &CommandReceived,
+    target: ExecutionCommandStatus,
+) -> Result<CommandTransitionOutcome, CommandTransitionError> {
+    if state
+        .dispatched_at
+        .is_some_and(|dispatched_at| received.received_at < dispatched_at)
+    {
+        return Err(CommandTransitionError::InvalidTimestamp(
+            "command receipt predates dispatch",
+        ));
+    }
+    if let Some(recorded_at) = state.command_received_at {
+        if recorded_at != received.received_at {
+            return Err(CommandTransitionError::InvalidEvidence(
+                "command receipt timestamp differs from the recorded receipt",
+            ));
+        }
+        return Ok(CommandTransitionOutcome::Duplicate(state.clone()));
+    }
+
+    if transition_is_allowed(state.status, target) {
+        let mut next = state.clone();
+        next.status = target;
+        next.command_received_at = Some(received.received_at);
+        next.updated_at = state
+            .updated_at
+            .checked_add(1)
+            .ok_or(CommandTransitionError::VersionOverflow)?
+            .max(received.received_at);
+        validate_command_state(command, &next)?;
+        return Ok(CommandTransitionOutcome::Applied(next));
+    }
+
+    // An execution event may overtake command.received. Preserve the stronger
+    // lifecycle while recording the late, independently valid receipt.
+    if matches!(
+        state.status,
+        ExecutionCommandStatus::Reconciling
+            | ExecutionCommandStatus::ManualReconciliationRequired
+            | ExecutionCommandStatus::Accepted
+            | ExecutionCommandStatus::Rejected
+            | ExecutionCommandStatus::OrderSent
+            | ExecutionCommandStatus::PartiallyFilled
+            | ExecutionCommandStatus::Filled
+            | ExecutionCommandStatus::Failed
+    ) {
+        let mut next = state.clone();
+        next.command_received_at = Some(received.received_at);
+        next.updated_at = state
+            .updated_at
+            .checked_add(1)
+            .ok_or(CommandTransitionError::VersionOverflow)?
+            .max(received.received_at);
+        validate_command_state(command, &next)?;
+        return Ok(CommandTransitionOutcome::Applied(next));
+    }
+
+    Err(CommandTransitionError::InvalidTransition {
+        from: state.status,
+        to: target,
+    })
 }
 
 pub fn validate_command_state(

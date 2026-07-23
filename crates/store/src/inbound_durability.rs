@@ -7,12 +7,12 @@ use sinan_types::{
 };
 use sqlx::{Row, SqliteConnection};
 
-use crate::{CanonicalJson, SqliteStateStore, StoreError};
+use crate::{CanonicalJson, SqliteStateStore, StoreError, WriteTransaction};
 
 const INBOUND_COLUMNS: &str = "message_id, session_id, client_id, account_id, terminal_id, \
     message_type, schema_version, sequence, correlation_id, causation_id, envelope_json, \
-    envelope_hash, received_at, status, lease_owner, lease_expires_at, revision, finished_at, \
-    last_error, created_at, updated_at";
+    envelope_hash, raw_payload_length, received_at, status, lease_owner, lease_expires_at, \
+    revision, finished_at, last_error, created_at, updated_at";
 const REJECTION_COLUMNS: &str = "rejection_id, message_id, session_id, client_id, account_id, \
     terminal_id, message_type, schema_version, sequence, correlation_id, causation_id, \
     envelope_json, envelope_hash, reason, received_at, created_at";
@@ -52,6 +52,7 @@ pub struct NewInboundAdmission {
     pub correlation_id: Option<CorrelationId>,
     pub causation_id: Option<CausationId>,
     pub envelope: CanonicalJson,
+    pub raw_payload_length: Option<u64>,
     pub received_at: i64,
     pub created_at: i64,
 }
@@ -69,6 +70,7 @@ pub struct StoredInboundAdmission {
     pub correlation_id: Option<CorrelationId>,
     pub causation_id: Option<CausationId>,
     pub envelope: CanonicalJson,
+    pub raw_payload_length: Option<u64>,
     pub received_at: i64,
     pub status: DurableWorkStatus,
     pub lease_owner: Option<String>,
@@ -300,16 +302,7 @@ impl SqliteStateStore {
         completion: CompleteInboundAdmission,
     ) -> Result<StoredInboundAdmission, StoreError> {
         let mut transaction = self.begin_write().await?;
-        finish_inbound_on(
-            transaction.connection(),
-            &completion.message_id,
-            completion.expected_revision,
-            &completion.worker_id,
-            completion.completed_at,
-            None,
-        )
-        .await?;
-        let stored = required_inbound(transaction.connection(), &completion.message_id).await?;
+        let stored = transaction.complete_inbound(completion).await?;
         transaction.commit().await?;
         Ok(stored)
     }
@@ -318,18 +311,8 @@ impl SqliteStateStore {
         &self,
         failure: FailInboundAdmission,
     ) -> Result<StoredInboundAdmission, StoreError> {
-        require_non_empty("inbound failure error", &failure.error)?;
         let mut transaction = self.begin_write().await?;
-        finish_inbound_on(
-            transaction.connection(),
-            &failure.message_id,
-            failure.expected_revision,
-            &failure.worker_id,
-            failure.failed_at,
-            Some(&failure.error),
-        )
-        .await?;
-        let stored = required_inbound(transaction.connection(), &failure.message_id).await?;
+        let stored = transaction.fail_inbound(failure).await?;
         transaction.commit().await?;
         Ok(stored)
     }
@@ -428,18 +411,7 @@ impl SqliteStateStore {
         completion: CompleteSessionResumeAdmission,
     ) -> Result<StoredSessionResumeAdmission, StoreError> {
         let mut transaction = self.begin_write().await?;
-        finish_resume_on(
-            transaction.connection(),
-            &completion.hello_message_id,
-            completion.expected_revision,
-            &completion.worker_id,
-            completion.completed_at,
-            completion.reconciliation_request_id.as_ref(),
-            None,
-        )
-        .await?;
-        let stored =
-            required_resume(transaction.connection(), &completion.hello_message_id).await?;
+        let stored = transaction.complete_session_resume(completion).await?;
         transaction.commit().await?;
         Ok(stored)
     }
@@ -448,10 +420,71 @@ impl SqliteStateStore {
         &self,
         failure: FailSessionResumeAdmission,
     ) -> Result<StoredSessionResumeAdmission, StoreError> {
-        require_non_empty("session resume failure error", &failure.error)?;
         let mut transaction = self.begin_write().await?;
+        let stored = transaction.fail_session_resume(failure).await?;
+        transaction.commit().await?;
+        Ok(stored)
+    }
+}
+
+impl WriteTransaction {
+    pub async fn complete_inbound(
+        &mut self,
+        completion: CompleteInboundAdmission,
+    ) -> Result<StoredInboundAdmission, StoreError> {
+        finish_inbound_on(
+            self.connection(),
+            &completion.message_id,
+            completion.expected_revision,
+            &completion.worker_id,
+            completion.completed_at,
+            None,
+        )
+        .await?;
+        required_inbound(self.connection(), &completion.message_id).await
+    }
+
+    pub async fn fail_inbound(
+        &mut self,
+        failure: FailInboundAdmission,
+    ) -> Result<StoredInboundAdmission, StoreError> {
+        require_non_empty("inbound failure error", &failure.error)?;
+        finish_inbound_on(
+            self.connection(),
+            &failure.message_id,
+            failure.expected_revision,
+            &failure.worker_id,
+            failure.failed_at,
+            Some(&failure.error),
+        )
+        .await?;
+        required_inbound(self.connection(), &failure.message_id).await
+    }
+
+    pub async fn complete_session_resume(
+        &mut self,
+        completion: CompleteSessionResumeAdmission,
+    ) -> Result<StoredSessionResumeAdmission, StoreError> {
         finish_resume_on(
-            transaction.connection(),
+            self.connection(),
+            &completion.hello_message_id,
+            completion.expected_revision,
+            &completion.worker_id,
+            completion.completed_at,
+            completion.reconciliation_request_id.as_ref(),
+            None,
+        )
+        .await?;
+        required_resume(self.connection(), &completion.hello_message_id).await
+    }
+
+    pub async fn fail_session_resume(
+        &mut self,
+        failure: FailSessionResumeAdmission,
+    ) -> Result<StoredSessionResumeAdmission, StoreError> {
+        require_non_empty("session resume failure error", &failure.error)?;
+        finish_resume_on(
+            self.connection(),
             &failure.hello_message_id,
             failure.expected_revision,
             &failure.worker_id,
@@ -460,9 +493,7 @@ impl SqliteStateStore {
             Some(&failure.error),
         )
         .await?;
-        let stored = required_resume(transaction.connection(), &failure.hello_message_id).await?;
-        transaction.commit().await?;
-        Ok(stored)
+        required_resume(self.connection(), &failure.hello_message_id).await
     }
 }
 
@@ -477,6 +508,9 @@ fn validate_new_inbound(admission: &NewInboundAdmission) -> Result<(), StoreErro
         return Err(StoreError::InvalidSequence {
             field: "inbound_admissions.sequence",
         });
+    }
+    if let Some(raw_payload_length) = admission.raw_payload_length {
+        u64_to_i64("inbound_admissions.raw_payload_length", raw_payload_length)?;
     }
     validate_time("inbound admission", admission.received_at)?;
     validate_time("inbound admission", admission.created_at)?;
@@ -576,8 +610,8 @@ async fn insert_inbound(
         "INSERT INTO inbound_admissions (\
             message_id, session_id, client_id, account_id, terminal_id, message_type, \
             schema_version, sequence, correlation_id, causation_id, envelope_json, envelope_hash, \
-            received_at, status, created_at, updated_at\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)",
+            raw_payload_length, received_at, status, created_at, updated_at\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)",
     )
     .bind(admission.message_id.as_str())
     .bind(admission.session_id.as_str())
@@ -594,6 +628,12 @@ async fn insert_inbound(
     .bind(admission.causation_id.as_ref().map(CausationId::as_str))
     .bind(admission.envelope.as_str())
     .bind(admission.envelope.sha256_hex())
+    .bind(
+        admission
+            .raw_payload_length
+            .map(|value| u64_to_i64("inbound_admissions.raw_payload_length", value))
+            .transpose()?,
+    )
     .bind(admission.received_at)
     .bind(admission.created_at)
     .bind(admission.created_at)
@@ -1108,6 +1148,10 @@ fn inbound_from_row(row: sqlx::sqlite::SqliteRow) -> Result<StoredInboundAdmissi
             row.try_get("envelope_json")?,
             row.try_get("envelope_hash")?,
         )?,
+        raw_payload_length: row
+            .try_get::<Option<i64>, _>("raw_payload_length")?
+            .map(|value| i64_to_u64("inbound_admissions", &message_id, value))
+            .transpose()?,
         received_at: row.try_get("received_at")?,
         status: parse_work_status("inbound_admission", &message_id, row.try_get("status")?)?,
         lease_owner: row.try_get("lease_owner")?,

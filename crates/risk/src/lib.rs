@@ -9,4 +9,4 @@ mod model;
 pub use circuit_breaker::*;
 pub use evaluator::*;
 pub use model::*;
-pub use sinan_types::single_leg_id;
+pub use sinan_types::{single_leg_id, RiskCapacity};

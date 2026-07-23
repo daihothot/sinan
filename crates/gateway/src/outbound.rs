@@ -863,6 +863,7 @@ fn unconfirmed_outcome(existing: StoredOutboundDelivery, observed_at: i64) -> De
         message_id: existing.outbox.message_id,
         session_id: existing.outbox.session_id,
         sequence: existing.outbox.sequence,
+        write_started_at: existing.outbox.created_at,
         observed_at,
         error: existing
             .attempt
@@ -1279,6 +1280,7 @@ mod tests {
                     proposed_sl: Some(2_320.5),
                     proposed_tp: Some(2_365.5),
                     proposed_legs: None,
+                    decision_timestamp: 800,
                     signal_expires_at: 10_000,
                     requested_at: 900,
                 },

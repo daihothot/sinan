@@ -3,7 +3,7 @@ use std::str::FromStr;
 use sinan_types::MessageId;
 use sqlx::Row;
 
-use crate::{CanonicalJson, SqliteStateStore, StoreError, WriteOutcome};
+use crate::{CanonicalJson, SqliteStateStore, StoreError, WriteOutcome, WriteTransaction};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemEventSeverity {
@@ -196,45 +196,10 @@ impl SqliteStateStore {
         &self,
         event: NewDeadletterEvent,
     ) -> Result<WriteOutcome<StoredDeadletterEvent>, StoreError> {
-        validate_deadletter_event(&event)?;
-        let raw_payload_length = event
-            .raw_payload_length
-            .map(|value| integer("deadletter_events.raw_payload_length", value))
-            .transpose()?;
         let mut transaction = self.begin_write().await?;
-        let result = sqlx::query(
-            "INSERT INTO deadletter_events (\
-                deadletter_id, message_id, message_type, schema_version, reason, raw_payload, \
-                received_at, created_at, source, raw_payload_length, error_message\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-        )
-        .bind(&event.deadletter_id)
-        .bind(event.message_id.as_ref().map(MessageId::as_str))
-        .bind(event.message_type.as_deref())
-        .bind(event.schema_version.as_deref())
-        .bind(event.reason.as_str())
-        .bind(event.raw_payload.as_deref())
-        .bind(event.received_at)
-        .bind(event.created_at)
-        .bind(&event.source)
-        .bind(raw_payload_length)
-        .bind(&event.error_message)
-        .execute(transaction.connection())
-        .await?;
-        let stored =
-            required_deadletter_event(transaction.connection(), &event.deadletter_id).await?;
-        if !same_deadletter_event(&stored, &event) {
-            return Err(StoreError::conflict(
-                "deadletter_event",
-                event.deadletter_id,
-            ));
-        }
+        let outcome = transaction.append_deadletter_event(event).await?;
         transaction.commit().await?;
-        Ok(if result.rows_affected() == 1 {
-            WriteOutcome::Inserted(stored)
-        } else {
-            WriteOutcome::Duplicate(stored)
-        })
+        Ok(outcome)
     }
 
     pub async fn get_deadletter_event(
@@ -251,6 +216,57 @@ impl SqliteStateStore {
         .await?;
         row.map(deadletter_event_from_row).transpose()
     }
+}
+
+impl WriteTransaction {
+    pub async fn append_deadletter_event(
+        &mut self,
+        event: NewDeadletterEvent,
+    ) -> Result<WriteOutcome<StoredDeadletterEvent>, StoreError> {
+        append_deadletter_event_on(self.connection(), event).await
+    }
+}
+
+async fn append_deadletter_event_on(
+    connection: &mut sqlx::SqliteConnection,
+    event: NewDeadletterEvent,
+) -> Result<WriteOutcome<StoredDeadletterEvent>, StoreError> {
+    validate_deadletter_event(&event)?;
+    let raw_payload_length = event
+        .raw_payload_length
+        .map(|value| integer("deadletter_events.raw_payload_length", value))
+        .transpose()?;
+    let result = sqlx::query(
+        "INSERT INTO deadletter_events (\
+            deadletter_id, message_id, message_type, schema_version, reason, raw_payload, \
+            received_at, created_at, source, raw_payload_length, error_message\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+    )
+    .bind(&event.deadletter_id)
+    .bind(event.message_id.as_ref().map(MessageId::as_str))
+    .bind(event.message_type.as_deref())
+    .bind(event.schema_version.as_deref())
+    .bind(event.reason.as_str())
+    .bind(event.raw_payload.as_deref())
+    .bind(event.received_at)
+    .bind(event.created_at)
+    .bind(&event.source)
+    .bind(raw_payload_length)
+    .bind(&event.error_message)
+    .execute(&mut *connection)
+    .await?;
+    let stored = required_deadletter_event(connection, &event.deadletter_id).await?;
+    if !same_deadletter_event(&stored, &event) {
+        return Err(StoreError::conflict(
+            "deadletter_event",
+            event.deadletter_id,
+        ));
+    }
+    Ok(if result.rows_affected() == 1 {
+        WriteOutcome::Inserted(stored)
+    } else {
+        WriteOutcome::Duplicate(stored)
+    })
 }
 
 async fn required_system_event(

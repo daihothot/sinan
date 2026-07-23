@@ -59,6 +59,7 @@ fn request() -> RiskRequest {
             proposed_sl: Some(90.0),
             proposed_tp: Some(120.0),
             proposed_legs: None,
+            decision_timestamp: NOW - 2_000,
             signal_expires_at: NOW + 60_000,
             requested_at: NOW - 1_000,
         },
@@ -836,6 +837,22 @@ fn candidate_leg_id_must_match_the_intent_leg() {
 
     assert_rejected_without_lots(&result);
     assert_reason(&result, ErrorCode::RiskInputInvalid.as_str());
+}
+
+#[test]
+fn decision_timestamp_must_match_the_intent_and_precede_the_request() {
+    let mut mismatched = request();
+    mismatched.intent.decision_timestamp += 1;
+    let mismatch_result = evaluate_closed(&mismatched);
+    assert_rejected_without_lots(&mismatch_result);
+    assert_reason(&mismatch_result, ErrorCode::RiskInputInvalid.as_str());
+
+    let mut invalid_order = request();
+    invalid_order.decision.timestamp = invalid_order.intent.requested_at + 1;
+    invalid_order.intent.decision_timestamp = invalid_order.decision.timestamp;
+    let ordering_result = evaluate_closed(&invalid_order);
+    assert_rejected_without_lots(&ordering_result);
+    assert_reason(&ordering_result, ErrorCode::TradeIntentTimeInvalid.as_str());
 }
 
 #[test]

@@ -84,6 +84,7 @@ fn intent(intent_id: &str, idempotency_key: &str) -> TradeIntent {
         proposed_sl: Some(1.09),
         proposed_tp: Some(1.12),
         proposed_legs: None,
+        decision_timestamp: 900,
         signal_expires_at: 2_000,
         requested_at: 1_000,
     }

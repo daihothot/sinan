@@ -367,8 +367,8 @@ async fn load_trade_intent_workflow_status(
 ) -> Result<Option<TradeIntentWorkflowStatus>, StoreError> {
     let mut intent_query = QueryBuilder::new(
         "SELECT intent_id, decision_id, strategy_id, account_id, symbol, action, status, \
-         requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash, \
-         created_at, updated_at FROM trade_intents WHERE intent_id = ",
+         decision_timestamp, requested_at, signal_expires_at, idempotency_key, payload_json, \
+         payload_hash, created_at, updated_at FROM trade_intents WHERE intent_id = ",
     );
     intent_query.push_bind(intent_id.to_string());
     intent_query.push(" AND account_id IN ");

@@ -43,6 +43,12 @@ impl sinan_http::HttpServerClock for SystemTradingCoreClock {
     }
 }
 
+impl sinan_execution::ServerClock for SystemTradingCoreClock {
+    fn now_ms(&self) -> i64 {
+        TradingCoreClock::now_ms(self)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqliteControlPlaneServiceConfig {
     pub state_limits: ControlPlaneStateLimits,
@@ -394,7 +400,9 @@ fn validate_intent_for_intake(
     policy: &TradingCoreTimePolicy,
 ) -> Result<(), ControlPlanePortError> {
     if now < 0
+        || intent.decision_timestamp < 0
         || intent.requested_at < 0
+        || intent.decision_timestamp > intent.requested_at
         || intent.signal_expires_at <= intent.requested_at
         || intent.requested_at > now.saturating_add(policy.max_decision_time_skew_ms)
         || now.saturating_sub(intent.requested_at) > policy.max_decision_intent_age_ms
@@ -588,6 +596,7 @@ mod tests {
             proposed_sl: Some(1.09),
             proposed_tp: Some(1.12),
             proposed_legs: None,
+            decision_timestamp: NOW - 1,
             signal_expires_at: NOW + 1_000,
             requested_at: NOW,
         }
@@ -651,11 +660,21 @@ mod tests {
         policy.max_decision_intent_age_ms = 100;
         policy.max_decision_time_skew_ms = 50;
 
+        let mut negative_decision_time = intent(TradeIntentAction::Buy);
+        negative_decision_time.decision_timestamp = -1;
+        let mut decision_after_request = intent(TradeIntentAction::Buy);
+        decision_after_request.decision_timestamp = decision_after_request.requested_at + 1;
         let mut too_old = intent(TradeIntentAction::Buy);
         too_old.requested_at = NOW - 101;
+        too_old.decision_timestamp = too_old.requested_at - 1;
         let mut too_far_future = intent(TradeIntentAction::Buy);
         too_far_future.requested_at = NOW + 51;
-        for malformed in [too_old, too_far_future] {
+        for malformed in [
+            negative_decision_time,
+            decision_after_request,
+            too_old,
+            too_far_future,
+        ] {
             assert_unprocessable_code(
                 validate_intent_for_intake(&malformed, NOW, &policy).unwrap_err(),
                 ErrorCode::TradeIntentTimeInvalid,

@@ -33,6 +33,12 @@ pub enum StoreError {
         reason: String,
     },
 
+    #[error("trusted risk snapshot for {intent_id} is unavailable: {input}")]
+    SnapshotUnavailable {
+        intent_id: String,
+        input: &'static str,
+    },
+
     #[error("{field} value {value} does not fit in a SQLite INTEGER")]
     InvalidInteger { field: &'static str, value: u64 },
 

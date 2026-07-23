@@ -160,8 +160,21 @@ pub struct TradeIntent {
     pub proposed_tp: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposed_legs: Option<Vec<TradeIntentLeg>>,
+    pub decision_timestamp: i64,
     pub signal_expires_at: i64,
     pub requested_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RiskCapacity {
+    pub account_id: AccountId,
+    pub strategy_id: StrategyId,
+    pub observed_at: i64,
+    pub daily_realized_loss_pct: f64,
+    pub equity_drawdown_pct: f64,
+    pub remaining_account_risk_pct: f64,
+    pub remaining_portfolio_risk_pct: f64,
+    pub remaining_strategy_legs: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

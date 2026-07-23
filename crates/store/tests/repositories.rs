@@ -64,6 +64,7 @@ fn trade_intent() -> TradeIntent {
         proposed_sl: Some(2_320.5),
         proposed_tp: Some(2_365.5),
         proposed_legs: None,
+        decision_timestamp: 900,
         signal_expires_at: 5_000,
         requested_at: 1_000,
     }

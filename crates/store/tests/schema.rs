@@ -21,10 +21,10 @@ async fn insert_intent_and_risk(pool: &SqlitePool) {
     sqlx::query(
         "INSERT INTO trade_intents (\
              intent_id, decision_id, strategy_id, account_id, symbol, action, status,\
-             requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
+             decision_timestamp, requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
              created_at, updated_at\
          ) VALUES ('intent-1', 'decision-1', 'strategy-1', 'account-1', 'EURUSD',\
-                   'BUY', 'ACCEPTED', 1, 10, 'intent-idem-1', '{}', ?, 1, 1)",
+                   'BUY', 'ACCEPTED', 0, 1, 10, 'intent-idem-1', '{}', ?, 1, 1)",
     )
     .bind(HASH)
     .execute(pool)
@@ -81,7 +81,7 @@ async fn insert_plan_leg_and_command(pool: &SqlitePool) {
 }
 
 #[tokio::test]
-async fn migration_creates_all_state_store_tables_at_version_seven() {
+async fn migration_creates_all_state_store_tables_at_version_ten() {
     let pool = migrated_pool().await;
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_schema \
@@ -100,7 +100,7 @@ async fn migration_creates_all_state_store_tables_at_version_seven() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(tables.len(), 30);
+    assert_eq!(tables.len(), 33);
     assert_eq!(
         tables,
         [
@@ -122,11 +122,14 @@ async fn migration_creates_all_state_store_tables_at_version_seven() {
             "market_bars",
             "market_snapshots",
             "order_snapshots_latest",
+            "outbound_delivery_work",
             "outbound_spool",
             "position_snapshots_latest",
             "reconciliation_order_set_members",
             "reconciliation_position_set_members",
             "reconciliation_runs",
+            "risk_capacity_snapshots",
+            "risk_capacity_snapshots_latest",
             "risk_results",
             "session_resume_admissions",
             "symbol_metadata_latest",
@@ -136,8 +139,55 @@ async fn migration_creates_all_state_store_tables_at_version_seven() {
             "wire_outbox",
         ]
     );
-    assert_eq!(migration_count, 7);
-    assert_eq!(user_version, 7);
+    assert_eq!(migration_count, 10);
+    assert_eq!(user_version, 10);
+}
+
+#[tokio::test]
+async fn inbound_raw_payload_length_is_nullable_non_negative_and_immutable() {
+    let pool = migrated_pool().await;
+    let column: (String, String, i64) = sqlx::query_as(
+        "SELECT name, type, \"notnull\" FROM pragma_table_info('inbound_admissions') \
+         WHERE name = 'raw_payload_length'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("raw payload length column should exist");
+    let trigger_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'trigger' \
+         AND name = 'trg_inbound_admissions_raw_payload_length_immutable')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("raw payload length trigger should be readable");
+
+    assert_eq!(
+        column,
+        ("raw_payload_length".to_owned(), "INTEGER".to_owned(), 0)
+    );
+    assert!(trigger_exists);
+    sqlx::query(
+        "INSERT INTO execution_client_sessions (\
+             session_id, client_id, account_id, platform, status, capabilities_json, connected_at, \
+             last_heartbeat_at, last_time_sync_at, clock_sync_status, updated_at\
+         ) VALUES ('session-raw-length', 'client-1', 'account-1', 'MT5', 'ACTIVE', '[]', \
+                   10, 10, 10, 'SYNCED', 10)",
+    )
+    .execute(&pool)
+    .await
+    .expect("session fixture should insert");
+    assert!(sqlx::query(
+        "INSERT INTO inbound_admissions (\
+             message_id, session_id, client_id, account_id, message_type, schema_version, \
+             sequence, envelope_json, envelope_hash, raw_payload_length, received_at, status, \
+             created_at, updated_at\
+         ) VALUES ('message-invalid-length', 'session-raw-length', 'client-1', 'account-1', \
+                   'market.tick', 'ecp.v1.0', 1, '{}', ?, -1, 10, 'PENDING', 10, 10)",
+    )
+    .bind(HASH)
+    .execute(&pool)
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -171,6 +221,8 @@ async fn every_payload_json_column_has_a_payload_hash() {
             "reconciliation_order_set_members",
             "reconciliation_position_set_members",
             "reconciliation_runs",
+            "risk_capacity_snapshots",
+            "risk_capacity_snapshots_latest",
             "risk_results",
             "symbol_metadata_latest",
             "trade_intents",
@@ -224,8 +276,10 @@ async fn schema_contains_required_query_indexes() {
         "idx_event_stream_created_sequence",
         "idx_execution_commands_idempotency",
         "idx_execution_events_command_time",
+        "idx_outbound_delivery_work_due",
         "idx_outbound_spool_due",
         "idx_reconciliation_runs_account_status_time",
+        "idx_risk_capacity_snapshots_account_strategy_time",
         "idx_trade_intents_idempotency",
         "idx_wire_inbox_session_sequence",
         "idx_wire_outbox_session_sequence",
@@ -241,13 +295,39 @@ async fn schema_contains_required_query_indexes() {
 async fn status_action_mode_json_and_hash_checks_reject_invalid_values() {
     let pool = migrated_pool().await;
 
-    let invalid_action = sqlx::query(
+    let missing_decision_timestamp = sqlx::query(
         "INSERT INTO trade_intents (\
              intent_id, decision_id, strategy_id, account_id, symbol, action, status,\
              requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
              created_at, updated_at\
+         ) VALUES ('intent-missing-decision-time', 'decision-1', 'strategy-1', 'account-1',\
+                   'EURUSD', 'BUY', 'ACCEPTED', 1, 10, 'idem-missing-decision-time', '{}', ?, 1, 1)",
+    )
+    .bind(HASH)
+    .execute(&pool)
+    .await;
+    assert!(missing_decision_timestamp.is_err());
+
+    let decision_after_request = sqlx::query(
+        "INSERT INTO trade_intents (\
+             intent_id, decision_id, strategy_id, account_id, symbol, action, status,\
+             decision_timestamp, requested_at, signal_expires_at, idempotency_key, payload_json,\
+             payload_hash, created_at, updated_at\
+         ) VALUES ('intent-late-decision', 'decision-1', 'strategy-1', 'account-1', 'EURUSD',\
+                   'BUY', 'ACCEPTED', 2, 1, 10, 'idem-late-decision', '{}', ?, 1, 1)",
+    )
+    .bind(HASH)
+    .execute(&pool)
+    .await;
+    assert!(decision_after_request.is_err());
+
+    let invalid_action = sqlx::query(
+        "INSERT INTO trade_intents (\
+             intent_id, decision_id, strategy_id, account_id, symbol, action, status,\
+             decision_timestamp, requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
+             created_at, updated_at\
          ) VALUES ('intent-bad-action', 'decision-1', 'strategy-1', 'account-1', 'EURUSD',\
-                   'SHORT', 'ACCEPTED', 1, 10, 'idem-bad-action', '{}', ?, 1, 1)",
+                   'SHORT', 'ACCEPTED', 0, 1, 10, 'idem-bad-action', '{}', ?, 1, 1)",
     )
     .bind(HASH)
     .execute(&pool)
@@ -285,10 +365,10 @@ async fn status_action_mode_json_and_hash_checks_reject_invalid_values() {
     let invalid_json = sqlx::query(
         "INSERT INTO trade_intents (\
              intent_id, decision_id, strategy_id, account_id, symbol, action, status,\
-             requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
+             decision_timestamp, requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
              created_at, updated_at\
          ) VALUES ('intent-bad-json', 'decision-1', 'strategy-1', 'account-1', 'EURUSD',\
-                   'BUY', 'ACCEPTED', 1, 10, 'idem-bad-json', '{', ?, 1, 1)",
+                   'BUY', 'ACCEPTED', 0, 1, 10, 'idem-bad-json', '{', ?, 1, 1)",
     )
     .bind(HASH)
     .execute(&pool)
@@ -298,10 +378,10 @@ async fn status_action_mode_json_and_hash_checks_reject_invalid_values() {
     let invalid_hash = sqlx::query(
         "INSERT INTO trade_intents (\
              intent_id, decision_id, strategy_id, account_id, symbol, action, status,\
-             requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
+             decision_timestamp, requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
              created_at, updated_at\
          ) VALUES ('intent-bad-hash', 'decision-1', 'strategy-1', 'account-1', 'EURUSD',\
-                   'BUY', 'ACCEPTED', 1, 10, 'idem-bad-hash', '{}', 'ABC', 1, 1)",
+                   'BUY', 'ACCEPTED', 0, 1, 10, 'idem-bad-hash', '{}', 'ABC', 1, 1)",
     )
     .execute(&pool)
     .await;

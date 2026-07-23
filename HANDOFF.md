@@ -19,16 +19,17 @@ docs/quant_trading_7_layer_target_architecture.md
 ## 当前状态
 
 - 架构和实现规格已经完成记录，并与当前代码保持同步。
-- 第一至第八里程碑已经完成。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
+- 第一至第九里程碑已经完成。内部 crate 目录不带前缀，Cargo 包名仍使用 `sinan-*`。
 - `sinan-types`、`sinan-protocol`、三个协议黄金样例、SQLite migration、repository 和 state-ingest projection 均已实现并通过测试。
-- `sinan-store` 当前共有 30 张业务表，最高 migration 为 V0007，启动时同步并校验 `PRAGMA user_version = 7`：V0002 的 22 张基础表、V0003 的 Circuit Breaker journal、V0004 的 4 张 Reconciliation run / checkpoint / set-membership 表，以及 V0007 的 inbound admission、inbound rejection 和 session resume admission 表。V0005 为 session、wire outbox 和 delivery attempt 增加 revision/CAS、sequence high-water、WRITE_STARTED/UNCONFIRMED 和双 subject 持久化边界；V0006 按旧表 `rowid` 顺序回填 bounded event stream 的数据库单调 `stream_sequence`，并建立 topic/account/created-time 的 sequence 索引；V0007 增加完整 canonical envelope/cursor、stable rejection 和 lease/revision recovery。canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 projection rebuild 均已实现。
-- `sinan-risk` 已实现不可变 `RiskRequest` / policy / capacity / full-set watermark 领域模型、确定性 Decimal position sizing evaluator 和纯 circuit breaker 状态机。
+- `sinan-store` 当前共有 33 张业务表，最高 migration 为 V0010，启动时同步并校验 `PRAGMA user_version = 10`：V0002 的 22 张基础表、V0003 的 Circuit Breaker journal、V0004 的 4 张 Reconciliation run / checkpoint / set-membership 表、V0007 的 3 张 inbound admission / rejection / resume admission 表、V0008 的 append-only `risk_capacity_snapshots` 和 `risk_capacity_snapshots_latest`，以及 V0009 的 `outbound_delivery_work`。V0005 为 session、wire outbox 和 delivery attempt 增加 revision/CAS、sequence high-water、WRITE_STARTED/UNCONFIRMED 和双 subject 持久化边界；V0006 回填 bounded event stream 的数据库单调 `stream_sequence`；V0007 增加完整 canonical envelope/cursor、stable rejection 和 lease/revision recovery；V0008 为新 TradeIntent 强制合法 `decision_timestamp`；V0009 增加确定性 generation/message ID、lease/revision CAS 和 durable retry/backoff；V0010 为 inbound admission 增加不可变的原始 wire byte length，不新增业务表。canonical JSON/hash、显式写事务、typed repository、授权 latest-state query 和原子 projection rebuild 均已实现。
+- `sinan-risk` 已实现不可变 `RiskRequest` / policy / full-set watermark 领域模型、确定性 Decimal position sizing evaluator 和纯 circuit breaker 状态机。`RiskCapacity` 是 `sinan-types` 的共享契约，并由 `sinan-store` 按 `account_id / strategy_id / observed_at` 持久化为可信 append-only fact 与单调 latest projection；同水位漂移、非法数值、身份或 canonical payload 损坏均 fail closed。
 - `sinan-execution` 已实现从 approved `RiskResult` 构建 plan / command、精确 lots 映射、command 状态机、leg / plan projector 和 recovery decision；`sinan-store` 已实现 intent / risk / plan / leg / command / initial state 的原子 workflow commit，以及 command、leg、plan projection 的 CAS 持久化边界。
 - Circuit breaker 已有完整、带版本的 durable snapshot 和启动恢复 adapter；缺失、损坏或未知 snapshot 会创建并持久化新的 `OPEN` safety incident，已知 `recovery_epoch` 不会回退。
 - `sinan-reconciliation` 已实现 transport-neutral request 生成、result 校验、`Completed / PendingEvidence` 评估和显式 evidence 驱动的 `ManualRequired` 升级；V0004 已实现 reconciliation run、checkpoint、position / order full-set 原子替换及旧逐行事实防复活。
-- `sinan-gateway` 已实现 live/durable session fencing、heartbeat clock health、Execution-owned `OutboundDeliveryPort` adapter，以及共享同一协议状态机的 Native TCP / Execution WebSocket binding；client auth、resume handoff、durable inbound/resume admission adapter、lease recovery dispatcher、单 writer、有界资源/停机和真实 loopback 测试均已落地。`TransportEventPort` 的生产 adapter 会先写 system/deadletter durable fact，再发布脱敏的全局 bounded summary。当前 `TransportEvent` 类型尚不携带 raw frame、message type 或 schema evidence，因此 deadletter 的 `raw_payload / raw_payload_length / message_type / schema_version` 目前可能为空，不能宣称已经保存完整原始证据。
+- `sinan-gateway` 已实现 live/durable session fencing、heartbeat clock health、Execution-owned `OutboundDeliveryPort` adapter，以及共享同一协议状态机的 Native TCP / Execution WebSocket binding；client auth、resume handoff、durable inbound/resume admission adapter、lease recovery dispatcher、单 writer、有界资源/停机和真实 loopback 测试均已落地。`TransportEventPort` 的生产 adapter 会先写 system/deadletter durable fact，再发布脱敏的全局 bounded summary；受限 fact 保存 typed message type、schema version 和原始 byte length，但有意不保存可能包含 credential/token/HMAC 的 raw content。
 - `sinan-http` 已实现严格 JSON 的 `POST /trade-intents`、`GET /state`、`GET /time`、intent/command 查询和独立 `WS /events`；Bearer token 同时约束 scope 与账户范围，Event WS 支持 cursor-exclusive durable replay、replay→live high-water 去重和慢消费者 fail-closed。
-- `sinan-core` 已组合 Control Plane、Event Stream Manager、Gateway durable persistence ports，并在开放 HTTP 前恢复 durable Circuit Breaker。当前二进制实际启动的是 HTTP/Event WS 与 event retention task；Native TCP / Execution WebSocket listener、`DurableRecoveryDispatcher` 及 handler-specific inbound business processor 尚未在 `main` 中启动，因此 V0007 的 `PENDING` admission 目前只具备可恢复持久化边界，不代表业务事实已经处理完成。
+- 当前 `/events` 已可靠发布 transport system/deadletter summary，但 inbound/Risk/Execution owner transaction 尚未原子追加 `market.snapshot / risk.summary / execution.summary` 并在 commit 后接入有序 live fanout。该缺口不影响 execution correctness/projection source of truth，但在 Strategy & Decision Control Plane 依赖业务事件前必须收口；不能把查询 projection 或进程内临时通知伪装成 durable summary。
+- `sinan-core` 已实现可信 `TradeIntent -> Risk -> Execution` processor、handler-specific inbound owner transaction 和 durable outbound processor。运行时统一启动 HTTP/Event WS、Native TCP、Execution WebSocket、inbound/resume recovery、Risk、outbound 和 retention worker；关键 worker 的失败、panic 或意外退出会立即触发 supervisor。outbound 只消费 durable `CREATED` command / `REQUESTED` reconciliation：基础设施错误保留原 message ID，明确未写入或可重试 typed rejection 才推进 generation；`Unconfirmed` 原子进入 reconciliation，`Expired` 以显式时间证据推进生命周期，已被 receipt/event 抢先推进的 work 以 `SUPERSEDED` 收敛。shutdown 可以取消正在等待 transport 的 batch item；已 claim 的 work 保留 lease，后续进程在 lease 到期后 reclaim。
 - 现有 MQL5 EA 仍位于 MetaTrader 工作区，不属于此 Rust 仓库。
 - 当前工作区已通过 `cargo fmt --all --check`、`cargo check --workspace`、`cargo test --workspace` 和 `git diff --check`。
 
@@ -66,6 +67,8 @@ docs/quant_trading_7_layer_target_architecture.md
 30. 明文 Execution Client transport 只允许 loopback 或具备明确隔离的受控私网；跨主机或跨安全边界必须使用 TLS，服务间优先使用 mTLS。
 31. `event_stream_log.account_id = NULL` 只允许 `system.event` / `deadletter.summary`；其他 topic 必须绑定非空账户。全局 summary 对所有合法 event subscriber 可见，只能包含经过白名单筛选的非敏感字段；当前 system summary payload 只含 `severity / component / timestamp`，deadletter summary payload 只含 `reason / received_at`。message、metadata、raw payload、remote/session/message identity 和 parser detail 不得进入全局 summary；其中由当前 transport event 实际携带的诊断字段只保存在受限 durable fact 中。
 32. durable admission 的 `Accepted` 只证明完整 envelope/cursor 已 crash-recoverable；只有 handler-specific 领域事实与 projection 在 owner transaction 中提交后才能标记 `HANDLED`。不得用 noop handler 或多个松散 Store 调用伪造业务处理完成。
+33. durable recovery 的 handler deadline 必须从 claim 开始计算，并为 admission/resume terminal commit 预留显式 finalization budget；`handler_timeout + finalization_budget` 不得超过 lease。过期 owner 不能提交 `HANDLED / FAILED`。
+34. durable outbound work 由 Execution application 层拥有。`DeliveryInfrastructureError` 必须保留同一 generation/message ID；只有明确未写入或 policy 允许重试的 typed rejection 才能换 generation。`Unconfirmed` 必须进入 reconciliation，不能自动重发；receipt/event 抢先推进 lifecycle 后，遗留 work 只能 `SUPERSEDED`。
 
 ## Rust 工作区目标
 
@@ -356,7 +359,7 @@ git diff --check
 第七里程碑完成 Native TCP 与 Execution WebSocket transport binding，并复用第六里程碑的 session/outbound durability，不在 transport 层引入 execution lifecycle、retry 或 reconciliation 决策：
 
 1. 共享连接与认证状态机：
-   - `ConfiguredClientAuthenticator` 按 client/account/terminal/platform/remote identity 绑定凭证，只接受 ACTIVE / NEXT client-auth secret，Debug 输出脱敏；
+   - 当前 `ConfiguredClientAuthenticator` 的凭证只按 `(client_id, account_id)` 绑定，并只接受 ACTIVE / NEXT client-auth secret；认证后的 session context 再固定 terminal/platform/remote identity，后续 payload 不得覆盖。当前不能宣称 credential 本身已限制 terminal/platform/remote；Debug 输出保持脱敏；
    - 首条数据消息必须是合法 `session.hello`，认证成功后分配新 session；`session.accepted` 真实写成功后才进入 active message loop；
    - `GatewayConnectionService` 同时限制两个 binding 的总 connection 和 pending handshake，并强制 session clock policy 与 hello 下发 policy 一致。
 2. 两种真实 transport binding：
@@ -388,7 +391,7 @@ git diff --check
 
 1. Control Plane HTTP：
    - `POST /trade-intents` 使用严格 JSON、`X-Request-ID`、`X-Idempotency-Key`、Bearer scope 和账户授权；intake 只持久化合法 TradeIntent，返回 `202 ACCEPTED` 或幂等的 `200 DUPLICATE`，不伪造 RiskResult、plan 或 command；
-   - BUY/SELL 的 `proposed_risk_pct` 必须在 `(0, 100]`，HOLD 必须为 `0` 且不得携带 SL/TP/legs；过旧/未来 `requested_at` 返回 `TRADE_INTENT_TIME_INVALID`，已到期 signal 返回 `TRADE_INTENT_EXPIRED`；
+   - BUY/SELL 的 `proposed_risk_pct` 必须在 `(0, 100]`，HOLD 必须为 `0` 且不得携带 SL/TP/legs；`decision_timestamp` 必填且不得晚于 `requested_at`；过旧/未来 `requested_at` 返回 `TRADE_INTENT_TIME_INVALID`，已到期 signal 返回 `TRADE_INTENT_EXPIRED`；
    - `GET /state` 从同一 SQLite read snapshot 返回授权范围内的 `accounts: AccountSnapshot[]` 及 bounded execution/risk 集合；有时间语义的 bounded 集合先倒序取上限，再按 `(time, id)` 升序输出；
    - `GET /time` 返回 receive/send server timestamps 和 Control Plane time policy；`GET /trade-intents/{intent_id}` 与 `GET /execution/commands/{command_id}` 不泄露范围外对象，command payload 需要额外 debug-sensitive scope；
    - 已持久化的 rejected RiskResult 在 intent detail 中派生为 `RISK_BLOCKED`，并把 `evaluated_at` 纳入 `updated_at`。
@@ -400,13 +403,51 @@ git diff --check
 3. Durable inbound/resume 与 TransportEvent：
    - V0007 新增 `inbound_admissions`、`inbound_rejections`、`session_resume_admissions`；保存完整 canonical envelope/cursor、authenticated route、sequence、hash、状态、revision 和 lease；
    - production admission port 在 durable `PENDING` 后才允许 ACK，稳定 duplicate/rejection 可安全重放；dispatcher 支持 claim、过期 lease reclaim、owner/revision/expiry fencing、handler timeout 和 terminal completion/failure；resume handler 不得自动重放 command；
-   - production `TransportEventPort` 将 frame/decode/schema 问题写入 deadletter，其余认证/clock/liveness 问题写入 system fact；durable fact 成功后才发布 bounded summary，发布失败保持可观测错误。由于当前 `TransportEvent` 没有 raw frame、message type 和 schema evidence 字段，相关 deadletter 列仍可能为空；这是证据携带边界，不得写成完整 raw evidence 已落库。
+   - production `TransportEventPort` 将 frame/decode/schema 问题写入 deadletter，其余认证/clock/liveness 问题写入 system fact；durable fact 成功后才发布 bounded summary，发布失败保持可观测错误。后续第九里程碑已贯通 typed message type/schema/raw length；raw content 按 credential/HMAC 脱敏策略明确不持久化。
 4. Core 运行组合：
    - 启动时先连接并迁移 Store，再执行 durable Circuit Breaker restore；缺失/损坏 snapshot 会持久化 OPEN safety incident，restore 失败拒绝开放 HTTP；
    - 必填运行配置为 `SINAN_CONTROL_PLANE_TOKEN / SINAN_CONTROL_PLANE_ACCOUNTS`；后者的环境变量本身必须存在且非空，但逗号分隔、trim 和过滤后的账户集合允许为空，此时 principal 不能读写任何账户对象，其 Event WS 只能看到脱敏的全局 system/deadletter summary。可选配置为 `SINAN_CONTROL_PLANE_SUBJECT / SINAN_CONTROL_PLANE_SCOPES / SINAN_DATABASE_URL / SINAN_HTTP_ADDR / SINAN_EVENT_LIVE_CAPACITY / SINAN_EVENT_REPLAY_LIMIT / SINAN_EVENT_MAX_MESSAGE_BYTES / SINAN_EVENT_WRITE_TIMEOUT_MS / SINAN_EVENT_RETAIN_LATEST / SINAN_EVENT_RETENTION_AGE_MS / SINAN_EVENT_RETENTION_INTERVAL_MS`。当前默认值分别为 subject `control-plane`、三个 Control Plane/Event scope、`sqlite://sinan.sqlite`、`127.0.0.1:8080`、`1024 / 1000 / 65536 / 5000ms / 10000 / 900000ms / 60000ms`；所有容量、上限和 duration 都必须为正数；
-   - 当前 `main` 只启动 Control Plane HTTP/Event WS 和 event retention。Gateway persistence ports 已组合并保活，但 Native TCP / Execution WebSocket listener 与 durable recovery worker 尚未启动。
+   - 第八里程碑结束时 `main` 只启动 Control Plane HTTP/Event WS 和 event retention；第九里程碑已经补齐 Native TCP / Execution WebSocket listener、durable recovery、Risk 和 outbound worker 的运行组合。
 
-第八里程碑明确没有把 V0007 admission 自动标记为 `HANDLED`。下一里程碑必须实现按 `command.received / execution.event / reconciliation.result` 分派的 handler-specific 原子业务事务、可信 RiskRequest assembler 与 Risk→Execution workflow processor，并把 Gateway listeners、session registry、outbound adapter 和 `DurableRecoveryDispatcher` 组合进进程生命周期；listener 投产前还必须补齐 TransportEvent 的有界 raw/type/schema 证据传递。完成这些边界前，不能把当前二进制描述为完整 production execution path。
+第八里程碑明确没有把 V0007 admission 自动标记为 `HANDLED`。这些当时保留的边界已经在第九里程碑完成：handler-specific 原子业务事务、可信 RiskRequest assembler、Risk→Execution workflow processor、Gateway listener/session/outbound/recovery 运行组合，以及 typed TransportEvent evidence 均已落地。
+
+## 第九里程碑（已完成）
+
+本里程碑完成从可信 hard-risk snapshot、`TradeIntent -> Risk -> Execution` 到真实 Gateway transport、receipt/event projection 的 durable 闭环；它不允许 Risk evaluator 补读 Store、调用 Compute/HTTP 或在缺少证据时使用默认值：
+
+1. V0008 与可信容量输入：
+   - `TradeIntent.decision_timestamp` 现在是共享模型和 HTTP intake 的必填字段；新数据库写入通过 schema trigger 强制非 NULL，并要求 `0 <= decision_timestamp <= requested_at`；从 V0007 升级的旧 intent 保持 NULL，因此不会把接收时间伪装成历史策略决策时间，也不会进入新的初始风险调度；
+   - `RiskCapacity` 已下沉到 `sinan-types`，`sinan-risk` 只 re-export 同一类型；V0008 新增 append-only `risk_capacity_snapshots` 和按 `account_id / strategy_id` 唯一的 latest projection；
+   - capacity repository 校验账户、策略、时间、finite/non-negative 数值、canonical JSON/hash 和冗余列身份。旧水位事实可以追加但不能覆盖 latest；相同水位的 payload 或 `recorded_at` 漂移返回稳定 conflict。
+2. 单事务可信 hard-risk snapshot：
+   - `WriteTransaction::load_trusted_risk_snapshot` 在同一个 `BEGIN IMMEDIATE` snapshot 中加载 intent、latest account、账户级 reconciliation checkpoint、精确 position/order full-set membership、所需 symbol metadata/market、所有 non-terminal command 及其状态、durable circuit breaker 和对应账户/策略的 latest capacity；
+   - hard-risk 输入集合不使用业务 `LIMIT`。checkpoint 后出现 position/order 单行更新、command 缺 state、command identity 漂移或 command state 晚于 pending-command 水位都会 fail closed；intent、active position/order 和 non-terminal BUY/SELL command 所需的每个 canonical symbol 都必须同时具备 metadata 与 market snapshot；空 position/order full set 仍是合法的完整证据；
+   - 账户、checkpoint、pending-command 水位、capacity 或必需 symbol context 暂缺时返回可重试的 `SnapshotUnavailable`。调度查询只选择基础证据齐全且水位未漂移的 intent，因此较早但尚未 ready 的 intent 不会让后续 ready intent 饥饿；直接按不存在的 `intent_id` 处理仍返回 `NotFound`。
+3. Risk→Execution processor：
+   - processor 在一个 write transaction 内完成 work selection、snapshot load、`RiskRequest` assembly、risk evaluation、execution build 和 durable commit；任一晚期失败整体回滚，不留下孤立 RiskResult、plan 或 command；
+   - `StrategyDecision.timestamp` 只从持久化的 `decision_timestamp` 重建。可信本地 execution resolver 必须同步、确定性且无 I/O；同一组 route/order/deviation/cost 参数同时用于 sizing candidate 和最终 command，市价 sizing 使用 ask/bid 并叠加 `deviation_points * point` 的保守价格；
+   - 初始 request/risk/plan/command ID 从 intent/leg 稳定派生。approved BUY/SELL 将 Risk 批准的 lots 精确复制到 plan 和 command；rejected 与 HOLD 只持久化 RiskResult；processor 本身不执行 transport I/O。
+4. Runtime risk worker：
+   - `SINAN_RISK_POLICY_JSON`、`SINAN_STRATEGY_RISK_POLICY_JSON`、`SINAN_EXECUTION_POLICY_JSON`、`SINAN_EXECUTION_ROUTES_JSON` 和 `SINAN_EXECUTION_COMMAND_SIGNING_SECRET` 五项全部缺失时不启动 risk worker；只要任一项存在，其余四项都必须存在且非空，否则启动失败；
+   - routes 必须是非空严格 JSON 数组，按 `(account_id, symbol)` 唯一，并显式提供订单、route、deviation、cost 和可选 dependency 参数；不提供隐式 route、policy、capacity、snapshot 或 signing secret；
+   - `SINAN_RISK_WORKFLOW_INTERVAL_MS` 控制轮询间隔，默认 `250ms` 且必须为正数。worker 只消费 trusted inputs 已就绪的 intent；`SnapshotUnavailable` 保持 pending，其他错误记录后继续轮询。
+5. Handler-specific inbound owner transaction 与 runtime：
+   - `transport.ack`、market/account/position/order/metadata、`command.received`、`execution.event` 和 `reconciliation.result` 都由对应 owner 在一个 write transaction 中提交领域事实、projection 和 admission `HANDLED`；任一步失败整体回滚；
+   - `command.received=RECORDED` 可依据 durable transport-write evidence 在同一事务补齐 `CREATED -> DISPATCHED -> COMMAND_RECEIVED`；`EXPIRED / REJECTED` 只追加事实，不 ACK delivery attempt、不伪造 lifecycle；
+   - `DurableRecoveryConfig` 使用独立 `handler_timeout` 与 `finalization_budget`，从 claim 开始计算绝对 deadline。inbound/resume timeout 会在 lease 内稳定收敛，过期 owner 不能写 terminal state；
+   - handler failure 区分 terminal schema/domain deadletter 与 retryable infrastructure。terminal 路径先回滚业务写，再在一个 owner transaction 中原子追加脱敏 deadletter 和 admission `FAILED`；retryable Store/并发错误保持 `PROCESSING` 供 lease reclaim，并以 typed error 返回 runtime，不能静默终结；
+   - V0010 从 listener 的 `wire_bytes.len()` 原样保存 admission `raw_payload_length`；terminal deadletter 只复制 type/schema/length，`raw_payload` 保持 NULL，不用 canonical JSON 长度冒充原始长度；
+   - `main` 统一启动 Native TCP、Execution WebSocket、session registry、recovery worker、Risk worker、HTTP/Event WS 和 retention，并以同一 shutdown/supervision 边界回收任务。
+6. V0009 durable outbound work：
+   - `outbound_delivery_work` 为 command 和 reconciliation request 保存稳定 work identity、确定性 generation/message ID、revision、lease、attempt count、next-attempt 和 terminal outcome；首次 claim 也能原子发现尚未建 work 的 `CREATED / REQUESTED` subject；
+   - `Sent` 在 owner transaction 内通过 Execution 状态机推进 `DISPATCHED` 并完成 work；`Unconfirmed` 推进 `DELIVERY_UNCONFIRMED` 并创建定向 reconciliation；`Expired` 以显式服务器时间推进 `EXPIRED`；永久 identity/peer rejection 停止投递；
+   - 基础设施故障或自相矛盾 evidence 保留同一 message ID；`DefinitelyNotWritten` 和 policy 允许的 transient typed rejection 才推进 generation。lease 到期可 reclaim；若 lifecycle 已被 receipt/event 推进，则不再调用 Gateway 并以 `SUPERSEDED` 收敛；
+   - runtime 配置为 `SINAN_DURABLE_OUTBOUND_INTERVAL_MS / BATCH_SIZE / LEASE_MS / CONFIRMATION_TIMEOUT_MS / RETRY_BASE_MS / RETRY_MAX_MS`，默认分别为 `100 / 64 / 30000 / 5000 / 250 / 30000`。
+7. Fake Execution Client 端到端验证：
+   - 真实 Native TCP binding 完成 hello/auth/time sync，接收 durable worker 发出的 `execution.command`，返回 `transport.ack` 与 `command.received`；
+   - 测试从可信 TradeIntent/Risk snapshot 生成 command，经 Gateway 单 writer 实际写出，再由 durable inbound recovery 原子推进 attempt、command、leg 和 plan projection，禁止用 mock delivery port替代 transport 边界。
+
+当前没有从 HTTP 或 Compute 自动生成 `RiskCapacity` 的路径；demo 或上层应用必须先通过 typed Store API 写入可信 capacity fact。该限制是显式输入边界，不得通过在 workflow 内推导或默认补值绕过。
 
 ## 实现约束
 
@@ -436,19 +477,19 @@ git diff --check
 5. Gateway session registry 和出站投递端口。（已完成）
 6. Native TCP 和 Execution WebSocket 绑定。（已完成）
 7. HTTP TradeIntent/state/time API、Event WebSocket，以及 production inbound、TransportEvent/deadletter persistence adapter。（已完成）
-8. handler-specific inbound 原子 dispatcher、Gateway listener 运行组合、TransportEvent 原始证据传递、可信 RiskRequest assembler 和 Risk→Execution workflow processor。（下一里程碑）
-9. Fake Execution Client 端到端测试。
+8. handler-specific inbound 原子 dispatcher、Gateway listener 运行组合、可信 RiskRequest assembler 和 Risk→Execution workflow processor。（已完成；TransportEvent 采用 typed evidence，raw content 明确不持久化）
+9. durable outbound command 调度和 Fake Execution Client 端到端测试。（已完成）
 10. MQL5 和 OKX 适配器。
 11. Strategy & Decision Control Plane。
 
-Risk、Circuit Breaker durable restore、Execution、Reconciliation、Gateway session/outbound durability、两种 Execution Client transport binding、Control Plane HTTP、Event WebSocket 和 durable admission/persistence adapter 已完成。下一里程碑把这些现有边界组合成真实业务处理链：每类 inbound message 使用 owner transaction 提交事实与 projection，Risk→Execution 使用同一可信 Store snapshot，Core 启动并监督 Gateway listeners 与 recovery dispatcher，并补齐 transport 到 deadletter 的有界原始证据；不得用 noop handler 把 admission 标记为已处理。MQL5 adapter 里程碑仍必须满足第 3.1 和 24 节规定的串行回调、有界网络泵约束及测试。
+Risk、Circuit Breaker durable restore、Execution、Reconciliation、Gateway session/outbound durability、两种 Execution Client transport binding、Control Plane HTTP、Event WebSocket、durable inbound/outbound worker、可信 Risk snapshot 和 Fake Execution Client 端到端闭环均已完成。下一里程碑进入 MQL5 与 OKX adapter，并在 Strategy & Decision Control Plane 消费前收口 business summary 的 owner-transaction append 与 commit 后有序 live fanout；MQL5 必须满足第 3.1 和 24 节规定的串行回调、`OnTimer` 独占 socket pump、无后台线程和有界网络泵约束。永久 identity/peer rejection 会终结 scheduler work，但 command 保持 `CREATED`，等待显式运维/策略处置，不伪造 execution lifecycle。
 
 ## 建议的开场提示
 
 ```text
 完整阅读 HANDOFF.md 和 docs/quant_trading_7_layer_target_architecture.md。
-将已经实现的协议、State Store、Risk、Execution、Reconciliation、Gateway、Control Plane HTTP、Event WebSocket 和 durable admission/persistence adapter 视为经过验证的基线；修改前先运行基线验收命令。
-下一里程碑实现 handler-specific inbound 原子 dispatcher、Gateway listener 运行组合、可信 RiskRequest assembler 和 Risk→Execution workflow processor；复用现有领域状态机和 Store transaction boundary，不得创建绕过 Trading Core 的 execution 通道，也不得把 durable intake 等同于业务处理完成。
+将已经实现的协议、State Store、Risk、Execution、Reconciliation、Gateway、Control Plane HTTP、Event WebSocket、durable inbound/outbound worker、可信 Risk snapshot 和 Fake Execution Client 端到端闭环视为经过验证的基线；修改前先运行基线验收命令。
+下一里程碑实现 MQL5 与 OKX adapter；MQL5 必须保持单线程事件回调、由 OnTimer 独占有界 socket pump、OnTick 只采集并合并行情、OnTradeTransaction 先持久化 broker 事实再入队，禁止后台线程推进网络或 journal 状态。
 报告完成前，运行 cargo fmt --all --check、cargo check --workspace 和 cargo test --workspace。
 架构存在歧义时，先指出冲突并解决文档问题，再修改代码。
 ```

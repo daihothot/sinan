@@ -5,11 +5,12 @@ use sinan_store::{
     CanonicalJson, ClaimDurableWork, CompleteInboundAdmission, CompleteSessionResumeAdmission,
     DeadletterReason, DurableInboundAdmissionOutcome, DurableSessionResumeAdmissionOutcome,
     DurableWorkStatus, FailInboundAdmission, FailSessionResumeAdmission, NewDeadletterEvent,
-    NewInboundAdmission, NewSessionResumeAdmission, NewSystemEvent, ReclaimDurableWork, StoreError,
-    SystemEventSeverity, WriteOutcome,
+    NewEventStreamRecord, NewInboundAdmission, NewSessionResumeAdmission, NewSystemEvent,
+    ReclaimDurableWork, StoreError, SystemEventSeverity, WriteOutcome,
 };
 use sinan_types::{
-    AccountId, CausationId, ClientId, CorrelationId, ErrorCode, MessageId, RequestId, SessionId,
+    AccountId, CausationId, ClientId, CorrelationId, ErrorCode, EventStreamTopic, MessageId,
+    RequestId, SessionId,
 };
 
 use common::test_store;
@@ -53,6 +54,7 @@ fn inbound(message_id: &str, sequence: u64, payload_value: i64) -> NewInboundAdm
         correlation_id: Some(CorrelationId::from("correlation-1")),
         causation_id: Some(CausationId::from("causation-1")),
         envelope,
+        raw_payload_length: Some(512),
         received_at: 100,
         created_at: 100,
     }
@@ -89,13 +91,16 @@ async fn inbound_admission_is_strictly_idempotent_and_journals_drift() {
     ));
 
     let mut retransmission = original.clone();
+    retransmission.raw_payload_length = Some(640);
     retransmission.received_at = 101;
     retransmission.created_at = 101;
     let duplicate = store.admit_inbound(retransmission).await.unwrap();
     assert!(matches!(
         duplicate,
         DurableInboundAdmissionOutcome::Duplicate(ref record)
-            if record.received_at == 100 && record.envelope == original.envelope
+            if record.received_at == 100
+                && record.envelope == original.envelope
+                && record.raw_payload_length == Some(512)
     ));
 
     let payload_drift = inbound("message-1", 1, 11);
@@ -404,6 +409,192 @@ async fn terminal_writes_are_fenced_at_the_lease_expiry_boundary() {
         .await
         .expect_err("resume completion at the expiry boundary must lose the lease");
     assert!(matches!(error, StoreError::StaleWrite { .. }));
+}
+
+#[tokio::test]
+async fn transaction_owned_terminal_writes_commit_or_rollback_with_business_facts() {
+    let (_database, store, pool) = test_store().await;
+    seed_session(&pool).await;
+
+    store
+        .admit_inbound(inbound("message-owner-commit", 1, 10))
+        .await
+        .unwrap();
+    let committed_claim = store
+        .claim_next_inbound(ClaimDurableWork {
+            worker_id: "owner-worker".to_owned(),
+            claimed_at: 110,
+            lease_expires_at: 200,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let mut committed = store.begin_write().await.unwrap();
+    committed
+        .append_event_stream_record(NewEventStreamRecord {
+            event_id: "owner-commit-fact".to_owned(),
+            topic: EventStreamTopic::SystemEvent,
+            account_id: None,
+            event_type: "test.owner-transaction".to_owned(),
+            payload: CanonicalJson::from_value(json!({"committed": true})).unwrap(),
+            created_at: 120,
+        })
+        .await
+        .unwrap();
+    committed
+        .complete_inbound(CompleteInboundAdmission {
+            message_id: committed_claim.message_id.clone(),
+            expected_revision: committed_claim.revision,
+            worker_id: "owner-worker".to_owned(),
+            completed_at: 120,
+        })
+        .await
+        .unwrap();
+    committed.commit().await.unwrap();
+    assert!(store
+        .get_event_stream_record("owner-commit-fact")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        store
+            .get_inbound_admission(&committed_claim.message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DurableWorkStatus::Handled
+    );
+
+    store
+        .admit_inbound(inbound("message-owner-rollback", 2, 20))
+        .await
+        .unwrap();
+    let rolled_back_claim = store
+        .claim_next_inbound(ClaimDurableWork {
+            worker_id: "owner-worker".to_owned(),
+            claimed_at: 121,
+            lease_expires_at: 200,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let mut rolled_back = store.begin_write().await.unwrap();
+    rolled_back
+        .append_event_stream_record(NewEventStreamRecord {
+            event_id: "owner-rollback-fact".to_owned(),
+            topic: EventStreamTopic::SystemEvent,
+            account_id: None,
+            event_type: "test.owner-transaction".to_owned(),
+            payload: CanonicalJson::from_value(json!({"committed": false})).unwrap(),
+            created_at: 122,
+        })
+        .await
+        .unwrap();
+    rolled_back
+        .append_deadletter_event(NewDeadletterEvent {
+            deadletter_id: "owner-rollback-deadletter".to_owned(),
+            message_id: Some(rolled_back_claim.message_id.clone()),
+            message_type: Some(rolled_back_claim.message_type.clone()),
+            schema_version: Some(rolled_back_claim.schema_version.clone()),
+            reason: DeadletterReason::SchemaValidationFailed,
+            source: "test.durable-recovery".to_owned(),
+            raw_payload: None,
+            raw_payload_length: None,
+            error_message: "rolled back failure".to_owned(),
+            received_at: rolled_back_claim.received_at,
+            created_at: 122,
+        })
+        .await
+        .unwrap();
+    rolled_back
+        .fail_inbound(FailInboundAdmission {
+            message_id: rolled_back_claim.message_id.clone(),
+            expected_revision: rolled_back_claim.revision,
+            worker_id: "owner-worker".to_owned(),
+            failed_at: 122,
+            error: "rolled back failure".to_owned(),
+        })
+        .await
+        .unwrap();
+    rolled_back.rollback().await.unwrap();
+    assert!(store
+        .get_event_stream_record("owner-rollback-fact")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_deadletter_event("owner-rollback-deadletter")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .get_inbound_admission(&rolled_back_claim.message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DurableWorkStatus::Processing
+    );
+
+    store
+        .admit_session_resume(resume("old-session-owner"))
+        .await
+        .unwrap();
+    let resume_claim = store
+        .claim_next_session_resume(ClaimDurableWork {
+            worker_id: "resume-owner".to_owned(),
+            claimed_at: 130,
+            lease_expires_at: 200,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let mut resume_rollback = store.begin_write().await.unwrap();
+    resume_rollback
+        .fail_session_resume(FailSessionResumeAdmission {
+            hello_message_id: resume_claim.hello_message_id.clone(),
+            expected_revision: resume_claim.revision,
+            worker_id: "resume-owner".to_owned(),
+            failed_at: 131,
+            error: "rolled back resume failure".to_owned(),
+        })
+        .await
+        .unwrap();
+    resume_rollback.rollback().await.unwrap();
+    assert_eq!(
+        store
+            .get_session_resume_admission(&resume_claim.hello_message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DurableWorkStatus::Processing
+    );
+
+    let mut resume_commit = store.begin_write().await.unwrap();
+    resume_commit
+        .complete_session_resume(CompleteSessionResumeAdmission {
+            hello_message_id: resume_claim.hello_message_id.clone(),
+            expected_revision: resume_claim.revision,
+            worker_id: "resume-owner".to_owned(),
+            completed_at: 132,
+            reconciliation_request_id: Some(RequestId::from("owner-reconciliation")),
+        })
+        .await
+        .unwrap();
+    resume_commit.commit().await.unwrap();
+    let stored_resume = store
+        .get_session_resume_admission(&resume_claim.hello_message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_resume.status, DurableWorkStatus::Handled);
+    assert_eq!(
+        stored_resume.reconciliation_request_id,
+        Some(RequestId::from("owner-reconciliation"))
+    );
 }
 
 #[tokio::test]

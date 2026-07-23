@@ -1,8 +1,8 @@
 use sinan_execution::{
     build_execution, decide_recovery, project_leg, project_plan, transition_command,
-    validate_command_state, CommandEvidence, CommandTransitionError, ExecutionBuildError,
-    ExecutionBuildOutcome, ExecutionBuildRequest, ProjectionError, RecoveryDecision,
-    ResolvedLegExecution,
+    validate_command_state, CommandEvidence, CommandTransitionError, CommandTransitionOutcome,
+    ExecutionBuildError, ExecutionBuildOutcome, ExecutionBuildRequest, ProjectionError,
+    RecoveryDecision, ResolvedLegExecution,
 };
 use sinan_protocol::{
     verify_execution_command_hmac, CommandInboxStatus, CommandReceived, CommandSigningFormat,
@@ -60,6 +60,7 @@ fn risk_request() -> RiskRequest {
             proposed_sl: Some(90.0),
             proposed_tp: Some(120.0),
             proposed_legs: None,
+            decision_timestamp: NOW - 2_000,
             signal_expires_at: NOW + 60_000,
             requested_at: NOW - 1_000,
         },
@@ -392,7 +393,7 @@ fn command_state_advances_only_from_business_evidence() {
             &state,
             CommandEvidence::ReceivedRecorded(&regressed_duplicate)
         ),
-        Err(CommandTransitionError::InvalidTimestamp(_))
+        Err(CommandTransitionError::InvalidEvidence(_))
     ));
 
     for (index, status) in [
@@ -417,6 +418,88 @@ fn command_state_advances_only_from_business_evidence() {
     assert!(matches!(
         transition_command(command, &state, CommandEvidence::Cancel { at: NOW + 500 }),
         Err(CommandTransitionError::InvalidEvidence(_))
+    ));
+}
+
+#[test]
+fn late_command_receipt_records_evidence_without_regressing_stronger_lifecycle() {
+    let (_, _, bundle) = bundle();
+    let command = &bundle.commands[0];
+    let dispatched = transition_command(
+        command,
+        &bundle.command_states[0],
+        CommandEvidence::Dispatched { at: NOW + 200 },
+    )
+    .unwrap()
+    .into_state();
+    let reconciling = transition_command(
+        command,
+        &dispatched,
+        CommandEvidence::DeliveryUnconfirmed {
+            at: NOW + 300,
+            error: "receipt timeout",
+        },
+    )
+    .unwrap()
+    .into_state();
+    let reconciling = transition_command(
+        command,
+        &reconciling,
+        CommandEvidence::BeginReconciliation { at: NOW + 400 },
+    )
+    .unwrap()
+    .into_state();
+    let filled = transition_command(
+        command,
+        &reconciling,
+        CommandEvidence::ExecutionEvent(&event(command, ExecutionEventStatus::Filled, NOW + 600)),
+    )
+    .unwrap()
+    .into_state();
+    assert_eq!(filled.command_received_at, None);
+
+    let late = receipt(command, CommandInboxStatus::Duplicate, NOW + 250);
+    let with_receipt = transition_command(
+        command,
+        &filled,
+        CommandEvidence::ReceivedDuplicateKnownSamePayload(&late),
+    )
+    .unwrap()
+    .into_state();
+    assert_eq!(with_receipt.status, ExecutionCommandStatus::Filled);
+    assert_eq!(with_receipt.completed_at, filled.completed_at);
+    assert_eq!(with_receipt.command_received_at, Some(NOW + 250));
+    assert!(with_receipt.updated_at > filled.updated_at);
+
+    assert!(matches!(
+        transition_command(
+            command,
+            &with_receipt,
+            CommandEvidence::ReceivedDuplicateKnownSamePayload(&late),
+        ),
+        Ok(CommandTransitionOutcome::Duplicate(state)) if state == with_receipt
+    ));
+
+    let mut drifted = late;
+    drifted.received_at += 1;
+    assert!(matches!(
+        transition_command(
+            command,
+            &with_receipt,
+            CommandEvidence::ReceivedDuplicateKnownSamePayload(&drifted),
+        ),
+        Err(CommandTransitionError::InvalidEvidence(_))
+    ));
+
+    let mut wrong_account = receipt(command, CommandInboxStatus::Duplicate, NOW + 250);
+    wrong_account.account_id = AccountId::new("other-account");
+    assert!(matches!(
+        transition_command(
+            command,
+            &filled,
+            CommandEvidence::ReceivedDuplicateKnownSamePayload(&wrong_account),
+        ),
+        Err(CommandTransitionError::InvalidIdentity(_))
     ));
 }
 

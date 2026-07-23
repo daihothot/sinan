@@ -12,8 +12,14 @@ const GATEWAY_DELIVERY_DURABILITY_SQL: &str =
 const EVENT_STREAM_SEQUENCE_SQL: &str =
     include_str!("../migrations/V0006__event_stream_sequence.sql");
 const INBOUND_DURABILITY_SQL: &str = include_str!("../migrations/V0007__inbound_durability.sql");
+const RISK_WORKFLOW_INPUTS_SQL: &str =
+    include_str!("../migrations/V0008__risk_workflow_inputs.sql");
+const OUTBOUND_DELIVERY_WORK_SQL: &str =
+    include_str!("../migrations/V0009__outbound_delivery_work.sql");
+const INBOUND_RAW_PAYLOAD_LENGTH_SQL: &str =
+    include_str!("../migrations/V0010__inbound_raw_payload_length.sql");
 
-fn embedded_migrations() -> [Migration; 7] {
+fn embedded_migrations() -> [Migration; 10] {
     [
         Migration::new(1, "init", INIT_SQL),
         Migration::new(2, "state_store_schema", STATE_STORE_SQL),
@@ -30,6 +36,13 @@ fn embedded_migrations() -> [Migration; 7] {
         ),
         Migration::new(6, "event_stream_sequence", EVENT_STREAM_SEQUENCE_SQL),
         Migration::new(7, "inbound_durability", INBOUND_DURABILITY_SQL),
+        Migration::new(8, "risk_workflow_inputs", RISK_WORKFLOW_INPUTS_SQL),
+        Migration::new(9, "outbound_delivery_work", OUTBOUND_DELIVERY_WORK_SQL),
+        Migration::new(
+            10,
+            "inbound_raw_payload_length",
+            INBOUND_RAW_PAYLOAD_LENGTH_SQL,
+        ),
     ]
 }
 
@@ -58,7 +71,7 @@ async fn first_run_applies_all_embedded_migrations() {
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(rows.len(), 7);
+    assert_eq!(rows.len(), 10);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "init");
     assert_eq!(rows[0].2, Migration::new(1, "init", INIT_SQL).checksum());
@@ -115,7 +128,33 @@ async fn first_run_applies_all_embedded_migrations() {
         Migration::new(7, "inbound_durability", INBOUND_DURABILITY_SQL).checksum()
     );
     assert!(rows[6].3 > 0);
-    assert_eq!(user_version, 7);
+    assert_eq!(rows[7].0, 8);
+    assert_eq!(rows[7].1, "risk_workflow_inputs");
+    assert_eq!(
+        rows[7].2,
+        Migration::new(8, "risk_workflow_inputs", RISK_WORKFLOW_INPUTS_SQL).checksum()
+    );
+    assert!(rows[7].3 > 0);
+    assert_eq!(rows[8].0, 9);
+    assert_eq!(rows[8].1, "outbound_delivery_work");
+    assert_eq!(
+        rows[8].2,
+        Migration::new(9, "outbound_delivery_work", OUTBOUND_DELIVERY_WORK_SQL).checksum()
+    );
+    assert!(rows[8].3 > 0);
+    assert_eq!(rows[9].0, 10);
+    assert_eq!(rows[9].1, "inbound_raw_payload_length");
+    assert_eq!(
+        rows[9].2,
+        Migration::new(
+            10,
+            "inbound_raw_payload_length",
+            INBOUND_RAW_PAYLOAD_LENGTH_SQL
+        )
+        .checksum()
+    );
+    assert!(rows[9].3 > 0);
+    assert_eq!(user_version, 10);
 }
 
 #[tokio::test]
@@ -130,7 +169,7 @@ async fn repeated_run_is_idempotent() {
         .await
         .expect("migration count should be readable");
 
-    assert_eq!(count, 7);
+    assert_eq!(count, 10);
 }
 
 #[tokio::test]
@@ -156,8 +195,8 @@ async fn version_one_database_upgrades_to_latest_schema() {
         .await
         .expect("user_version should be readable");
 
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
-    assert_eq!(user_version, 7);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(user_version, 10);
 }
 
 #[tokio::test]
@@ -181,7 +220,97 @@ async fn version_two_database_upgrades_to_execution_durability_schema() {
             .fetch_all(&pool)
             .await
             .expect("migration versions should be readable");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+}
+
+#[tokio::test]
+async fn version_nine_database_adds_nullable_inbound_raw_payload_length() {
+    let pool = memory_pool().await;
+    Migrator::new(embedded_migrations()[..9].iter().copied())
+        .expect("version nine migrations should be valid")
+        .run(&pool)
+        .await
+        .expect("version nine should apply");
+    sqlx::query(
+        "INSERT INTO execution_client_sessions (\
+             session_id, client_id, account_id, platform, status, capabilities_json, connected_at, \
+             last_heartbeat_at, last_time_sync_at, clock_sync_status, updated_at\
+         ) VALUES ('session-1', 'client-1', 'account-1', 'MT5', 'ACTIVE', '[]', 10, 10, 10, \
+                   'SYNCED', 10)",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy session fixture should insert");
+    sqlx::query(
+        "INSERT INTO inbound_admissions (\
+             message_id, session_id, client_id, account_id, message_type, schema_version, \
+             sequence, envelope_json, envelope_hash, received_at, status, created_at, updated_at\
+         ) VALUES ('message-1', 'session-1', 'client-1', 'account-1', 'market.tick', \
+                   'ecp.v1.0', 1, '{}', ?, 10, 'PENDING', 10, 10)",
+    )
+    .bind("0".repeat(64))
+    .execute(&pool)
+    .await
+    .expect("legacy inbound fixture should insert");
+
+    migrate(&pool).await.expect("version ten should apply");
+
+    let raw_payload_length: Option<i64> = sqlx::query_scalar(
+        "SELECT raw_payload_length FROM inbound_admissions WHERE message_id = 'message-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("new inbound evidence column should be readable");
+    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+        .expect("user_version should be readable");
+    assert_eq!(raw_payload_length, None);
+    assert_eq!(user_version, 10);
+}
+
+#[tokio::test]
+async fn version_seven_upgrade_preserves_legacy_intents_without_forging_decision_time() {
+    let pool = memory_pool().await;
+    Migrator::new(embedded_migrations()[..7].iter().copied())
+        .expect("version seven migrations should be valid")
+        .run(&pool)
+        .await
+        .expect("version seven should apply");
+    sqlx::query(
+        "INSERT INTO trade_intents (\
+             intent_id, decision_id, strategy_id, account_id, symbol, action, status,\
+             requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
+             created_at, updated_at\
+         ) VALUES ('legacy-intent', 'decision-1', 'strategy-1', 'account-1', 'EURUSD',\
+                   'BUY', 'ACCEPTED', 10, 20, 'legacy-idem', '{}', ?, 10, 10)",
+    )
+    .bind("0".repeat(64))
+    .execute(&pool)
+    .await
+    .expect("legacy intent should insert before V8");
+
+    migrate(&pool).await.expect("V8 should apply");
+
+    let decision_timestamp: Option<i64> = sqlx::query_scalar(
+        "SELECT decision_timestamp FROM trade_intents WHERE intent_id = 'legacy-intent'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("new column should be readable");
+    assert_eq!(decision_timestamp, None);
+    assert!(sqlx::query(
+        "INSERT INTO trade_intents (\
+                 intent_id, decision_id, strategy_id, account_id, symbol, action, status,\
+                 requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash,\
+                 created_at, updated_at\
+             ) VALUES ('new-intent', 'decision-2', 'strategy-1', 'account-1', 'EURUSD',\
+                       'BUY', 'ACCEPTED', 10, 20, 'new-idem', '{}', ?, 10, 10)",
+    )
+    .bind("0".repeat(64))
+    .execute(&pool)
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -454,7 +583,7 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
         .expect("initial migration should succeed");
     sqlx::query(
         "INSERT INTO schema_migrations (version, name, checksum, applied_at) \
-         VALUES (8, 'unknown', 'unknown', 1)",
+         VALUES (11, 'unknown', 'unknown', 1)",
     )
     .execute(&pool)
     .await
@@ -467,8 +596,8 @@ async fn database_versions_newer_than_the_binary_are_rejected() {
     assert!(matches!(
         error,
         MigrationError::DatabaseAhead {
-            applied: 8,
-            available: 7
+            applied: 11,
+            available: 10
         }
     ));
 }
@@ -491,7 +620,7 @@ async fn lower_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 7,
+            expected: 10,
             actual: 0
         }
     ));
@@ -503,7 +632,7 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     migrate(&pool)
         .await
         .expect("initial migration should succeed");
-    sqlx::query("PRAGMA user_version = 8")
+    sqlx::query("PRAGMA user_version = 11")
         .execute(&pool)
         .await
         .expect("test fixture should raise user_version");
@@ -515,8 +644,8 @@ async fn higher_user_version_than_migration_ledger_is_rejected() {
     assert!(matches!(
         error,
         MigrationError::UserVersionMismatch {
-            expected: 7,
-            actual: 8
+            expected: 10,
+            actual: 11
         }
     ));
 }
@@ -535,8 +664,11 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         embedded_migrations()[4],
         embedded_migrations()[5],
         embedded_migrations()[6],
+        embedded_migrations()[7],
+        embedded_migrations()[8],
+        embedded_migrations()[9],
         Migration::new(
-            8,
+            11,
             "broken",
             "CREATE TABLE rollback_probe (id INTEGER PRIMARY KEY);\
              INSERT INTO missing_table DEFAULT VALUES;",
@@ -568,8 +700,8 @@ async fn failed_migration_rolls_back_ddl_ledger_and_user_version() {
         .expect("user_version should be readable");
 
     assert!(!probe_exists);
-    assert_eq!(migration_count, 7);
-    assert_eq!(user_version, 7);
+    assert_eq!(migration_count, 10);
+    assert_eq!(user_version, 10);
 }
 
 #[test]

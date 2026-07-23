@@ -56,6 +56,7 @@ struct StrictTradeIntent {
     proposed_sl: Option<f64>,
     proposed_tp: Option<f64>,
     proposed_legs: Option<Vec<StrictTradeIntentLeg>>,
+    decision_timestamp: i64,
     signal_expires_at: i64,
     requested_at: i64,
 }
@@ -80,6 +81,7 @@ impl From<StrictTradeIntent> for TradeIntent {
             proposed_legs: value
                 .proposed_legs
                 .map(|legs| legs.into_iter().map(Into::into).collect()),
+            decision_timestamp: value.decision_timestamp,
             signal_expires_at: value.signal_expires_at,
             requested_at: value.requested_at,
         }

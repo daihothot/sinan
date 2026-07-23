@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sinan_types::{
     AccountId, AccountSnapshot, DecisionId, ExecutionCommand, ExecutionCommandState, LegId,
-    MarketSnapshot, OrderSnapshot, PositionSnapshot, RequestId, RiskId, StrategyId, SymbolCode,
-    SymbolMetadataSnapshot, TimeframeCode, TradeIntent, TradeIntentAction,
+    MarketSnapshot, OrderSnapshot, PositionSnapshot, RequestId, RiskCapacity, RiskId, StrategyId,
+    SymbolCode, SymbolMetadataSnapshot, TimeframeCode, TradeIntent, TradeIntentAction,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -85,18 +85,6 @@ pub struct RiskStateWatermarks {
     pub positions_observed_at: i64,
     pub orders_observed_at: i64,
     pub pending_commands_reconciled_at: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RiskCapacity {
-    pub account_id: AccountId,
-    pub strategy_id: StrategyId,
-    pub observed_at: i64,
-    pub daily_realized_loss_pct: f64,
-    pub equity_drawdown_pct: f64,
-    pub remaining_account_risk_pct: f64,
-    pub remaining_portfolio_risk_pct: f64,
-    pub remaining_strategy_legs: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

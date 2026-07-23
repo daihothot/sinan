@@ -62,10 +62,10 @@ async fn seed_execution_parent(pool: &SqlitePool) {
     sqlx::query(
         "INSERT OR IGNORE INTO trade_intents (\
              intent_id, decision_id, strategy_id, account_id, symbol, action, status, \
-             requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash, \
-             created_at, updated_at\
+             decision_timestamp, requested_at, signal_expires_at, idempotency_key, payload_json, \
+             payload_hash, created_at, updated_at\
          ) VALUES ('intent-1', 'decision-1', 'strategy-1', 'account-1', 'EURUSD', 'BUY', \
-                   'ACCEPTED', 1, 100000, 'intent-idem-1', '{}', ?, 1, 1)",
+                   'ACCEPTED', 0, 1, 100000, 'intent-idem-1', '{}', ?, 1, 1)",
     )
     .bind(HASH)
     .execute(pool)

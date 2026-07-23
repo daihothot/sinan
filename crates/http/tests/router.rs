@@ -191,6 +191,7 @@ fn intent_body() -> Value {
                 "action": "BUY",
                 "ratio": 1.0
             }],
+            "decision_timestamp": 1_799_999_999_000_i64,
             "signal_expires_at": 1_900_000_000_000_i64,
             "requested_at": 1_800_000_000_000_i64
         }
@@ -312,7 +313,7 @@ async fn request_id_and_idempotency_headers_are_enforced() {
 }
 
 #[tokio::test]
-async fn strict_json_rejects_unknown_wrapper_and_leg_fields() {
+async fn strict_json_rejects_missing_decision_time_and_unknown_fields() {
     let ports = Arc::new(MockPorts::new());
     let router = app(ports.clone(), [ControlPlaneScope::WriteIntent]);
 
@@ -324,6 +325,20 @@ async fn strict_json_rejects_unknown_wrapper_and_leg_fields() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let mut missing_decision_time = intent_body();
+    missing_decision_time["intent"]
+        .as_object_mut()
+        .unwrap()
+        .remove("decision_timestamp");
+    let response = router
+        .clone()
+        .oneshot(post_intent(missing_decision_time))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: HttpErrorResponse = serde_json::from_value(json_body(response).await).unwrap();
+    assert_eq!(error.error_code, ErrorCode::SchemaValidationFailed);
 
     let mut leg_unknown = intent_body();
     leg_unknown["intent"]["proposed_legs"][0]["unknown"] = json!(true);

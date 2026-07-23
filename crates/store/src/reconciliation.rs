@@ -12,7 +12,7 @@ use sinan_types::{
 use sqlx::{Row, SqliteConnection};
 
 use crate::{
-    connection::SqliteStateStore,
+    connection::{SqliteStateStore, WriteTransaction},
     json::CanonicalJson,
     model::{CoreEventMetadata, NewCoreEvent, StoredCoreEvent, WriteOutcome},
     projection::{
@@ -136,109 +136,8 @@ impl SqliteStateStore {
         &self,
         new_run: NewReconciliationRun,
     ) -> Result<WriteOutcome<StoredReconciliationRun>, StoreError> {
-        validate_request(&new_run.request, new_run.requested_at)?;
-        validate_event_metadata(
-            &new_run.event_metadata,
-            REQUEST_EVENT_TYPE,
-            &new_run.request.request_id,
-            &new_run.request.account_id,
-            new_run
-                .request
-                .terminal_id
-                .as_ref()
-                .map(|value| value.as_str()),
-            new_run
-                .request
-                .client_id
-                .as_ref()
-                .map(|value| value.as_str()),
-            new_run.requested_at,
-        )?;
-        let request_payload = CanonicalJson::from_serializable(&new_run.request)?;
-        let command_ids = new_run
-            .request
-            .command_ids
-            .as_ref()
-            .map(CanonicalJson::from_serializable)
-            .transpose()?;
-
         let mut transaction = self.begin_write().await?;
-        let result = async {
-            let event_outcome = append_core_event_on(
-                transaction.connection(),
-                NewCoreEvent {
-                    metadata: new_run.event_metadata.clone(),
-                    payload: request_payload.clone(),
-                },
-            )
-            .await?;
-
-            let insert = sqlx::query(
-                "INSERT INTO reconciliation_runs (\
-                    request_id, request_event_id, account_id, terminal_id, client_id, reason, \
-                    scope, command_ids_json, command_ids_hash, since_server_time, requested_at, \
-                    status, request_payload_json, request_payload_hash, created_at, updated_at\
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'REQUESTED', ?, ?, ?, ?) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(new_run.request.request_id.as_str())
-            .bind(&new_run.event_metadata.event_id)
-            .bind(new_run.request.account_id.as_str())
-            .bind(
-                new_run
-                    .request
-                    .terminal_id
-                    .as_ref()
-                    .map(|value| value.as_str()),
-            )
-            .bind(
-                new_run
-                    .request
-                    .client_id
-                    .as_ref()
-                    .map(|value| value.as_str()),
-            )
-            .bind(reason_name(new_run.request.reason)?)
-            .bind(if command_ids.is_some() {
-                "TARGETED"
-            } else {
-                "ACCOUNT"
-            })
-            .bind(command_ids.as_ref().map(CanonicalJson::as_str))
-            .bind(command_ids.as_ref().map(CanonicalJson::sha256_hex))
-            .bind(new_run.request.since_server_time)
-            .bind(new_run.requested_at)
-            .bind(request_payload.as_str())
-            .bind(request_payload.sha256_hex())
-            .bind(new_run.event_metadata.created_at)
-            .bind(new_run.event_metadata.created_at)
-            .execute(transaction.connection())
-            .await?;
-
-            let stored =
-                fetch_reconciliation_run_on(transaction.connection(), &new_run.request.request_id)
-                    .await?
-                    .ok_or_else(|| StoreError::NotFound {
-                        entity: "reconciliation_run",
-                        key: new_run.request.request_id.to_string(),
-                    })?;
-
-            if insert.rows_affected() == 1 && event_outcome.was_inserted() {
-                Ok(WriteOutcome::Inserted(stored))
-            } else if insert.rows_affected() == 0
-                && !event_outcome.was_inserted()
-                && same_request_run(&stored, &new_run)
-            {
-                Ok(WriteOutcome::Duplicate(stored))
-            } else {
-                Err(StoreError::conflict(
-                    "reconciliation_run",
-                    new_run.request.request_id.to_string(),
-                ))
-            }
-        }
-        .await;
-
+        let result = create_reconciliation_run_on(transaction.connection(), new_run).await;
         finish_write(transaction, result).await
     }
 
@@ -288,6 +187,29 @@ impl SqliteStateStore {
     }
 }
 
+impl WriteTransaction {
+    pub async fn create_reconciliation_run(
+        &mut self,
+        new_run: NewReconciliationRun,
+    ) -> Result<WriteOutcome<StoredReconciliationRun>, StoreError> {
+        create_reconciliation_run_on(self.connection(), new_run).await
+    }
+
+    pub async fn get_reconciliation_run(
+        &mut self,
+        request_id: &RequestId,
+    ) -> Result<Option<StoredReconciliationRun>, StoreError> {
+        fetch_reconciliation_run_on(self.connection(), request_id).await
+    }
+
+    pub async fn commit_reconciliation_result(
+        &mut self,
+        new_result: NewReconciliationResult,
+    ) -> Result<WriteOutcome<StoredReconciliationRun>, StoreError> {
+        commit_reconciliation_result_on(self.connection(), new_result).await
+    }
+}
+
 async fn finish_write<T>(
     transaction: crate::WriteTransaction,
     result: Result<T, StoreError>,
@@ -301,6 +223,109 @@ async fn finish_write<T>(
             let _ = transaction.rollback().await;
             Err(error)
         }
+    }
+}
+
+async fn create_reconciliation_run_on(
+    connection: &mut SqliteConnection,
+    new_run: NewReconciliationRun,
+) -> Result<WriteOutcome<StoredReconciliationRun>, StoreError> {
+    validate_request(&new_run.request, new_run.requested_at)?;
+    validate_event_metadata(
+        &new_run.event_metadata,
+        REQUEST_EVENT_TYPE,
+        &new_run.request.request_id,
+        &new_run.request.account_id,
+        new_run
+            .request
+            .terminal_id
+            .as_ref()
+            .map(|value| value.as_str()),
+        new_run
+            .request
+            .client_id
+            .as_ref()
+            .map(|value| value.as_str()),
+        new_run.requested_at,
+    )?;
+    let request_payload = CanonicalJson::from_serializable(&new_run.request)?;
+    let command_ids = new_run
+        .request
+        .command_ids
+        .as_ref()
+        .map(CanonicalJson::from_serializable)
+        .transpose()?;
+
+    let event_outcome = append_core_event_on(
+        connection,
+        NewCoreEvent {
+            metadata: new_run.event_metadata.clone(),
+            payload: request_payload.clone(),
+        },
+    )
+    .await?;
+
+    let insert = sqlx::query(
+        "INSERT INTO reconciliation_runs (\
+            request_id, request_event_id, account_id, terminal_id, client_id, reason, \
+            scope, command_ids_json, command_ids_hash, since_server_time, requested_at, \
+            status, request_payload_json, request_payload_hash, created_at, updated_at\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'REQUESTED', ?, ?, ?, ?) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(new_run.request.request_id.as_str())
+    .bind(&new_run.event_metadata.event_id)
+    .bind(new_run.request.account_id.as_str())
+    .bind(
+        new_run
+            .request
+            .terminal_id
+            .as_ref()
+            .map(|value| value.as_str()),
+    )
+    .bind(
+        new_run
+            .request
+            .client_id
+            .as_ref()
+            .map(|value| value.as_str()),
+    )
+    .bind(reason_name(new_run.request.reason)?)
+    .bind(if command_ids.is_some() {
+        "TARGETED"
+    } else {
+        "ACCOUNT"
+    })
+    .bind(command_ids.as_ref().map(CanonicalJson::as_str))
+    .bind(command_ids.as_ref().map(CanonicalJson::sha256_hex))
+    .bind(new_run.request.since_server_time)
+    .bind(new_run.requested_at)
+    .bind(request_payload.as_str())
+    .bind(request_payload.sha256_hex())
+    .bind(new_run.event_metadata.created_at)
+    .bind(new_run.event_metadata.created_at)
+    .execute(&mut *connection)
+    .await?;
+
+    let stored = fetch_reconciliation_run_on(connection, &new_run.request.request_id)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "reconciliation_run",
+            key: new_run.request.request_id.to_string(),
+        })?;
+
+    if insert.rows_affected() == 1 && event_outcome.was_inserted() {
+        Ok(WriteOutcome::Inserted(stored))
+    } else if insert.rows_affected() == 0
+        && !event_outcome.was_inserted()
+        && same_request_run(&stored, &new_run)
+    {
+        Ok(WriteOutcome::Duplicate(stored))
+    } else {
+        Err(StoreError::conflict(
+            "reconciliation_run",
+            new_run.request.request_id.to_string(),
+        ))
     }
 }
 
@@ -476,7 +501,7 @@ async fn escalate_reconciliation_manual_on(
     Ok(WriteOutcome::Inserted(stored))
 }
 
-async fn fetch_reconciliation_run_on(
+pub(crate) async fn fetch_reconciliation_run_on(
     connection: &mut SqliteConnection,
     request_id: &RequestId,
 ) -> Result<Option<StoredReconciliationRun>, StoreError> {
@@ -674,7 +699,7 @@ async fn fetch_reconciliation_run_on(
     }))
 }
 
-async fn fetch_checkpoint_on(
+pub(crate) async fn fetch_checkpoint_on(
     connection: &mut SqliteConnection,
     account_id: &AccountId,
 ) -> Result<Option<AccountReconciliationCheckpoint>, StoreError> {

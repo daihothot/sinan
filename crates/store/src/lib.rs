@@ -10,9 +10,13 @@ mod gateway_delivery;
 mod inbound_durability;
 mod json;
 mod model;
+mod outbound_work;
 mod projection;
 mod reconciliation;
 mod repository;
+mod risk_capacity;
+mod risk_snapshot;
+mod transaction_snapshot;
 mod transport_events;
 
 pub use connection::*;
@@ -22,8 +26,12 @@ pub use event_stream::*;
 pub use inbound_durability::*;
 pub use json::*;
 pub use model::*;
+pub use outbound_work::*;
 pub use projection::*;
 pub use reconciliation::*;
+pub use risk_capacity::*;
+pub use risk_snapshot::*;
+pub use transaction_snapshot::*;
 pub use transport_events::*;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,6 +73,21 @@ const EMBEDDED_MIGRATIONS: &[Migration] = &[
         7,
         "inbound_durability",
         include_str!("../migrations/V0007__inbound_durability.sql"),
+    ),
+    Migration::new(
+        8,
+        "risk_workflow_inputs",
+        include_str!("../migrations/V0008__risk_workflow_inputs.sql"),
+    ),
+    Migration::new(
+        9,
+        "outbound_delivery_work",
+        include_str!("../migrations/V0009__outbound_delivery_work.sql"),
+    ),
+    Migration::new(
+        10,
+        "inbound_raw_payload_length",
+        include_str!("../migrations/V0010__inbound_raw_payload_length.sql"),
     ),
 ];
 

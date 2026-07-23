@@ -68,6 +68,9 @@ pub struct DeliveryUncertainty {
     pub message_id: MessageId,
     pub session_id: Option<SessionId>,
     pub sequence: Option<u64>,
+    /// Durable lower bound for when transport writing began. This remains
+    /// before command expiry even when uncertainty is observed later.
+    pub write_started_at: i64,
     pub observed_at: i64,
     pub error: String,
 }
@@ -167,6 +170,7 @@ mod tests {
             message_id,
             session_id: Some(session_id),
             sequence: Some(2),
+            write_started_at: 9,
             observed_at: 10,
             error: "connection closed after write started".to_owned(),
         });

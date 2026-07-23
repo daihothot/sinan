@@ -6,6 +6,7 @@
         "arrayvec",
         "atoi",
         "autocfg",
+        "Backpressure",
         "Backtest",
         "bindgen",
         "bitflags",

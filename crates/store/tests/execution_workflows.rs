@@ -1,18 +1,23 @@
 mod common;
 
 use common::test_store;
+use sinan_protocol::{ReconciliationReason, ReconciliationRequest};
 use sinan_store::{
-    ExecutionLifecycleUpdate, LegStateUpdate, NewExecutionCommand, NewExecutionPlan,
-    NewExecutionWorkflow, NewRiskResult, NewTradeIntent, PlanStateUpdate, StoreError, WriteOutcome,
+    CanonicalJson, CoreEventMetadata, DeliverySubject, ExecutionLifecycleUpdate, LegStateUpdate,
+    NewDeliveryAttempt, NewExecutionCommand, NewExecutionPlan, NewExecutionWorkflow,
+    NewReconciliationRun, NewRiskResult, NewSessionRecord, NewTradeIntent, PlanStateUpdate,
+    StoreError, WriteOutcome,
 };
 use sinan_types::{
-    single_leg_id, AccountId, AdjustedRiskLeg, AdjustedRiskLegAction, CommandId, CorrelationId,
-    DecisionId, ErrorCodeOrString, ExecutionAction, ExecutionCommand, ExecutionCommandState,
-    ExecutionCommandStatus, ExecutionFailurePolicy, ExecutionLeg, ExecutionLegDefinition,
-    ExecutionLegState, ExecutionLegStatus, ExecutionPlan, ExecutionPlanDefinition,
-    ExecutionPlanMode, ExecutionPlanState, ExecutionPlanStatus, FillingPolicy, IdempotencyKey,
-    IntentId, OrderType, PlanId, RiskId, RiskResult, SizingCandidateProvenance, StrategyId,
-    SymbolCode, TimePolicy, TimeframeCode, TradeIntent, TradeIntentAction, TradeIntentStatus,
+    single_leg_id, AccountId, AdjustedRiskLeg, AdjustedRiskLegAction, ClientId, ClockSyncStatus,
+    CommandDeliveryAttemptStatus, CommandId, CorrelationId, DecisionId, ErrorCodeOrString,
+    ExecutionAction, ExecutionCommand, ExecutionCommandState, ExecutionCommandStatus,
+    ExecutionFailurePolicy, ExecutionLeg, ExecutionLegDefinition, ExecutionLegState,
+    ExecutionLegStatus, ExecutionPlan, ExecutionPlanDefinition, ExecutionPlanMode,
+    ExecutionPlanState, ExecutionPlanStatus, FillingPolicy, IdempotencyKey, IntentId, OrderType,
+    PlanId, RequestId, RiskId, RiskResult, SessionId, SessionStatus, SizingCandidateProvenance,
+    StrategyId, SymbolCode, TerminalId, TimePolicy, TimeframeCode, TradeIntent, TradeIntentAction,
+    TradeIntentStatus,
 };
 
 const INTENT_RECORDED_AT: i64 = 1_010;
@@ -43,6 +48,7 @@ fn workflow() -> NewExecutionWorkflow {
         proposed_sl: Some(2_320.5),
         proposed_tp: Some(2_365.5),
         proposed_legs: None,
+        decision_timestamp: 900,
         signal_expires_at: 5_000,
         requested_at: 1_000,
     };
@@ -184,6 +190,88 @@ fn workflow() -> NewExecutionWorkflow {
             created_at: CREATED_AT,
         }],
         command_states: vec![state],
+    }
+}
+
+fn reconciliation_run(
+    request_id: &str,
+    command_ids: Option<Vec<CommandId>>,
+) -> NewReconciliationRun {
+    let request_id = RequestId::from(request_id);
+    let account_id = AccountId::from("account_1");
+    let client_id = ClientId::from("client_1");
+    let terminal_id = TerminalId::from("terminal_1");
+    NewReconciliationRun {
+        request: ReconciliationRequest {
+            request_id: request_id.clone(),
+            account_id: account_id.clone(),
+            terminal_id: Some(terminal_id.clone()),
+            client_id: Some(client_id.clone()),
+            reason: ReconciliationReason::ConnectionRestored,
+            command_ids,
+            since_server_time: None,
+        },
+        requested_at: CREATED_AT + 100,
+        event_metadata: CoreEventMetadata {
+            event_id: format!("event-{request_id}"),
+            event_type: "reconciliation.request".to_owned(),
+            aggregate_type: "reconciliation".to_owned(),
+            aggregate_id: request_id.to_string(),
+            message_id: None,
+            schema_version: "ecp.v1.0".to_owned(),
+            correlation_id: None,
+            causation_id: None,
+            account_id: Some(account_id),
+            client_id: Some(client_id),
+            terminal_id: Some(terminal_id),
+            strategy_id: None,
+            intent_id: None,
+            plan_id: None,
+            leg_id: None,
+            command_id: None,
+            idempotency_key: None,
+            event_at: CREATED_AT + 100,
+            received_at: CREATED_AT + 100,
+            created_at: CREATED_AT + 100,
+            source: "transaction-snapshot-test".to_owned(),
+        },
+    }
+}
+
+fn session(session_id: &str, client_id: &str, terminal_id: &str) -> NewSessionRecord {
+    NewSessionRecord {
+        session_id: SessionId::from(session_id),
+        client_id: ClientId::from(client_id),
+        account_id: AccountId::from("account_1"),
+        terminal_id: Some(TerminalId::from(terminal_id)),
+        platform: "MT5".to_owned(),
+        status: SessionStatus::Active,
+        capabilities: CanonicalJson::from_value(serde_json::json!([])).unwrap(),
+        remote_addr: None,
+        connected_at: CREATED_AT + 10,
+        last_heartbeat_at: Some(CREATED_AT + 10),
+        last_time_sync_at: Some(CREATED_AT + 10),
+        clock_sync_status: Some(ClockSyncStatus::Synced),
+        disconnected_at: None,
+        max_inflight_commands: 1,
+        updated_at: CREATED_AT + 10,
+    }
+}
+
+fn delivery_attempt(attempt_id: &str, session_id: &str) -> NewDeliveryAttempt {
+    NewDeliveryAttempt {
+        attempt_id: attempt_id.to_owned(),
+        subject: DeliverySubject::ExecutionCommand(CommandId::from("command_1")),
+        session_id: Some(SessionId::from(session_id)),
+        message_id: None,
+        request_payload: Some(
+            CanonicalJson::from_value(serde_json::json!({"command_id": "command_1"})).unwrap(),
+        ),
+        status: CommandDeliveryAttemptStatus::Backpressure,
+        attempted_at: CREATED_AT + 20,
+        acked_at: None,
+        error: Some("BACKPRESSURE".to_owned()),
+        updated_at: CREATED_AT + 20,
     }
 }
 
@@ -670,4 +758,116 @@ async fn typed_plan_read_detects_parent_identity_tampering() {
         store.get_execution_plan(&plan_id).await,
         Err(StoreError::CorruptData { .. })
     ));
+}
+
+#[tokio::test]
+async fn reconciliation_snapshot_includes_command_with_explicit_route() {
+    let (_database, store, _pool) = test_store().await;
+    let mut input = workflow();
+    input.commands[0].command.client_id = Some(ClientId::from("client_1"));
+    input.commands[0].command.terminal_id = Some(TerminalId::from("terminal_1"));
+    store.commit_execution_workflow(input).await.unwrap();
+    let request_id = RequestId::from("explicit-route");
+    store
+        .create_reconciliation_run(reconciliation_run(request_id.as_str(), None))
+        .await
+        .unwrap();
+
+    let mut transaction = store.begin_write().await.unwrap();
+    let snapshot = transaction
+        .load_reconciliation_evaluation_snapshot(&request_id)
+        .await
+        .unwrap()
+        .unwrap();
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(snapshot.commands.len(), 1);
+    assert_eq!(
+        snapshot.commands[0].command.command.command_id,
+        CommandId::from("command_1")
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_snapshot_accepts_matching_delivery_session_as_route_proof() {
+    let (_database, store, _pool) = test_store().await;
+    store.commit_execution_workflow(workflow()).await.unwrap();
+    store
+        .replace_active_session(session("matching-session", "client_1", "terminal_1"))
+        .await
+        .unwrap();
+    store
+        .record_delivery_attempt(delivery_attempt("matching-attempt", "matching-session"))
+        .await
+        .unwrap();
+    let request_id = RequestId::from("delivery-route");
+    store
+        .create_reconciliation_run(reconciliation_run(request_id.as_str(), None))
+        .await
+        .unwrap();
+
+    let mut transaction = store.begin_write().await.unwrap();
+    let snapshot = transaction
+        .load_reconciliation_evaluation_snapshot(&request_id)
+        .await
+        .unwrap()
+        .unwrap();
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(snapshot.commands.len(), 1);
+    assert_eq!(
+        snapshot.commands[0].command.command.command_id,
+        CommandId::from("command_1")
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_snapshot_rejects_delivery_proof_from_another_route() {
+    let (_database, store, _pool) = test_store().await;
+    store.commit_execution_workflow(workflow()).await.unwrap();
+    store
+        .replace_active_session(session("other-session", "client_2", "terminal_2"))
+        .await
+        .unwrap();
+    store
+        .record_delivery_attempt(delivery_attempt("other-attempt", "other-session"))
+        .await
+        .unwrap();
+    let request_id = RequestId::from("other-delivery-route");
+    store
+        .create_reconciliation_run(reconciliation_run(request_id.as_str(), None))
+        .await
+        .unwrap();
+
+    let mut transaction = store.begin_write().await.unwrap();
+    let snapshot = transaction
+        .load_reconciliation_evaluation_snapshot(&request_id)
+        .await
+        .unwrap()
+        .unwrap();
+    transaction.rollback().await.unwrap();
+
+    assert!(snapshot.commands.is_empty());
+}
+
+#[tokio::test]
+async fn reconciliation_snapshot_fails_closed_for_unknown_targeted_command() {
+    let (_database, store, _pool) = test_store().await;
+    let request_id = RequestId::from("unknown-target");
+    store
+        .create_reconciliation_run(reconciliation_run(
+            request_id.as_str(),
+            Some(vec![CommandId::from("missing-command")]),
+        ))
+        .await
+        .unwrap();
+
+    let mut transaction = store.begin_write().await.unwrap();
+    assert!(matches!(
+        transaction
+            .load_reconciliation_evaluation_snapshot(&request_id)
+            .await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    transaction.rollback().await.unwrap();
 }

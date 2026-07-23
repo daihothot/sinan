@@ -372,6 +372,7 @@ fn validate_request_identity(request: &RiskRequest) -> EvaluationResult<()> {
         || !same_float(decision.proposed_risk_pct, intent.proposed_risk_pct)
         || !same_optional_float(decision.proposed_sl, intent.proposed_sl)
         || !same_optional_float(decision.proposed_tp, intent.proposed_tp)
+        || decision.timestamp != intent.decision_timestamp
         || decision.signal_expires_at != intent.signal_expires_at
     {
         return invalid("StrategyDecision and TradeIntent identity or risk fields do not match");
@@ -464,8 +465,9 @@ fn validate_control_time(request: &RiskRequest) -> EvaluationResult<()> {
         return invalid("max_approval_ttl_ms must be greater than zero");
     }
     if decision.timestamp < 0
+        || intent.decision_timestamp < 0
         || intent.requested_at < 0
-        || decision.timestamp > intent.requested_at
+        || intent.decision_timestamp > intent.requested_at
         || intent.requested_at > request.evaluated_at
         || intent.signal_expires_at <= intent.requested_at
     {

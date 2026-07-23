@@ -257,6 +257,59 @@ async fn request_is_canonical_atomic_idempotent_and_transport_neutral() {
 }
 
 #[tokio::test]
+async fn transaction_owned_reconciliation_run_follows_owner_commit_or_rollback() {
+    let (_database, store, raw) = test_store().await;
+
+    let mut rolled_back = store.begin_write().await.unwrap();
+    assert!(matches!(
+        rolled_back
+            .create_reconciliation_run(new_run("run-owner-rollback", None))
+            .await
+            .unwrap(),
+        WriteOutcome::Inserted(_)
+    ));
+    assert!(rolled_back
+        .get_reconciliation_run(&RequestId::from("run-owner-rollback"))
+        .await
+        .unwrap()
+        .is_some());
+    rolled_back.rollback().await.unwrap();
+
+    assert!(store
+        .get_reconciliation_run(&RequestId::from("run-owner-rollback"))
+        .await
+        .unwrap()
+        .is_none());
+    let rolled_back_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM core_events WHERE aggregate_id = 'run-owner-rollback'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert_eq!(rolled_back_events, 0);
+
+    let mut committed = store.begin_write().await.unwrap();
+    committed
+        .create_reconciliation_run(new_run("run-owner-commit", None))
+        .await
+        .unwrap();
+    committed.commit().await.unwrap();
+
+    assert!(store
+        .get_reconciliation_run(&RequestId::from("run-owner-commit"))
+        .await
+        .unwrap()
+        .is_some());
+    let committed_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM core_events WHERE aggregate_id = 'run-owner-commit'",
+    )
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert_eq!(committed_events, 1);
+}
+
+#[tokio::test]
 async fn request_and_event_time_boundaries_fail_before_writing() {
     let (_database, store, raw) = test_store().await;
     let mut unsorted = new_run("run-unsorted", Some(vec!["cmd-b", "cmd-a"]));

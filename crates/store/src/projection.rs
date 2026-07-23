@@ -11,7 +11,7 @@ use sinan_types::{
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, SqliteConnection};
 
 use crate::{
-    connection::SqliteStateStore,
+    connection::{SqliteStateStore, WriteTransaction},
     error::StoreError,
     json::CanonicalJson,
     model::{CoreEventMetadata, NewCoreEvent, WriteOutcome},
@@ -377,6 +377,112 @@ impl SqliteStateStore {
                 Err(error)
             }
         }
+    }
+}
+
+impl WriteTransaction {
+    pub async fn ingest_account_snapshot(
+        &mut self,
+        metadata: CoreEventMetadata,
+        snapshot: &AccountSnapshot,
+    ) -> Result<ProjectionWriteOutcome, StoreError> {
+        self.ingest_durable(metadata, DurableProjection::Account(snapshot))
+            .await
+    }
+
+    pub async fn ingest_symbol_metadata(
+        &mut self,
+        metadata: CoreEventMetadata,
+        snapshot: &SymbolMetadataSnapshot,
+    ) -> Result<ProjectionWriteOutcome, StoreError> {
+        self.ingest_durable(metadata, DurableProjection::Symbol(snapshot))
+            .await
+    }
+
+    pub async fn ingest_position_snapshot(
+        &mut self,
+        metadata: CoreEventMetadata,
+        snapshot: &PositionSnapshot,
+    ) -> Result<ProjectionWriteOutcome, StoreError> {
+        self.ingest_durable(metadata, DurableProjection::Position(snapshot))
+            .await
+    }
+
+    pub async fn ingest_order_snapshot(
+        &mut self,
+        metadata: CoreEventMetadata,
+        snapshot: &OrderSnapshot,
+    ) -> Result<ProjectionWriteOutcome, StoreError> {
+        self.ingest_durable(metadata, DurableProjection::Order(snapshot))
+            .await
+    }
+
+    pub async fn ingest_market_bar(
+        &mut self,
+        metadata: CoreEventMetadata,
+        bar: &MarketBar,
+    ) -> Result<ProjectionWriteOutcome, StoreError> {
+        self.ingest_durable(metadata, DurableProjection::MarketBar(bar))
+            .await
+    }
+
+    /// Updates the latest-only market projection inside the caller-owned transaction.
+    pub async fn update_market_snapshot(
+        &mut self,
+        account_id: &AccountId,
+        snapshot: &MarketSnapshot,
+        updated_at: i64,
+    ) -> Result<ProjectionWriteOutcome, StoreError> {
+        let payload = CanonicalJson::from_serializable(snapshot)?;
+        let decision = apply_market_snapshot(
+            self.connection(),
+            account_id,
+            snapshot,
+            &payload,
+            updated_at,
+        )
+        .await?;
+        Ok(match decision {
+            ApplyDecision::Applied => ProjectionWriteOutcome::Applied,
+            ApplyDecision::IgnoredOlder => ProjectionWriteOutcome::ProjectionIgnored,
+            ApplyDecision::Unchanged => ProjectionWriteOutcome::ProjectionUnchanged,
+        })
+    }
+
+    async fn ingest_durable(
+        &mut self,
+        metadata: CoreEventMetadata,
+        projection: DurableProjection<'_>,
+    ) -> Result<ProjectionWriteOutcome, StoreError> {
+        projection.validate_identity(&metadata)?;
+        let payload = projection.canonical_json()?;
+        let append = append_core_event_on(
+            self.connection(),
+            NewCoreEvent {
+                metadata: metadata.clone(),
+                payload: payload.clone(),
+            },
+        )
+        .await?;
+        let fact_was_duplicate = matches!(append, WriteOutcome::Duplicate(_));
+        let fact = append.into_record();
+
+        if let Some(account_id) = projection.full_set_consistency_account_id() {
+            validate_account_durable_snapshot_full_set_consistency(self.connection(), account_id)
+                .await?;
+        }
+
+        let projection = projection
+            .apply(self.connection(), &fact.metadata, &fact.payload)
+            .await?;
+        if fact_was_duplicate {
+            return Ok(ProjectionWriteOutcome::Duplicate);
+        }
+        Ok(match projection {
+            ApplyDecision::Applied => ProjectionWriteOutcome::Applied,
+            ApplyDecision::IgnoredOlder => ProjectionWriteOutcome::FactAppendedProjectionIgnored,
+            ApplyDecision::Unchanged => ProjectionWriteOutcome::FactAppendedProjectionUnchanged,
+        })
     }
 }
 

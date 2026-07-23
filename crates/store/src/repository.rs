@@ -48,6 +48,7 @@ pub(crate) const RISK_RESULT_COLUMNS: &str =
     r.payload_hash, i.intent_id AS parent_intent_id, i.decision_id AS intent_decision_id, \
     i.strategy_id AS intent_strategy_id, i.account_id AS intent_account_id, \
     i.symbol AS intent_symbol, i.action AS intent_action, i.status AS intent_status, \
+    i.decision_timestamp AS intent_decision_timestamp, \
     i.requested_at AS intent_requested_at, i.signal_expires_at AS intent_signal_expires_at, \
     i.idempotency_key AS intent_idempotency_key, i.payload_json AS intent_payload_json, \
     i.payload_hash AS intent_payload_hash, i.created_at AS intent_created_at, \
@@ -435,6 +436,13 @@ impl WriteTransaction {
         insert_execution_command_on(self.connection(), command).await
     }
 
+    pub async fn get_execution_command(
+        &mut self,
+        command_id: &CommandId,
+    ) -> Result<Option<StoredExecutionCommand>, StoreError> {
+        fetch_execution_command_by_id(self.connection(), command_id).await
+    }
+
     pub async fn append_execution_event(
         &mut self,
         event: NewExecutionEvent,
@@ -447,6 +455,13 @@ impl WriteTransaction {
         state: ExecutionCommandState,
     ) -> Result<WriteOutcome<ExecutionCommandState>, StoreError> {
         insert_execution_command_state_on(self.connection(), state).await
+    }
+
+    pub async fn get_execution_command_state(
+        &mut self,
+        command_id: &CommandId,
+    ) -> Result<Option<ExecutionCommandState>, StoreError> {
+        fetch_execution_command_state_by_id(self.connection(), command_id).await
     }
 
     pub async fn update_execution_command_state(
@@ -1945,7 +1960,7 @@ async fn commit_execution_workflow_in_savepoint(
     })
 }
 
-async fn fetch_execution_workflow_by_plan_id(
+pub(crate) async fn fetch_execution_workflow_by_plan_id(
     connection: &mut SqliteConnection,
     plan_id: &PlanId,
 ) -> Result<Option<StoredExecutionWorkflow>, StoreError> {
@@ -2295,7 +2310,7 @@ fn validate_initial_command_state(
     Ok(())
 }
 
-fn validate_persisted_command_state(
+pub(crate) fn validate_persisted_command_state(
     state: &ExecutionCommandState,
     command: &StoredExecutionCommand,
 ) -> Result<(), String> {
@@ -2598,9 +2613,9 @@ pub(crate) async fn insert_trade_intent_on(
     let result = sqlx::query(
         "INSERT INTO trade_intents (\
             intent_id, decision_id, strategy_id, account_id, symbol, action, status, \
-            requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash, \
-            created_at, updated_at\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            decision_timestamp, requested_at, signal_expires_at, idempotency_key, payload_json, \
+            payload_hash, created_at, updated_at\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT DO NOTHING",
     )
     .bind(intent.intent_id.as_str())
@@ -2610,6 +2625,7 @@ pub(crate) async fn insert_trade_intent_on(
     .bind(intent.symbol.as_str())
     .bind(intent.action.as_str())
     .bind(new_intent.initial_status.as_str())
+    .bind(intent.decision_timestamp)
     .bind(intent.requested_at)
     .bind(intent.signal_expires_at)
     .bind(intent.idempotency_key.as_str())
@@ -2653,7 +2669,7 @@ pub(crate) async fn insert_trade_intent_on(
     }
 }
 
-async fn fetch_trade_intent_by_id<'e, E>(
+pub(crate) async fn fetch_trade_intent_by_id<'e, E>(
     executor: E,
     intent_id: &IntentId,
 ) -> Result<Option<StoredTradeIntent>, StoreError>
@@ -2662,8 +2678,8 @@ where
 {
     let row = sqlx::query(
         "SELECT intent_id, decision_id, strategy_id, account_id, symbol, action, status, \
-                requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash, \
-                created_at, updated_at \
+                decision_timestamp, requested_at, signal_expires_at, idempotency_key, \
+                payload_json, payload_hash, created_at, updated_at \
          FROM trade_intents WHERE intent_id = ?",
     )
     .bind(intent_id.as_str())
@@ -2678,8 +2694,8 @@ async fn fetch_trade_intent_conflicts(
 ) -> Result<Vec<StoredTradeIntent>, StoreError> {
     let rows = sqlx::query(
         "SELECT intent_id, decision_id, strategy_id, account_id, symbol, action, status, \
-                requested_at, signal_expires_at, idempotency_key, payload_json, payload_hash, \
-                created_at, updated_at \
+                decision_timestamp, requested_at, signal_expires_at, idempotency_key, \
+                payload_json, payload_hash, created_at, updated_at \
          FROM trade_intents WHERE intent_id = ? OR idempotency_key = ?",
     )
     .bind(intent.intent_id.as_str())
@@ -2742,6 +2758,13 @@ pub(crate) fn trade_intent_from_row(
         "action",
         &row.try_get::<String, _>("action")?,
         intent.action.as_str(),
+    )?;
+    validate_i64_column(
+        "trade_intent",
+        &key,
+        "decision_timestamp",
+        row.try_get("decision_timestamp")?,
+        intent.decision_timestamp,
     )?;
     validate_i64_column(
         "trade_intent",
@@ -3271,6 +3294,13 @@ fn trade_intent_from_risk_result_row(
     validate_i64_column(
         "trade_intent",
         &key,
+        "decision_timestamp",
+        row.try_get("intent_decision_timestamp")?,
+        intent.decision_timestamp,
+    )?;
+    validate_i64_column(
+        "trade_intent",
+        &key,
         "requested_at",
         row.try_get("intent_requested_at")?,
         intent.requested_at,
@@ -3368,7 +3398,7 @@ pub(crate) async fn insert_execution_command_on(
     }
 }
 
-async fn fetch_execution_command_by_id<'e, E>(
+pub(crate) async fn fetch_execution_command_by_id<'e, E>(
     executor: E,
     command_id: &CommandId,
 ) -> Result<Option<StoredExecutionCommand>, StoreError>
@@ -3657,7 +3687,7 @@ fn same_command_state_identity(
         && existing.created_at == proposed.created_at
 }
 
-async fn fetch_execution_command_state_by_id<'e, E>(
+pub(crate) async fn fetch_execution_command_state_by_id<'e, E>(
     executor: E,
     command_id: &CommandId,
 ) -> Result<Option<ExecutionCommandState>, StoreError>

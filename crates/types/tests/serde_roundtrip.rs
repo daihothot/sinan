@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use sinan_types::{
     single_leg_id, AccountId, AdjustedRiskLeg, AdjustedRiskLegAction, ErrorCode, ErrorCodeOrString,
     ExecutionAction, ExecutionCommand, ExecutionCommandState, ExecutionCommandStatus,
-    FillingPolicy, IdempotencyKey, IntentId, OrderType, PlanId, RiskResult,
+    FillingPolicy, IdempotencyKey, IntentId, OrderType, PlanId, RiskCapacity, RiskResult,
     SizingCandidateProvenance, StrategyId, SymbolCode, SymbolMetadataSnapshot, SymbolTradeMode,
     TimePolicy, TradeIntent, TradeIntentAction, WireInboxStatus,
 };
@@ -33,6 +33,7 @@ fn valid_trade_intent_json() -> Value {
         "reason": "trend confirmed",
         "proposed_risk_pct": 1.0,
         "proposed_sl": 2320.5,
+        "decision_timestamp": 1779800000000_i64,
         "signal_expires_at": 1779800123000_i64,
         "requested_at": 1779800000123_i64
     })
@@ -163,8 +164,8 @@ fn trade_intent_round_trips_with_account_and_idempotency_key() {
 }
 
 #[test]
-fn trade_intent_rejects_missing_account_and_idempotency_key() {
-    for required_field in ["account_id", "idempotency_key"] {
+fn trade_intent_rejects_missing_required_identity_and_decision_time() {
+    for required_field in ["account_id", "idempotency_key", "decision_timestamp"] {
         let mut json = valid_trade_intent_json();
         json.as_object_mut().unwrap().remove(required_field);
 
@@ -195,6 +196,20 @@ fn trade_intent_rejects_execution_command_fields() {
             "forbidden field {forbidden_field} should be rejected"
         );
     }
+}
+
+#[test]
+fn risk_capacity_is_a_shared_transport_independent_dto() {
+    assert_json_round_trip(&RiskCapacity {
+        account_id: "acct_mt5_001".into(),
+        strategy_id: "trend_xau_h4_v1".into(),
+        observed_at: 1_779_800_000_123,
+        daily_realized_loss_pct: 0.2,
+        equity_drawdown_pct: 0.4,
+        remaining_account_risk_pct: 3.0,
+        remaining_portfolio_risk_pct: 5.0,
+        remaining_strategy_legs: 2,
+    });
 }
 
 #[test]
